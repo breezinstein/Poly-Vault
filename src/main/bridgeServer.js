@@ -24,6 +24,20 @@ const JOB_STATES = Object.freeze({
   FAILED: 'failed',
 });
 const TERMINAL_STATES = new Set([JOB_STATES.DONE, JOB_STATES.FAILED]);
+const MAX_TERMINAL_JOBS = 200;
+
+function pruneJobs(jobs, maxTerminal = MAX_TERMINAL_JOBS) {
+  const active = [];
+  const terminal = [];
+  for (const j of jobs) {
+    if (TERMINAL_STATES.has(j.status)) terminal.push(j);
+    else active.push(j);
+  }
+  if (terminal.length > maxTerminal) {
+    terminal.splice(0, terminal.length - maxTerminal);
+  }
+  return [...terminal, ...active];
+}
 
 function createJob(asset, now = new Date()) {
   return {
@@ -376,6 +390,9 @@ function startBridge({ host = '127.0.0.1', port = 7100, getState, tags, meta, on
           importables: body.importables,
         });
         state.jobs.push(job);
+        const pruned = pruneJobs(state.jobs);
+        state.jobs.length = 0;
+        state.jobs.push(...pruned);
         if (onJobsChanged) onJobsChanged(state.jobs);
         sendJson(res, 201, { ok: true, job });
         return;
@@ -417,6 +434,9 @@ function startBridge({ host = '127.0.0.1', port = 7100, getState, tags, meta, on
             : JOB_STATES.PROCESSING;
         job.note = body.note || '';
         job.updatedAt = new Date().toISOString();
+        const pruned = pruneJobs(state.jobs);
+        state.jobs.length = 0;
+        state.jobs.push(...pruned);
         if (onJobsChanged) onJobsChanged(state.jobs);
         sendJson(res, 200, { ok: true, job });
         return;
@@ -437,4 +457,4 @@ function startBridge({ host = '127.0.0.1', port = 7100, getState, tags, meta, on
   return { server, listen, host, port };
 }
 
-module.exports = { startBridge, JOB_STATES, TERMINAL_STATES, createJob };
+module.exports = { startBridge, JOB_STATES, TERMINAL_STATES, createJob, pruneJobs, MAX_TERMINAL_JOBS };

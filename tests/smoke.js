@@ -6,7 +6,7 @@ const path = require('path');
 const assert = require('assert');
 
 const { scanLibrary } = require('../src/main/library');
-const { startBridge } = require('../src/main/bridgeServer');
+const { startBridge, pruneJobs, JOB_STATES } = require('../src/main/bridgeServer');
 const { createEnrichment, mergeMetaEntry } = require('../src/main/enrichment');
 const { JsonStore } = require('../src/main/store');
 
@@ -90,6 +90,18 @@ assert.deepStrictEqual(c3d.tags, [], 'container tag aggregation starts empty');
 assert.ok(typeof c3d.created === 'string' && c3d.created.length > 0, 'container created date present');
 
 console.log(`scan ok: ${lib.totalAssets} assets, nested depth ok`);
+
+// Test pruneJobs keeps active jobs and caps terminal jobs
+const testJobs = [
+  { id: '1', status: JOB_STATES.DONE },
+  { id: '2', status: JOB_STATES.FAILED },
+  { id: '3', status: JOB_STATES.DONE },
+  { id: '4', status: JOB_STATES.PENDING },
+  { id: '5', status: JOB_STATES.PROCESSING },
+];
+const pruned = pruneJobs(testJobs, 2);
+assert.strictEqual(pruned.length, 4, 'prunes oldest terminal job (1) and keeps last 2 terminal + 2 active');
+assert.deepStrictEqual(pruned.map((j) => j.id), ['2', '3', '4', '5'], 'retains newest terminal jobs and all active jobs');
 
 // ---- bridge ----
 (async () => {

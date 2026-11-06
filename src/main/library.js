@@ -312,6 +312,8 @@ function scanDirectory(lib, absPath, rel, depth, getTags, getMeta) {
     const importables = classifyImportable(absPath, files, preview && preview.path);
     const tags = getTags ? (Array.isArray(getTags(absPath)) ? getTags(absPath) : []) : [];
     const info = statInfo(absPath);
+    const sizeBytes = sizeOfDir(files);
+    const kindCounts = buildKindCounts(importables);
 
     return {
       type: 'asset',
@@ -321,8 +323,8 @@ function scanDirectory(lib, absPath, rel, depth, getTags, getMeta) {
       count: 1,
       assetCount: 1,
       fileCount: files.length,
-      sizeBytes: sizeOfDir(files),
-      kindCounts: buildKindCounts(importables),
+      sizeBytes,
+      kindCounts,
       tags,
       created: info.created,
       updated: info.updated,
@@ -336,9 +338,9 @@ function scanDirectory(lib, absPath, rel, depth, getTags, getMeta) {
         libraryId: lib.id,
         libraryName: lib.name,
         folder: absPath,
-        sizeBytes: sizeOfDir(files),
+        sizeBytes,
         fileCount: files.length,
-        kindCounts: buildKindCounts(importables),
+        kindCounts,
         preview: preview ? { path: preview.path, rel: preview.rel } : null,
         importables,
         importable: importables.length > 0,

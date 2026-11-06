@@ -6,6 +6,23 @@ All notable changes to **Poly Vault** are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-11-07
+
+Performance optimizations and UI usability enhancements across the Electron renderer, library scanner, and bridge server.
+
+### Added
+
+- **Keyboard navigation in asset grid** — navigate between cards with Arrow keys (`Left`, `Right`, `Up`, `Down`), `Home`, `End`, and select with `Enter` / `Space`. Cards include accessible `:focus-visible` outline rings.
+- **Global search shortcuts** — press `/` or `Ctrl+F` / `Cmd+F` anywhere to focus and select search; press `Escape` to clear search or dismiss popovers.
+- **Tag popover search & frequency sorting** — tags in the popover are sorted by usage frequency and then alphabetically, with an inline search filter when more than 8 tags exist.
+- **Smooth thumbnail transitions** — preview images fade in smoothly on load, preventing layout shift and thumbnail popping.
+
+### Changed
+
+- **Chunked grid rendering** — large libraries render in batches of 60 cards per animation frame (`requestAnimationFrame`) instead of freezing the main thread on full-DOM rebuilds.
+- **Scanner syscall optimization** — cached file size and kind classification in `scanDirectory`, cutting `fs.statSync` syscalls in half across all scans.
+- **Bridge server job pruning** — `state.jobs` automatically prunes terminal jobs past the latest 200 items, keeping memory and JSON persistence bounded.
+
 ## [0.4.1] — 2026-11-07
 
 Lifecycle tracking for package imports, active re-import / retry actions in the desktop UI, and bridge in-flight processing status.
