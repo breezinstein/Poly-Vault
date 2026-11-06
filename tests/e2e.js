@@ -196,6 +196,8 @@ async function waitForDiag(action, filter, what, ms = 15000) {
   assert.strictEqual(assetDiag.cascadeToggles, 0, 'assets tag themselves only (no cascade toggle)');
   assert.strictEqual(assetDiag.tagInputs, 1, 'asset detail has a tag input');
   assert.strictEqual(assetDiag.pathTexts, 0, 'asset footer shows no path text');
+  assert.strictEqual(assetDiag.importBtn, 'Re-import to Unity', 'completed asset shows re-import button');
+  assert.strictEqual(assetDiag.importBtnDisabled, false, 're-import button is enabled');
   console.log(`asset detail ok: detail=${assetDiag.detail}, view=${assetDiag.view}, metaRows=${assetDiag.metaRows}`);
 
   // Pack holds the only .unitypackage -> the detail lists just that filename.

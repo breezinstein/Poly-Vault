@@ -1159,14 +1159,38 @@ function renderAssetDetail(content, asset) {
     btn.textContent = 'Nothing importable';
   }
   if (job) {
-    btn.disabled = true;
-    if (job.status === 'done') { btn.classList.add('done'); btn.textContent = 'Imported'; }
-    else if (job.status === 'failed') { btn.classList.add('failed'); btn.textContent = 'Import failed'; }
-    else if (job.status === 'processing') { btn.classList.add('queued'); btn.textContent = 'Importing in Unity...'; }
-    else { btn.classList.add('queued'); btn.textContent = 'Queued - waiting for Unity'; }
+    if (job.status === 'done') {
+      btn.classList.add('done');
+      btn.textContent = 'Re-import to Unity';
+      btn.title = 'Re-send this asset to the Unity Editor';
+      btn.disabled = !asset.importable;
+    } else if (job.status === 'failed') {
+      btn.classList.add('failed');
+      btn.textContent = 'Retry import to Unity';
+      btn.title = 'Retry sending this asset to the Unity Editor';
+      btn.disabled = !asset.importable;
+    } else if (job.status === 'processing') {
+      btn.classList.add('queued');
+      btn.textContent = 'Importing in Unity...';
+      btn.disabled = true;
+    } else {
+      btn.classList.add('queued');
+      btn.textContent = 'Queued - waiting for Unity';
+      btn.disabled = true;
+    }
   }
   btn.addEventListener('click', () => sendImportJob(asset));
   content.appendChild(btn);
+
+  if (job && (job.status === 'pending' || job.status === 'processing')) {
+    const cancelBtn = el('button', 'job-cancel-btn', 'Cancel import request', 'Cancel this in-flight import request');
+    cancelBtn.addEventListener('click', async () => {
+      cancelBtn.disabled = true;
+      cancelBtn.textContent = 'Cancelling...';
+      await cancelImportJob(job.id);
+    });
+    content.appendChild(cancelBtn);
+  }
 
   if (job && job.status !== 'pending') {
     const js = el('div', `job-state ${job.status === 'done' ? 'done' : job.status === 'failed' ? 'failed' : 'queued'}`);
@@ -1293,7 +1317,7 @@ async function sendImportJob(asset) {
     assetId: asset.id,
     assetName: asset.name,
     category: asset.category,
-    libraryName: asset.libraryName,
+    libraryName: asset.libraryName || asset._lib || 'Default',
     assetFolder: asset.folder,
     tags: asset.tags || [],
     importables: asset.importables,
@@ -1309,6 +1333,18 @@ async function sendImportJob(asset) {
     renderDetail();
     renderGrid();
   }
+}
+
+async function cancelImportJob(jobId) {
+  if (!state.serverUrl || !jobId) return;
+  try {
+    await fetch(`${state.serverUrl}/api/unity/import-jobs/${jobId}/failed`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ note: 'cancelled by user in Poly Vault' }),
+    });
+    await pollJobs();
+  } catch (_) {}
 }
 
 // ---------- update (rescan + enrich) ----------

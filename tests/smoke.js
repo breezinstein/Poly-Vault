@@ -379,6 +379,16 @@ console.log(`scan ok: ${lib.totalAssets} assets, nested depth ok`);
   assert.strictEqual(active.jobs.length, 1);
   assert.strictEqual(active.jobs[0].id, job.id);
 
+  const proc = await fetch(`${base}/api/unity/import-jobs/${job.id}/processing`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ note: 'extracting package' }),
+  });
+  assert.strictEqual(proc.status, 200);
+  const activeProc = await (await fetch(`${base}/api/unity/import-jobs`)).json();
+  assert.strictEqual(activeProc.jobs.length, 1);
+  assert.strictEqual(activeProc.jobs[0].status, 'processing');
+
   const done = await fetch(`${base}/api/unity/import-jobs/${job.id}/complete`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -388,6 +398,28 @@ console.log(`scan ok: ${lib.totalAssets} assets, nested depth ok`);
 
   const activeAfter = await (await fetch(`${base}/api/unity/import-jobs`)).json();
   assert.strictEqual(activeAfter.jobs.length, 0, 'job terminal');
+
+  // Re-importing after completion succeeds and creates a new pending job
+  const reimportRes = await fetch(`${base}/api/import-job`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      assetId: chair.id,
+      assetName: chair.name,
+      category: chair.category,
+      libraryName: 'MyAssets',
+      assetFolder: chair.folder,
+      tags: ['wood'],
+      importables: chair.importables,
+    }),
+  });
+  assert.strictEqual(reimportRes.status, 201);
+  const { job: reimportJob } = await reimportRes.json();
+  assert.strictEqual(reimportJob.status, 'pending');
+  assert.notStrictEqual(reimportJob.id, job.id);
+  const activeReimport = await (await fetch(`${base}/api/unity/import-jobs`)).json();
+  assert.strictEqual(activeReimport.jobs.length, 1);
+  assert.strictEqual(activeReimport.jobs[0].id, reimportJob.id);
 
   console.log('bridge ok: preview, auth guard, tags + meta round-trip, job queue');
   bridge.server.close();

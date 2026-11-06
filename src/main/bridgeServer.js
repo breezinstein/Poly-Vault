@@ -400,7 +400,7 @@ function startBridge({ host = '127.0.0.1', port = 7100, getState, tags, meta, on
         return;
       }
 
-      const jobStatusMatch = route.match(/^\/api\/unity\/import-jobs\/([^/]+)\/(complete|failed)$/);
+      const jobStatusMatch = route.match(/^\/api\/unity\/import-jobs\/([^/]+)\/(complete|failed|processing)$/);
       if (req.method === 'POST' && jobStatusMatch) {
         lastUnitySeen = Date.now();
         const [, jobId, action] = jobStatusMatch;
@@ -410,7 +410,11 @@ function startBridge({ host = '127.0.0.1', port = 7100, getState, tags, meta, on
           sendJson(res, 404, { ok: false, error: 'job not found' });
           return;
         }
-        job.status = action === 'complete' ? JOB_STATES.DONE : JOB_STATES.FAILED;
+        job.status = action === 'complete'
+          ? JOB_STATES.DONE
+          : action === 'failed'
+            ? JOB_STATES.FAILED
+            : JOB_STATES.PROCESSING;
         job.note = body.note || '';
         job.updatedAt = new Date().toISOString();
         if (onJobsChanged) onJobsChanged(state.jobs);

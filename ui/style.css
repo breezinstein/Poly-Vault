@@ -807,6 +807,22 @@ body.resizing * { cursor: col-resize !important; user-select: none; }
 .import-btn.done { background: var(--good); color: #fff; }
 .import-btn.failed { background: var(--bad); color: #fff; }
 
+.job-cancel-btn {
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel-2);
+  color: var(--text-dim);
+  border-radius: var(--radius);
+  font-size: 11px;
+  cursor: pointer;
+  align-self: flex-start;
+  transition: all 0.15s ease;
+}
+.job-cancel-btn:hover {
+  border-color: var(--bad);
+  color: var(--bad);
+}
+
 .job-state { font-size: 12px; color: var(--text-dim); }
 .job-state.done { color: var(--good); }
 .job-state.failed { color: var(--bad); }

@@ -11,13 +11,128 @@ namespace AssetVault.EditorTools
     /// .unitypackage files are opened through Unity's own import dialog; all other
     /// importable files are copied under Assets/PolyVaultImports/...
     /// </summary>
+    [InitializeOnLoad]
     public static class AssetVaultImporter
     {
         public const string ImportRoot = "Assets/PolyVaultImports";
 
         private static readonly HashSet<string> InFlight = new HashSet<string>();
+        private static readonly Dictionary<string, ImportJobDto> PendingPackageJobs =
+            new Dictionary<string, ImportJobDto>(StringComparer.OrdinalIgnoreCase);
 
-        private static bool IsInFlight(string jobId) => InFlight.Contains(jobId);
+        static AssetVaultImporter()
+        {
+            AssetDatabase.importPackageCompleted += OnPackageImportCompleted;
+            AssetDatabase.importPackageCancelled += OnPackageImportCancelled;
+            AssetDatabase.importPackageFailed += OnPackageImportFailed;
+        }
+
+        public static bool IsInFlight(string jobId) => !string.IsNullOrEmpty(jobId) && InFlight.Contains(jobId);
+
+        public static void CancelInFlight(string jobId)
+        {
+            if (string.IsNullOrEmpty(jobId)) return;
+            InFlight.Remove(jobId);
+            var keys = new List<string>();
+            foreach (var kvp in PendingPackageJobs)
+            {
+                if (kvp.Value != null && kvp.Value.id == jobId) keys.Add(kvp.Key);
+            }
+            foreach (var k in keys) PendingPackageJobs.Remove(k);
+        }
+
+        private static void RegisterPendingPackage(ImportableDto item, ImportJobDto job)
+        {
+            if (item == null || job == null) return;
+            string key1 = Path.GetFileNameWithoutExtension(item.path);
+            if (!string.IsNullOrEmpty(key1)) PendingPackageJobs[key1] = job;
+            if (!string.IsNullOrEmpty(item.name))
+            {
+                PendingPackageJobs[item.name] = job;
+                string key2 = Path.GetFileNameWithoutExtension(item.name);
+                if (!string.IsNullOrEmpty(key2)) PendingPackageJobs[key2] = job;
+            }
+        }
+
+        private static bool TryPopPackageJob(string packageName, out ImportJobDto job)
+        {
+            job = null;
+            if (PendingPackageJobs.Count == 0) return false;
+
+            if (!string.IsNullOrEmpty(packageName))
+            {
+                if (PendingPackageJobs.TryGetValue(packageName, out job))
+                {
+                    RemoveJobFromPending(job);
+                    InFlight.Remove(job.id);
+                    return true;
+                }
+                string clean = Path.GetFileNameWithoutExtension(packageName);
+                if (PendingPackageJobs.TryGetValue(clean, out job))
+                {
+                    RemoveJobFromPending(job);
+                    InFlight.Remove(job.id);
+                    return true;
+                }
+            }
+
+            if (PendingPackageJobs.Count >= 1)
+            {
+                using (var enumerator = PendingPackageJobs.Values.GetEnumerator())
+                {
+                    if (enumerator.MoveNext())
+                    {
+                        job = enumerator.Current;
+                        RemoveJobFromPending(job);
+                        InFlight.Remove(job.id);
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private static void RemoveJobFromPending(ImportJobDto job)
+        {
+            if (job == null) return;
+            var keys = new List<string>();
+            foreach (var kvp in PendingPackageJobs)
+            {
+                if (kvp.Value != null && kvp.Value.id == job.id) keys.Add(kvp.Key);
+            }
+            foreach (var k in keys) PendingPackageJobs.Remove(k);
+        }
+
+        private static void OnPackageImportCompleted(string packageName)
+        {
+            if (TryPopPackageJob(packageName, out var job))
+            {
+                Debug.Log($"[Poly Vault] Package '{packageName}' imported successfully.");
+                ReportJobResult(job, true, $"Imported package {packageName}.");
+                AssetVaultQueue.PollNow();
+            }
+        }
+
+        private static void OnPackageImportCancelled(string packageName)
+        {
+            if (TryPopPackageJob(packageName, out var job))
+            {
+                Debug.LogWarning($"[Poly Vault] Package '{packageName}' import was cancelled in Unity.");
+                ReportJobResult(job, false, $"Package '{packageName}' import cancelled in Unity.");
+                AssetVaultQueue.PollNow();
+            }
+        }
+
+        private static void OnPackageImportFailed(string packageName, string errorMessage)
+        {
+            if (TryPopPackageJob(packageName, out var job))
+            {
+                Debug.LogError($"[Poly Vault] Package '{packageName}' import failed: {errorMessage}");
+                ReportJobResult(job, false, $"Package '{packageName}' import failed: {errorMessage}");
+                AssetVaultQueue.PollNow();
+            }
+        }
 
         private static string Sanitize(string name)
         {
@@ -87,6 +202,7 @@ namespace AssetVault.EditorTools
             {
                 int imported = 0;
                 int skippedPackages = 0;
+                bool hasInteractivePackage = false;
 
                 string destAssetRoot = Path.Combine(
                     ImportRoot.Replace('/', Path.DirectorySeparatorChar),
@@ -104,6 +220,10 @@ namespace AssetVault.EditorTools
                         {
                             if (interactive)
                             {
+                                hasInteractivePackage = true;
+                                RegisterPendingPackage(item, job);
+                                ReportJobStatus(job, "processing", $"Importing package {item.name} in Unity...");
+
                                 // Opens Unity's package import dialog.
                                 AssetDatabase.ImportPackage(item.path, true);
                                 log?.Invoke($"Opened package import for {item.name}");
@@ -147,27 +267,32 @@ namespace AssetVault.EditorTools
                 AssetDatabase.Refresh();
                 WriteTagsFile(destAssetRoot, job.tags);
 
-                if (imported == 0 && skippedPackages > 0)
+                if (hasInteractivePackage)
                 {
-                    finished?.Invoke("Only unitypackage files pending manual import.", false);
+                    finished?.Invoke($"Opened package import dialog for {job.assetName}.", true);
                     return true;
                 }
 
+                if (imported == 0 && skippedPackages > 0)
+                {
+                    finished?.Invoke("Only unitypackage files pending manual import.", false);
+                    InFlight.Remove(job.id);
+                    return true;
+                }
+
+                InFlight.Remove(job.id);
                 ReportJobResult(job, true, $"Imported {imported} file(s).");
                 finished?.Invoke($"Imported {imported} file(s).", true);
                 return true;
             }
             catch (Exception e)
             {
+                InFlight.Remove(job.id);
                 string msg = e.Message;
                 log?.Invoke($"Import failed: {msg}");
                 ReportJobResult(job, false, msg);
                 finished?.Invoke($"Import failed: {msg}", false);
                 return true;
-            }
-            finally
-            {
-                InFlight.Remove(job.id);
             }
         }
 
@@ -202,18 +327,24 @@ namespace AssetVault.EditorTools
             return "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
         }
 
+        public static void ReportJobStatus(ImportJobDto job, string status, string note)
+        {
+            if (job == null || string.IsNullOrEmpty(job.id)) return;
+            string url = $"{AssetVaultSettings.ServerUrl}/api/unity/import-jobs/{job.id}/{status}";
+            string body = "{\"note\":" + JsonUtility.ToJson(note) + "}";
+            AssetVaultWeb.PostJson(url, body, (ok, text) =>
+            {
+                if (!ok) Debug.LogWarning($"[Poly Vault] Failed to report job status to server: {text}");
+            });
+        }
+
         /// <summary>
         /// Reports a job as imported or failed back to the Poly Vault server so
         /// it leaves the pending queue. Best effort; async.
         /// </summary>
         public static void ReportJobResult(ImportJobDto job, bool success, string note)
         {
-            string url = $"{AssetVaultSettings.ServerUrl}/api/unity/import-jobs/{job.id}/{(success ? "complete" : "failed")}";
-            string body = "{\"note\":" + JsonUtility.ToJson(note) + "}";
-            AssetVaultWeb.PostJson(url, body, (ok, text) =>
-            {
-                if (!ok) Debug.LogWarning($"[Poly Vault] Failed to report job result to server: {text}");
-            });
+            ReportJobStatus(job, success ? "complete" : "failed", note);
         }
     }
 }

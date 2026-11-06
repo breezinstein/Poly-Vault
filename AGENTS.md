@@ -79,6 +79,7 @@ before making changes.
 - Exactly **three** themes: `default`, `dark`, `light`. `localStorage av.theme` wins, else default.
 - Do **not** commit: `node_modules/`, `dist/`, `out/`, `.release/`, `build/icon.ico`, `build/icon.png`, `*.log`.
 - Tests are the gate: `node tests\smoke.js` and `node tests\e2e.js` must pass before any release.
+- **Always update graphify and builds after modifications**: Whenever code changes are made, run `graphify update .` and update the local builds (`npm.cmd run icons`, `npm.cmd run dist`, and Unity package artifacts in `.release/`) before completing the task.
 - Branch: `main` only. Global git identity is already configured.
 
 ---
@@ -189,8 +190,10 @@ Rules:
 
 ### Poly Vault specifics (mandatory)
 
-- **Every code modification must refresh the graph in the same session**: run `graphify update .` right
-  after the last edit of a task, before reporting completion. A task is not done while the graph is stale.
+- **Every code modification must refresh graphify and builds in the same session**:
+  - **Graph**: run `graphify update .` (or `graphify update . --force` if a refactor deleted code) right after the last edit of a task.
+  - **Builds**: run `npm.cmd run icons`, build the Windows installer (`npm.cmd run dist`), and package the Unity package artifacts into `.release/`.
+  - A task is not done while either the graph or the builds are stale.
 - Refresh the graph with `--force` when a refactor deletes code (`graphify update . --force`), otherwise
   the rebuild is skipped as a possible regression.
 - `graphify` is **not on the machine PATH** by default. Bootstrap every session with the standard PATH

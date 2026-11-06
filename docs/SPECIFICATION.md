@@ -5,7 +5,7 @@ and its Unity 6 bridge. This is the authoritative reference for *what the
 product does*: full capability list, functional behaviours, API contracts,
 data shapes, and edge cases.
 
-**Product:** Poly Vault · **Version:** 0.4.0 · **Author:** Zeeshan Qaswar ·
+**Product:** Poly Vault · **Version:** 0.4.1 · **Author:** Zeeshan Qaswar ·
 **License:** MIT
 
 Contents:
@@ -253,7 +253,7 @@ RequestBody cap: **2 MB**.
 {
   "ok": true,
   "name": "Poly Vault",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "time": "<ISO>",
   "libraryCount": 1,
   "libraries": [{ "id": "…", "name": "…", "path": "C:\\…" }],

@@ -6,15 +6,21 @@ All notable changes to **Poly Vault** are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-11-07
+
+Lifecycle tracking for package imports, active re-import / retry actions in the desktop UI, and bridge in-flight processing status.
+
+### Added
+
+- **Re-import and retry actions** — assets in `done` or `failed` state can now be re-imported or retried directly from the desktop inspector with active `Re-import to Unity` / `Retry import to Unity` buttons instead of remaining permanently disabled.
+- **Cancel in-flight imports** — added a `Cancel import request` button in the desktop detail panel for pending or processing import jobs.
+- **Bridge processing state** — HTTP bridge supports `/api/unity/import-jobs/:id/processing` to reflect active in-flight import status.
+
 ### Fixed
 
-- **Preview caching** — `/api/preview` now answers with `Cache-Control: private,
-  max-age=3600`, a weak `ETag` and `Last-Modified`, and returns `304 Not Modified`
-  for `If-None-Match` / `If-Modified-Since`. Previously every grid re-render
-  re-streamed each visible thumbnail from disk (`no-store`, no validator), so
-  filtering, tag changes and search re-read the same images repeatedly.
-- **Search debounce** — the toolbar search box waits 120 ms before re-rendering
-  the grid instead of rebuilding it on every keystroke.
+- **Unity package import lifecycle** — Unity Editor plugin hooks `AssetDatabase.importPackageCompleted`, `AssetDatabase.importPackageCancelled`, and `AssetDatabase.importPackageFailed` using `[InitializeOnLoad]`, avoiding premature job completion before package import dialogs finish.
+- **Preview caching** — `/api/preview` now answers with `Cache-Control: private, max-age=3600`, a weak `ETag` and `Last-Modified`, and returns `304 Not Modified` for `If-None-Match` / `If-Modified-Since`. Previously every grid re-render re-streamed each visible thumbnail from disk (`no-store`, no validator), so filtering, tag changes and search re-read the same images repeatedly.
+- **Search debounce** — the toolbar search box waits 120 ms before re-rendering the grid instead of rebuilding it on every keystroke.
 
 ## [0.4.0] — 2026-09-26
 

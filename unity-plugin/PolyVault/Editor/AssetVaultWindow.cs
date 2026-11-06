@@ -146,7 +146,9 @@ namespace AssetVault.EditorTools
 
                 using (new EditorGUILayout.HorizontalScope())
                 {
-                    if (GUILayout.Button($"Import “{job.assetName}” now", GUILayout.MinWidth(160)))
+                    bool inFlight = AssetVaultImporter.IsInFlight(job.id) || string.Equals(job.status, "processing", StringComparison.OrdinalIgnoreCase);
+                    GUI.enabled = !inFlight;
+                    if (GUILayout.Button(inFlight ? $"Importing “{job.assetName}”..." : $"Import “{job.assetName}” now", GUILayout.MinWidth(160)))
                     {
                         AssetVaultImporter.TryImport(job, interactive: true,
                             log: msg => Debug.Log($"[Poly Vault] {msg}"),
@@ -156,6 +158,7 @@ namespace AssetVault.EditorTools
                                 AssetVaultQueue.PollNow();
                             });
                     }
+                    GUI.enabled = true;
 
                     if (GUILayout.Button("Cancel", GUILayout.Width(70)))
                     {
@@ -167,6 +170,8 @@ namespace AssetVault.EditorTools
 
         private static void ReportCancel(ImportJobDto job)
         {
+            if (job == null) return;
+            AssetVaultImporter.CancelInFlight(job.id);
             string url = $"{AssetVaultSettings.ServerUrl}/api/unity/import-jobs/{job.id}/failed";
             AssetVaultWeb.PostJson(url, "{\"note\":\"cancelled in Unity\"}", null);
             AssetVaultQueue.PollNow();
