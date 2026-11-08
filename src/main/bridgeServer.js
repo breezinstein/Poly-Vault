@@ -414,8 +414,14 @@ function startBridge({ host = '127.0.0.1', port = 7100, getState, tags, meta, on
         }
         const folderRoot = path.resolve(folder);
         for (const item of body.importables) {
-          const p = path.resolve(String(item && item.path || ''));
-          if (!withinLibrary(p, libs) || (p !== folderRoot && !p.startsWith(folderRoot + path.sep))) {
+          const raw = String(item && item.path || '');
+          // "<package>#<entry>" addresses a file inside a .unitypackage: clients
+          // that predate the `entry` field send it this way.
+          const p = path.resolve(raw.split('#')[0]);
+          const insideFolder = p === folderRoot
+            || p.startsWith(folderRoot + path.sep)
+            || raw.startsWith(`${folderRoot}#`);
+          if (!withinLibrary(p, libs) || !insideFolder) {
             sendJson(res, 403, { ok: false, error: 'importable outside asset folder' });
             return;
           }

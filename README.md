@@ -212,7 +212,8 @@ assets
   engine in this build). Its panel offers **Import this file to Unity**, plus a
   secondary **Import the whole package instead**.
 - Importing one file makes the server extract it from the archive
-  (`GET /api/file?path=<package>&entry=Assets/…`), cache it under
+  (`GET /api/file?path=<package>&entry=Assets/…`, or the legacy
+  `path=<package>#Assets/…` form that add-ons before 0.6.0 build), cache it under
   `/data/packages/extracted`, and hand it to the editor like any other asset.
   Models, textures, audio, fonts and scripts import cleanly on their own;
   prefabs/materials usually need the whole package for their dependencies.

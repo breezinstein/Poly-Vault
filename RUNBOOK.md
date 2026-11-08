@@ -203,6 +203,12 @@ required — this is not specific to Poly Vault. Three ways forward, best first:
 
 | Console message | Cause | Action |
 | --- | --- | --- |
+| `ImportFBX Errors: Couldn't read file …/PolyVaultImports/…` (`None of the registered readers can process the file`) | the add-on was older than 0.6.0, so a per-file import downloaded the **whole `.unitypackage`** and saved it under the asset's name | update the add-on (Settings → Download, 0.6.0+). Newer servers also accept the old address form, so this no longer happens even on 0.5.2 |
+| `Could not create asset from …/Snow_02_Height.tif: File could not be read` | same cause, texture variant | same |
+
+
+| Console message | Cause | Action |
+| --- | --- | --- |
 | `GetString is not allowed to be called from a ScriptableObject constructor … AssetVaultWindow` | plugin ≤ 0.5.1 read `EditorPrefs` in `EditorWindow` field initializers | upgrade to **0.5.2+** (settings are now loaded in `OnEnable`) |
 | `NullReferenceException … EditorWindow.OnDisableINTERNAL` when closing the window | side effect of the failed window construction above | same fix |
 | `Invalid antiAliasing value (must be at least 1)` repeated | Unity project quality settings (`QualitySettings.antiAliasing = 0`), unrelated to Poly Vault | Project Settings → Quality → Anti Aliasing, or the pipeline asset's MSAA setting |
