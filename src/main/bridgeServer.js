@@ -137,17 +137,19 @@ function sanitizeScope(raw) {
  * update    => { run(scope): Promise<{libraries, targets:[{path,name}]}> }
  * onJobsChanged(jobs) => called whenever the job queue is mutated (cheap to persist).
  */
-function startBridge({ host = '127.0.0.1', port = 7100, getState, tags, meta, onJobsChanged, onDiag, enrichment, update }) {
+function startBridge({ host = '127.0.0.1', port = 7100, getState, tags, meta, onJobsChanged, onDiag, enrichment, update, scan = scanLibrary, corsOrigin = '*' }) {
   let lastUnitySeen = 0; // epoch ms of the last /api/unity/* request (Unity plugin poll)
   const server = http.createServer(async (req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (corsOrigin) {
+      res.setHeader('Access-Control-Allow-Origin', corsOrigin);
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204);
-      res.end();
-      return;
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
     }
 
     const url = new URL(req.url, `http://${host}:${port}`);
@@ -183,7 +185,7 @@ function startBridge({ host = '127.0.0.1', port = 7100, getState, tags, meta, on
           const entry = metaMap[key];
           return entry && entry.description ? entry.description : '';
         };
-        const rescanned = libs.map((lib) => scanLibrary(lib, { getTags: getTagsFor, getMeta: getMetaFor }));
+        const rescanned = libs.map((lib) => scan(lib, { getTags: getTagsFor, getMeta: getMetaFor }));
         if (enrichment && enrichment.request) {
           const fresh = [];
           for (const lib of rescanned) {
@@ -337,9 +339,16 @@ function startBridge({ host = '127.0.0.1', port = 7100, getState, tags, meta, on
           sendJson(res, 403, { ok: false, error: 'path outside libraries' });
           return;
         }
+        // Symlinks inside a library must not escape it: check the real path too.
+        let realTarget;
         let stat;
         try {
-          stat = fs.statSync(target);
+          realTarget = fs.realpathSync(target);
+          if (!withinLibrary(realTarget, libs)) {
+            sendJson(res, 403, { ok: false, error: 'path outside libraries' });
+            return;
+          }
+          stat = fs.statSync(realTarget);
         } catch (_) {
           sendJson(res, 404, { ok: false, error: 'not found' });
           return;
@@ -361,7 +370,7 @@ function startBridge({ host = '127.0.0.1', port = 7100, getState, tags, meta, on
           return;
         }
         res.writeHead(200, { ...base, 'Content-Length': stat.size });
-        fs.createReadStream(target).pipe(res);
+        fs.createReadStream(realTarget).pipe(res);
         return;
       }
 
@@ -379,6 +388,14 @@ function startBridge({ host = '127.0.0.1', port = 7100, getState, tags, meta, on
         if (!withinLibrary(folder, libs)) {
           sendJson(res, 403, { ok: false, error: 'asset outside libraries' });
           return;
+        }
+        const folderRoot = path.resolve(folder);
+        for (const item of body.importables) {
+          const p = path.resolve(String(item && item.path || ''));
+          if (!withinLibrary(p, libs) || (p !== folderRoot && !p.startsWith(folderRoot + path.sep))) {
+            sendJson(res, 403, { ok: false, error: 'importable outside asset folder' });
+            return;
+          }
         }
         const job = createJob({
           id: body.assetId,

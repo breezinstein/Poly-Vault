@@ -174,7 +174,8 @@ async function init() {
   restoreLayout();
   try {
     const info = await assetVault.getServerInfo();
-    state.serverUrl = `http://${info.host}:${info.port}`;
+    // Web build: prefer an explicit origin so HTTPS reverse proxies work.
+    state.serverUrl = info.origin || `http://${info.host}:${info.port}`;
   } catch (_) {
     setServerState(false);
     return;
