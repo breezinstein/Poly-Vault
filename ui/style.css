@@ -1075,3 +1075,69 @@ body.resizing * { cursor: col-resize !important; user-select: none; }
   background-clip: content-box;
 }
 ::-webkit-scrollbar-thumb:hover { background-color: color-mix(in srgb, var(--text-dim) 52%, transparent); }
+/* Package contents list (web build: what a .unitypackage contains) */
+.contents-list .importable-file {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+.contents-list .content-kind {
+  flex: 0 0 auto;
+  min-width: 52px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.55;
+}
+.contents-list .content-path {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;       /* ellipsis at the start: keeps the file name visible */
+  text-align: left;
+}
+.contents-list .content-size {
+  flex: 0 0 auto;
+  opacity: 0.6;
+  font-variant-numeric: tabular-nums;
+}
+.contents-note {
+  font-size: 11px;
+  opacity: 0.6;
+  padding: 4px 0 0 2px;
+}
+
+/* Package contents (web build: fetched from /api/package on demand) */
+.contents-holder { font-size: 12px; opacity: 0.85; }
+.contents-list .importable-file {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+.contents-list .content-kind {
+  flex: 0 0 auto;
+  min-width: 52px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.55;
+}
+.contents-list .content-path {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;       /* ellipsis at the start: keeps the file name visible */
+  text-align: left;
+}
+.contents-list .content-size {
+  flex: 0 0 auto;
+  opacity: 0.6;
+  font-variant-numeric: tabular-nums;
+}
+.contents-note {
+  font-size: 11px;
+  opacity: 0.6;
+  padding: 4px 0 0 2px;
+}

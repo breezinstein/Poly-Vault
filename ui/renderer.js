@@ -1239,6 +1239,54 @@ function renderAssetDetail(content, asset) {
     content.appendChild(pills);
   }
 
+  // Packages are single files. Their contents are fetched on demand (the list
+  // is far too large to ship with every library poll) and rendered when it
+  // arrives; `contentsTotal` tells us a list exists.
+  if (asset.packageFile && (asset.contentsTotal || asset.contentsCount)) {
+    const total = asset.contentsTotal || asset.contentsCount;
+    const title = asset.contentsPartial
+      ? `What's inside (${total}+ entries)`
+      : `What's inside (${total})`;
+    content.appendChild(el('div', 'detail-section-title', title));
+    const holder = el('div', 'contents-holder', 'Loading contents…');
+    content.appendChild(holder);
+
+    const load = async () => {
+      try {
+        const res = await fetch(`${state.serverUrl}/api/package?path=${encodeURIComponent(asset.folder)}`);
+        const json = await res.json();
+        if (!json.ok) {
+          holder.textContent = json.retry ? 'Indexing this package…' : 'Contents unavailable.';
+          if (json.retry) setTimeout(load, 4000);
+          return;
+        }
+        holder.textContent = '';
+        const list = el('ul', 'file-list contents-list');
+        for (const item of json.contents) {
+          const li = el('li', 'importable-file');
+          const name = item.path.split('/').pop();
+          const kind = (name.split('.').pop() || '').toLowerCase();
+          li.appendChild(el('span', 'content-kind', kind));
+          li.appendChild(el('span', 'content-path', item.path));
+          li.appendChild(el('span', 'content-size', fmtBytes(item.size || 0)));
+          li.title = item.path;
+          list.appendChild(li);
+        }
+        holder.appendChild(list);
+        if (json.partial) {
+          holder.appendChild(el('div', 'contents-note',
+            'Large package: contents were read from the first part of the archive only.'));
+        } else if ((json.totalAssets || 0) > json.contents.length) {
+          holder.appendChild(el('div', 'contents-note',
+            `Showing the ${json.contents.length} largest of ${json.totalAssets} entries.`));
+        }
+      } catch (_) {
+        holder.textContent = 'Contents unavailable.';
+      }
+    };
+    load();
+  }
+
   const job = jobForAsset(asset);
   const btn = el('button', 'import-btn', 'Import to Unity', 'Send this asset to the Unity Editor');
   if (!asset.importable) {
