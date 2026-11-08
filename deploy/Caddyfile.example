@@ -1,0 +1,48 @@
+# Put this in front of the poly-vault container.
+#   docker compose --profile proxy up -d
+#
+# Two supported auth modes:
+#   A) shared token  -> leave the container in PV_TOKEN mode, do nothing here
+#   B) forward-auth  -> set PV_TRUST_PROXY_AUTH=1 in the container and use one
+#                       of the snippets below (oauth2-proxy, Authelia, Caddy +
+#                       basic_auth). The proxy must send X-Auth-Request-User.
+
+{
+	email ops@example.com
+}
+
+vault.example.com {
+	encode zstd gzip
+
+	# --- Option 1: HTTP basic auth (smallest setup) ------------------------
+	# Generate the hash with:
+	#   docker run --rm caddy caddy hash-password --plaintext 's3cret'
+	basic_auth {
+		artist $2a$14$REPLACE_WITH_BCRYPT_HASH
+	}
+
+	# --- Option 2: oauth2-proxy / Authelia / your IdP ---------------------
+	# reverse_proxy /oauth2/* oauth2-proxy:4180
+	# forward_auth oauth2-proxy:4180 {
+	# 	uri /oauth2/auth
+	# 	copy_headers X-Auth-Request-User X-Auth-Request-Groups
+	# }
+
+	# Workaround for a well-known Caddy/forward_auth nuance: headers set by
+	# oauth2-proxy are forwarded with copy_headers above, which is what
+	# PV_TRUST_PROXY_AUTH=1 reads (X-Auth-Request-User / -Groups).
+	reverse_proxy poly-vault:8080 {
+		# If you use forward_auth, keep this so the identity header survives:
+		header_up X-Forwarded-Host {host}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+
+	log {
+		output file /var/log/caddy/access.log
+		format json
+	}
+}

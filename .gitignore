@@ -1,11 +1,20 @@
-node_modules/
-dist/
-out/
-.release/
-graphify-out/
-*.log
+# Local secrets and runtime data — never commit these
+.env
+.env.*
+!.env.example
 data/
-build/*.ico
-build/*.png
+backups/
+dist/
+plugin/
+
+# Ops artefacts
+*.tgz
+*.zip
+!sample-library/**/*.zip
+
+# Node / editors
+node_modules/
+npm-debug.log*
 .DS_Store
-Thumbs.db
+
+# The patch stack is kept for rebasing onto upstream; see patches/README.md

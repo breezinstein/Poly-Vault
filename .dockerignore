@@ -1,0 +1,14 @@
+.git
+.github
+data
+backups
+dist
+plugin
+node_modules
+npm-debug.log*
+*.md
+.DS_Store
+.env
+.env.*
+AUDIT-AND-PLAN.md
+RUNBOOK.md
