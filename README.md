@@ -204,8 +204,13 @@ assets
 - The tree is fetched **on demand** when a package is expanded
   (`GET /api/package/tree`), so the 20-second library poll stays ~700 KB instead
   of carrying file lists for every package.
-- Selecting a file inside a package opens its own panel with **Import this file
-  to Unity**, and a secondary **Import the whole package instead**.
+- Selecting the package (card or tree row) turns the **main pane** into a grid of
+  everything inside it — textures, models, audio, scripts, prefabs — with Unity's
+  own thumbnails.
+- Selecting a file shows a **preview in the main pane**: images render inline,
+  audio and video get a player, and models show Unity's rendered preview (no 3D
+  engine in this build). Its panel offers **Import this file to Unity**, plus a
+  secondary **Import the whole package instead**.
 - Importing one file makes the server extract it from the archive
   (`GET /api/file?path=<package>&entry=Assets/…`), cache it under
   `/data/packages/extracted`, and hand it to the editor like any other asset.
@@ -262,6 +267,10 @@ artist needs to connect Unity — no ticket to IT:
 - **Connection** — Server URL (the address this page was opened with), the access
   token behind a *Show* toggle with copy buttons.
 - **This server** — libraries, thumbnail cache, package index totals.
+
+Removing a library asks for confirmation first: it leaves the sidebar, while its
+tags, descriptions and import history stay in the data folder and the files on
+disk are never touched.
 
 The panel is part of `server/web-shim.js`, so the upstream renderer stays
 untouched. `PV_SHOW_TOKEN=0` hides the token (the panel then points people at

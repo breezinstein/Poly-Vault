@@ -1,10 +1,18 @@
 # Patch stack
 
-`0001`–`0007` are the complete diff against upstream
+`0001`–`0007` are the upstream-facing changes (core scanner/bridge, Unity add-on,
+renderer hooks) as they were applied to
 [`xeeshanqaswar/Poly-Vault`](https://github.com/xeeshanqaswar/Poly-Vault) at tag
-**v0.4.2**. They are already **applied** in this repository's working tree — the
-folder exists so the changes can be reviewed in isolation and re-applied when
-upstream moves.
+**v0.4.2**. They are already **applied**, and they remain the reference for
+rebasing onto a newer upstream release.
+
+The web shell (`server/`, Docker, docs, ops scripts) is this fork's own code and
+is not part of the patch stack; later UI work landed directly in `ui/`. To see
+everything the fork changes relative to upstream in one file:
+
+```bash
+./scripts/export-upstream-diff.sh        # -> dist/poly-vault-vs-upstream.patch
+```
 
 ## Review a single change
 

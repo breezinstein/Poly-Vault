@@ -647,6 +647,20 @@ function checkOrigin(req) {
  * version + scan generation), so no body hashing is needed and a 304 can be
  * answered without touching the bridge at all.
  */
+// Cache location for one extracted entry and for its embedded preview.
+function entryCacheDir(pkgReal, stat) {
+  return path.join(packagesCacheDir, 'extracted', crypto.createHash('sha1')
+    .update(`${pkgReal}\u0000${Math.trunc(stat.mtimeMs)}`).digest('hex'));
+}
+
+function entryCachePath(pkgReal, stat, entryPath) {
+  return path.join(entryCacheDir(pkgReal, stat), crypto.createHash('sha1').update(entryPath).digest('hex'));
+}
+
+function entryPreviewPath(pkgReal, stat, entryPath) {
+  return `${entryCachePath(pkgReal, stat, entryPath)}.preview.png`;
+}
+
 function apiEtag() {
   return `W/"pv-${dataVersion}-${scanGeneration}-p${packageIndex.status().version}"`;
 }
@@ -969,6 +983,40 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // --- preview image Unity embedded for one file inside a package -----------
+  // Textures preview as themselves; models/audio have Unity's rendered thumbnail.
+  if (route === '/api/package/preview') {
+    const target = String(url.searchParams.get('path') || '').trim();
+    const entryPath = String(url.searchParams.get('entry') || '').trim();
+    if (!target || !entryPath) { sendJson(res, 400, { ok: false, error: 'missing path or entry' }); return; }
+
+    let real;
+    let stat;
+    try {
+      real = fs.realpathSync(target);
+      stat = fs.statSync(real);
+    } catch (_) { sendJson(res, 404, { ok: false, error: 'not found' }); return; }
+    if (!stat.isFile()) { sendJson(res, 400, { ok: false, error: 'not a file' }); return; }
+
+    const previewFile = entryPreviewPath(real, stat, entryPath);
+    if (!fs.existsSync(previewFile)) {
+      // Extraction produces the preview as a side effect; do it once.
+      const result = await packageIndex.extractTo(real, entryPath, entryCachePath(real, stat, entryPath), undefined, previewFile);
+      if (!result.ok || !result.previewPath) {
+        sendJson(res, 404, { ok: false, error: 'no preview inside the package for this file' });
+        return;
+      }
+    }
+    metrics.counter('pv_entry_preview_total');
+    res.writeHead(200, {
+      'Content-Type': 'image/png',
+      'Cache-Control': 'private, max-age=3600',
+      ETag: `W/"ep-${path.basename(previewFile)}"`,
+    });
+    pipeline(fs.createReadStream(previewFile), res, () => {});
+    return;
+  }
+
   // --- contents tree of one package (lazy tree expansion in the UI) ---------
   if (route === '/api/package/tree') {
     const target = String(url.searchParams.get('path') || '').trim();
@@ -1205,16 +1253,16 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const base = path.basename(entryPath);
-      const cacheDir = path.join(packagesCacheDir, 'extracted', crypto.createHash('sha1')
-        .update(`${real}\u0000${Math.trunc(stat.mtimeMs)}`).digest('hex'));
-      const cached = path.join(cacheDir, crypto.createHash('sha1').update(entryPath).digest('hex'));
+      const cached = entryCachePath(real, stat, entryPath);
       let extractedPath = cached;
       let size = 0;
       try {
         size = fs.statSync(cached).size;
         metrics.counter('pv_entry_cache_hit_total');
       } catch (_) {
-        const result = await packageIndex.extractTo(real, entryPath, cached);
+        // Extract the file and, alongside it, Unity's own preview for that asset
+        // (used as the card thumbnail and the model preview).
+        const result = await packageIndex.extractTo(real, entryPath, cached, undefined, entryPreviewPath(real, stat, entryPath));
         if (!result.ok) {
           sendJson(res, 404, { ok: false, error: result.error || 'entry not found' });
           return;

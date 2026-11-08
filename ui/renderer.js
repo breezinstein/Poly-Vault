@@ -437,6 +437,15 @@ function renderSidebar() {
     rem.appendChild(iconSpan('x'));
     rem.addEventListener('click', async (e) => {
       e.stopPropagation();
+      // Removing a library drops it (and its place in the sidebar) from Poly
+      // Vault; tags/descriptions stay in the data folder and the files on disk
+      // are never touched. Still worth a deliberate confirmation.
+      const confirmed = window.confirm(
+        `Remove the library \u201C${lib.name}\u201D from Poly Vault?\n\n`
+        + 'Its tags, descriptions and import history stay in the data folder, and the '
+        + 'asset files themselves are not touched. You can add the folder again at any time.'
+      );
+      if (!confirmed) return;
       await assetVault.removeLibrary(lib.id);
       state.activeLibId = null;
       state.activeNode = null;
@@ -549,6 +558,11 @@ function renderTreeRow(node, libId, parent, depth) {
       state.activeNode = { libId, rel: node.rel };
       state.selectedAssetId = node.asset.id;
       state.detail = { kind: 'asset', libId, assetId: node.asset.id };
+      if (isPackage) {
+        // Fill the main pane with this package's files.
+        if (!state.expanded.has(pkgKey)) state.expanded.add(pkgKey);
+        loadPackageTree(node.asset);
+      }
       refresh();
     });
   }
@@ -584,6 +598,124 @@ function toggleContainer(key) {
   renderSidebar();
 }
 
+// ---------- package entries in the main pane ----------
+
+const IMAGE_ENTRY_EXT = /^(png|jpe?g|webp|gif|bmp|tga|psd|tiff?|exr|hdr)$/i;
+const AUDIO_ENTRY_EXT = /^(wav|mp3|ogg|aiff?|flac|xm|mod|it|s3m)$/i;
+const VIDEO_ENTRY_EXT = /^(mp4|mov|avi|webm|m4v|mpe?g)$/i;
+const MODEL_ENTRY_EXT = /^(fbx|obj|glb|gltf|blend|dae|3ds|dxf|stl|ply)$/i;
+
+function entryExt(entry) {
+  const m = /\.([A-Za-z0-9]+)$/.exec(entry.path || '');
+  return m ? m[1] : '';
+}
+
+function entryPreviewUrl(pkgAsset, entry) {
+  return `/api/package/preview?path=${encodeURIComponent(pkgAsset.folder)}&entry=${encodeURIComponent(entry.path)}`;
+}
+
+function entryFileUrl(pkgAsset, entry) {
+  return `/api/file?path=${encodeURIComponent(pkgAsset.folder)}&entry=${encodeURIComponent(entry.path)}`;
+}
+
+function selectPackageEntry(pkgAsset, entry, libId) {
+  state.activeLibId = libId || pkgAsset._libId || pkgAsset.libraryId;
+  state.activeNode = null;
+  state.selectedAssetId = null;
+  state.detail = { kind: 'packageEntry', libId: state.activeLibId, pkg: pkgAsset.folder, entry: entry.path, node: entry, pkgAsset };
+  refresh();
+}
+
+function createPackageEntryCard(entry, pkgAsset, index) {
+  const ext = entryExt(entry);
+  const card = el('div', 'card package-entry-card');
+  card.dataset.entry = entry.path;
+  const selected = state.detail && state.detail.kind === 'packageEntry' && state.detail.entry === entry.path;
+  if (selected) card.classList.add('selected');
+  card.style.animationDelay = `${Math.min((index % 12) * 16, 180)}ms`;
+
+  const thumb = el('div', 'thumb');
+  if (IMAGE_ENTRY_EXT.test(ext) || MODEL_ENTRY_EXT.test(ext) || VIDEO_ENTRY_EXT.test(ext)) {
+    const img = el('img');
+    img.loading = 'lazy';
+    img.src = entryPreviewUrl(pkgAsset, entry);
+    img.addEventListener('load', () => img.classList.add('loaded'));
+    img.addEventListener('error', () => img.replaceWith(el('div', 'no-image', ext.toUpperCase().slice(0, 3))));
+    thumb.appendChild(img);
+  } else {
+    thumb.appendChild(el('div', 'no-image', AUDIO_ENTRY_EXT.test(ext) ? '\u266B' : ext.toUpperCase().slice(0, 3) || '?'));
+  }
+  const badges = el('div', 'badges');
+  badges.appendChild(el('span', 'badge', ext ? ext.toLowerCase() : entry.kind));
+  thumb.appendChild(badges);
+  card.appendChild(thumb);
+
+  // Same structure as a normal card, so the shared styles apply.
+  const body = el('div', 'card-body');
+  body.appendChild(el('div', 'card-name', entry.name));
+  body.appendChild(el('div', 'card-meta',
+    `${entry.dir ? entry.dir.split('/').pop() + '/' : ''}${fmtBytes(entry.size || 0)}`));
+  card.appendChild(body);
+
+  card.addEventListener('click', () => selectPackageEntry(pkgAsset, entry));
+  return card;
+}
+
+// Large preview shown at the top of the main pane for the selected file.
+function buildEntryPreview(pkgAsset, entry) {
+  const ext = entryExt(entry);
+  const box = el('div', 'entry-preview');
+
+  const head = el('div', 'entry-preview-head');
+  head.appendChild(el('span', 'entry-preview-name', entry.name));
+  head.appendChild(el('span', 'entry-preview-meta', `${fmtBytes(entry.size || 0)} \u00B7 ${entry.dir || 'package root'}`));
+  box.appendChild(head);
+
+  const stage = el('div', 'entry-preview-stage');
+
+  if (IMAGE_ENTRY_EXT.test(ext)) {
+    const img = el('img', 'entry-preview-image');
+    img.loading = 'lazy';
+    img.src = entryFileUrl(pkgAsset, entry);
+    img.alt = entry.name;
+    stage.appendChild(img);
+  } else if (AUDIO_ENTRY_EXT.test(ext)) {
+    const audio = el('audio', 'entry-preview-audio');
+    audio.controls = true;
+    audio.preload = 'none';
+    audio.src = entryFileUrl(pkgAsset, entry);
+    stage.appendChild(audio);
+    stage.appendChild(el('div', 'entry-preview-note', 'Streamed from inside the package on demand.'));
+  } else if (VIDEO_ENTRY_EXT.test(ext)) {
+    const video = el('video', 'entry-preview-video');
+    video.controls = true;
+    video.preload = 'none';
+    video.src = entryFileUrl(pkgAsset, entry);
+    stage.appendChild(video);
+  } else if (MODEL_ENTRY_EXT.test(ext)) {
+    // No 3D engine in this build: show Unity's own render of the asset.
+    const img = el('img', 'entry-preview-image');
+    img.loading = 'lazy';
+    img.src = entryPreviewUrl(pkgAsset, entry);
+    img.alt = entry.name;
+    img.addEventListener('error', () => {
+      img.replaceWith(el('div', 'entry-preview-note',
+        'Unity stored no preview for this model. Import it to inspect it in 3D.'));
+    });
+    stage.appendChild(img);
+    stage.appendChild(el('div', 'entry-preview-note',
+      'Unity\u2019s own preview of the model. Import the file to open it in the editor.'));
+  } else {
+    stage.appendChild(el('div', 'entry-preview-note',
+      `No inline preview for .${ext || '?'} \u2014 import it, or open the whole package.`));
+  }
+
+  box.appendChild(stage);
+  box.appendChild(el('div', 'entry-preview-actions',
+    'Use the panel on the right to import this file or the whole package.'));
+  return box;
+}
+
 // ---------- package entries (a .unitypackage browsed as a folder) ----------
 
 async function loadPackageTree(pkgAsset) {
@@ -591,7 +723,7 @@ async function loadPackageTree(pkgAsset) {
   const existing = state.packageTrees.get(pkgPath);
   if (existing && (existing.loading || existing.tree)) return;
   state.packageTrees.set(pkgPath, { loading: true });
-  renderSidebar();
+  renderGrid();     // show "reading package…" immediately
 
   const attempt = async (retriesLeft) => {
     try {
@@ -604,7 +736,7 @@ async function loadPackageTree(pkgAsset) {
           shown: json.shown,
           truncated: json.truncated,
         });
-        renderSidebar();
+        refresh();      // sidebar *and* main pane
         return;
       }
       if (json.indexing && retriesLeft > 0) {
@@ -612,11 +744,11 @@ async function loadPackageTree(pkgAsset) {
         return;
       }
       state.packageTrees.set(pkgPath, { error: json.error || 'contents unavailable' });
-      renderSidebar();
+      refresh();
     } catch (_) {
       if (retriesLeft > 0) { setTimeout(() => attempt(retriesLeft - 1), 3000); return; }
       state.packageTrees.set(pkgPath, { error: 'contents unavailable' });
-      renderSidebar();
+      refresh();
     }
   };
   attempt(20);
@@ -951,6 +1083,12 @@ function createCard(a, i) {
   card.addEventListener('click', () => {
     state.selectedAssetId = a.id;
     state.detail = { kind: 'asset', libId: a._libId, assetId: a.id };
+    if (a.packageFile) {
+      // A package opens like a folder: main pane lists what is inside.
+      loadPackageTree(a);
+      refresh();
+      return;
+    }
     document.querySelectorAll('.card.selected').forEach((c) => c.classList.remove('selected'));
     card.classList.add('selected');
     renderDetail();
@@ -958,8 +1096,78 @@ function createCard(a, i) {
   return card;
 }
 
+// The package whose contents should fill the main pane, when one is selected
+// (or expanded) in the sidebar.
+function activePackageAsset() {
+  if (!state.detail) return null;
+  if (state.detail.kind === 'asset') {
+    const a = findAssetById(state.detail.assetId);
+    return a && a.packageFile ? a : null;
+  }
+  if (state.detail.kind === 'packageEntry' && state.detail.pkgAsset) return state.detail.pkgAsset;
+  if (state.detail.kind === 'package' && state.detail.pkgAsset) return state.detail.pkgAsset;
+  return null;
+}
+
+// Flattened entries of the active package (what the grid shows instead of the
+// library's cards while you are browsing inside a package).
+function packageEntries(pkgAsset) {
+  const loaded = state.packageTrees.get(pkgAsset.folder);
+  if (!loaded || !loaded.tree) return null;
+  const out = [];
+  const walk = (nodes, base) => {
+    for (const n of nodes) {
+      if (n.type === 'container') walk(n.children || [], base);
+      else out.push({ ...n, dir: base });
+    }
+  };
+  walk(loaded.tree, '');
+  return out;
+}
+
 function renderGrid() {
   const grid = $('#grid');
+  const pkg = activePackageAsset();
+  const entries = pkg ? packageEntries(pkg) : null;
+
+  if (pkg && !entries) {
+    grid.innerHTML = '';
+    grid.classList.add('package-grid');
+    const loaded = state.packageTrees.get(pkg.folder);
+    $('#empty-state').classList.remove('visible');
+    grid.appendChild(el('div', 'package-loading',
+      loaded && loaded.error ? loaded.error : 'reading package\u2026'));
+    return;
+  }
+
+  // Browsing inside a package: the main pane lists its files, not the library.
+  if (pkg && entries) {
+    grid.innerHTML = '';
+    grid.classList.add('package-grid');
+    $('#empty-state').classList.remove('visible');
+    if (!entries.length) {
+      $('#empty-state').classList.add('visible');
+      $('#empty-state').textContent = 'This package has no readable entries.';
+      return;
+    }
+    const selectedEntry = state.detail && state.detail.kind === 'packageEntry'
+      ? entries.find((e) => e.path === state.detail.entry)
+      : null;
+    if (selectedEntry) grid.appendChild(buildEntryPreview(pkg, selectedEntry));
+
+    const token = ++currentGridToken;
+    entries
+      .slice()
+      .sort((a, b) => b.size - a.size)
+      .slice(0, 300)
+      .forEach((entry, i) => {
+        if (token !== currentGridToken) return;
+        grid.appendChild(createPackageEntryCard(entry, pkg, i));
+      });
+    return;
+  }
+  grid.classList.remove('package-grid');
+
   const assets = assetsFiltered(true);
   grid.innerHTML = '';
   const empty = $('#empty-state');
