@@ -225,7 +225,9 @@ function statInfo(absPath) {
   try {
     const st = fs.statSync(absPath);
     return {
-      created: st.birthtime && !isNaN(st.birthtime.getTime()) ? st.birthtime.toISOString() : null,
+      // NFS/SMB frequently reports no birth time (0); showing 1970 is worse
+      // than showing nothing.
+      created: st.birthtimeMs > 0 ? st.birthtime.toISOString() : null,
       updated: st.mtime ? st.mtime.toISOString() : null,
     };
   } catch (_) {
@@ -267,6 +269,62 @@ function sortByName(nodes) {
   for (const n of nodes) if (n.type === 'container') sortByName(n.children);
 }
 
+// Builds an asset node backed by a single file (a .unitypackage in Unity's
+// Asset Store cache). The asset "folder" is that file, which keeps tag/meta
+// keys unique per package and lets the import job carry one importable.
+function packageAssetNode(lib, parentRel, file, getTags, getMeta) {
+  const name = path.basename(file.name, path.extname(file.name));
+  const fileRel = `${parentRel}/${file.name}`;
+  let st = null;
+  try { st = fs.statSync(file.path); } catch (_) { st = null; }
+  const created = st && st.birthtimeMs > 0 ? st.birthtime.toISOString() : null;
+  const updated = st && st.mtime ? st.mtime.toISOString() : null;
+  const sizeBytes = st ? st.size : 0;
+  const tags = getTags ? (Array.isArray(getTags(file.path)) ? getTags(file.path) : []) : [];
+  const description = getMeta ? getMeta(file.path) || '' : '';
+  const importables = [{ name: file.name, path: file.path, rel: file.name, kind: 'unitypackage' }];
+
+  return {
+    type: 'asset',
+    name,
+    path: file.path,
+    rel: fileRel,
+    count: 1,
+    assetCount: 1,
+    fileCount: 1,
+    sizeBytes,
+    kindCounts: { unitypackage: 1 },
+    tags,
+    created,
+    updated,
+    description,
+    children: [],
+    asset: {
+      id: `${lib.id}:${hashString(file.path)}`,
+      name,
+      relPath: fileRel,
+      category: parentRel,
+      libraryId: lib.id,
+      libraryName: lib.name,
+      folder: file.path,
+      sizeBytes,
+      fileCount: 1,
+      kindCounts: { unitypackage: 1 },
+      preview: null,
+      importables,
+      importable: true,
+      kinds: ['unitypackage'],
+      kind: 'unitypackage',
+      tags,
+      created,
+      updated,
+      description,
+      // Hint for hosts/UI: this card is one package file, not a folder.
+      packageFile: true,
+    },
+  };
+}
+
 // Returns null when the folder should be ignored or contains no assets.
 function scanDirectory(lib, absPath, rel, depth, getTags, getMeta) {
   const name = path.basename(absPath);
@@ -300,6 +358,43 @@ function scanDirectory(lib, absPath, rel, depth, getTags, getMeta) {
   const hasDirectImportable = directFiles.some(
     (f) => IMPORTABLE_EXTENSIONS.has(path.extname(f.name).toLowerCase())
   );
+
+  const directPackages = directFiles.filter(
+    (f) => path.extname(f.name).toLowerCase() === '.unitypackage'
+  );
+  const otherDirectImportables = directFiles.filter((f) => {
+    const ext = path.extname(f.name).toLowerCase();
+    return IMPORTABLE_EXTENSIONS.has(ext) && ext !== '.unitypackage';
+  });
+
+  // Unity's own Asset Store cache is laid out as
+  //   <Publisher>/<Category>/<Package Name>.unitypackage
+  // with no per-package folder and no preview. Treating the category folder as
+  // one asset would hide every package behind a single card, so when a folder
+  // holds nothing but packages (and no preview) each package becomes its own
+  // asset: real names, real tags/descriptions, one importable each.
+  if (!hasDirectPreview && directPackages.length > 0 && otherDirectImportables.length === 0) {
+    const children = directPackages.map((file) => packageAssetNode(lib, rel, file, getTags, getMeta));
+    const agg = aggregateChildren(children);
+    const info = statInfo(absPath);
+    return {
+      type: 'container',
+      name,
+      path: absPath,
+      rel,
+      count: agg.assetCount,
+      assetCount: agg.assetCount,
+      fileCount: agg.fileCount,
+      sizeBytes: agg.sizeBytes,
+      kindCounts: agg.kindCounts,
+      tags: agg.tags,
+      created: info.created,
+      updated: maxUpdated(children, info.updated),
+      description: getMeta ? getMeta(absPath) || '' : '',
+      children,
+      asset: null,
+    };
+  }
 
   // A folder only counts as an asset when something importable or a preview
   // image sits *directly* inside it. Otherwise it is a container that we
