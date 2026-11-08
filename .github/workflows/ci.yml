@@ -1,0 +1,96 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  IMAGE: poly-vault:ci
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t "$IMAGE" .
+
+      - name: Build source stage (for the upstream test suite)
+        run: docker build --target source -t poly-vault:ci-source .
+
+      - name: Upstream smoke tests (scanner, bridge, enrichment)
+        run: docker run --rm --entrypoint node poly-vault:ci-source /app/tests/smoke.js
+
+      - name: Create fixture library
+        run: |
+          ./scripts/make-fixture-library.sh /tmp/assets
+          ls /tmp/assets/demo-assets
+
+      - name: Start container
+        run: |
+          docker run -d --name poly-vault --init --read-only --tmpfs /tmp \
+            -p 8080:8080 \
+            -e PV_TOKEN=ci-token \
+            -e PV_USERS="alice:tok-alice,bob:tok-bob" \
+            -e PV_ADMIN_TOKEN=ci-admin \
+            -e ASSETVAULT_NO_ENRICH=1 \
+            -v poly-vault-ci-data:/data \
+            -v /tmp/assets:/assets:ro \
+            "$IMAGE"
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/healthz | grep -q '"ok":true'; then break; fi
+            sleep 1
+          done
+          docker logs poly-vault
+          curl -fsS http://127.0.0.1:8080/healthz
+
+      - name: Phase 2 checks (gzip, ETag, thumbnails, audit, metrics, incremental scan)
+        run: ./scripts/verify-phase2.sh http://127.0.0.1:8080 tok-alice /tmp/assets poly-vault
+
+      - name: Phase 3 checks (HTTP import, per-artist job targeting)
+        run: ./scripts/verify-phase3.sh http://127.0.0.1:8080 tok-alice tok-bob /tmp/assets
+
+      - name: Browser checks (sign-in, grid, thumbnails, tag write, download, 304 polling)
+        run: ./scripts/verify-ui.sh http://127.0.0.1:8080 tok-alice
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs --tail 200 poly-vault || true
+
+      - name: Security smoke (unauth, CSRF, traversal, symlink escape)
+        run: |
+          set -e
+          base=http://127.0.0.1:8080
+          fail=0
+          expect() { # name expected actual
+            if [ "$2" = "$3" ]; then echo "PASS $1"; else echo "FAIL $1 expected=$2 got=$3"; fail=1; fi
+          }
+          expect "api needs auth" 401 "$(curl -s -o /dev/null -w '%{http_code}' "$base/api/library")"
+          expect "metrics needs auth" 401 "$(curl -s -o /dev/null -w '%{http_code}' "$base/metrics")"
+          expect "diag disabled" 404 "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer tok-alice' "$base/__diag?action=update")"
+          expect "traversal rejected" 400 "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer tok-alice' "$base/api/preview?path=/assets/../../../etc/hostname")"
+          expect "cross-origin write rejected" 403 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H 'Authorization: Bearer tok-alice' -H 'Origin: https://evil.example' -H 'Content-Type: application/json' -d '{"path":"/assets","tags":[]}' "$base/api/tags")"
+          expect "no wildcard CORS" "" "$(curl -s -D - -o /dev/null -X OPTIONS -H 'Origin: https://evil.example' "$base/api/tags" | grep -i 'access-control-allow-origin' || true)"
+          exit $fail
+
+      - name: Export Unity package from the image + upload artefacts
+        run: |
+          docker create --name pv-artifacts "$IMAGE"
+          docker cp pv-artifacts:/app/plugin/. dist/
+          docker rm -f pv-artifacts
+          ls -l dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unity-package
+          path: dist/PolyVault-Unity-*
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f poly-vault || true
+          docker volume rm poly-vault-ci-data || true
