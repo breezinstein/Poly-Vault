@@ -7,12 +7,17 @@ namespace AssetVault.EditorTools
 {
     public class AssetVaultWindow : EditorWindow
     {
-        private string _url = AssetVaultSettings.ServerUrl;
-        private string _token = AssetVaultSettings.Token;
-        private bool _autoSync = AssetVaultSettings.AutoSync;
-        private bool _autoImport = AssetVaultSettings.AutoImport;
-        private float _interval = AssetVaultSettings.SyncIntervalSeconds;
+        // No field initializers here: EditorWindow is a ScriptableObject, and
+        // Unity forbids EditorPrefs access while it is being constructed
+        // ("GetString is not allowed to be called from a ScriptableObject
+        // constructor"). Everything is loaded in OnEnable instead.
+        private string _url;
+        private string _token;
+        private bool _autoSync;
+        private bool _autoImport;
+        private float _interval;
         private Vector2 _scroll;
+        private bool _loaded;
 
         [MenuItem("Window/Poly Vault/Poly Vault", priority = 500)]
         public static void OpenWindow()
@@ -28,6 +33,11 @@ namespace AssetVault.EditorTools
 
         private void OnEnable()
         {
+            // Settings live in EditorPrefs, which is only safe to read here.
+            LoadSettings();
+
+            // Unsubscribe first so a domain reload can't double-subscribe.
+            AssetVaultQueue.JobsChanged -= OnJobsChanged;
             AssetVaultQueue.JobsChanged += OnJobsChanged;
             AssetVaultQueue.PollNow();
         }
@@ -37,10 +47,21 @@ namespace AssetVault.EditorTools
             AssetVaultQueue.JobsChanged -= OnJobsChanged;
         }
 
+        private void LoadSettings()
+        {
+            _url = AssetVaultSettings.ServerUrl;
+            _token = AssetVaultSettings.Token;
+            _autoSync = AssetVaultSettings.AutoSync;
+            _autoImport = AssetVaultSettings.AutoImport;
+            _interval = AssetVaultSettings.SyncIntervalSeconds;
+            _loaded = true;
+        }
+
         private void OnJobsChanged() { Repaint(); }
 
         private void OnGUI()
         {
+            if (!_loaded) LoadSettings();
             EditorGUILayout.Space(4);
             DrawSettings();
             DrawActions();
