@@ -203,7 +203,12 @@ function startBridge({ host = '127.0.0.1', port = 7100, getState, tags, meta, on
           const entry = metaMap[key];
           return entry && entry.description ? entry.description : '';
         };
-        const rescanned = libs.map((lib) => scan(lib, { getTags: getTagsFor, getMeta: getMetaFor }));
+        // `scan` may be asynchronous (the web build runs it on a worker thread
+        // to keep this HTTP server responsive during slow network-filesystem
+        // walks). Awaiting a sync value is free, so desktop behaviour is intact.
+        const rescanned = await Promise.all(
+          libs.map((lib) => scan(lib, { getTags: getTagsFor, getMeta: getMetaFor }))
+        );
         if (enrichment && enrichment.request) {
           const fresh = [];
           for (const lib of rescanned) {
