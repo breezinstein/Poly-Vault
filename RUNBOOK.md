@@ -113,14 +113,32 @@ must also update the token in Unity: **Window → Poly Vault → Access token**.
 
 ## 6. Adding a library
 
-Preferred: mount it.
+Preferred: mount it and list it. One mounted root = one library, and the
+library's display name is the folder name:
 
 ```yaml
-volumes:
-  - /srv/assets/characters:/assets/characters:ro
+    volumes:
+      - "${PV_ASSETS:-/srv/assets}:/assets:ro"
+      - "${PV_ASSETS_2:-/srv/assets-2}:/libraries/Second Library:ro"
+    environment:
+      PV_LIBRARIES: "/assets:/libraries/Second Library"
+      PV_LIBRARY_ROOTS: "/assets:/libraries"
 ```
 
-Then `docker compose up -d`. It is auto-registered on boot (`PV_LIBRARIES=/assets`).
+Then `docker compose up -d`. Both roots are registered on boot; folders inside a
+root are categories, not separate libraries.
+
+Notes:
+
+- Paths may contain spaces (`:/libraries/Other Unity Assets`) — quote the mount
+  in compose and keep the env value quoted too.
+- Existing tags/descriptions are keyed by absolute path: **changing a library's
+  mount point strands its annotations** and re-reads its package index. Add new
+  libraries at new paths instead of moving old ones.
+- `PV_ENRICH_ROOTS` defaults to `/assets` in compose. Point it at a hand-curated
+  library too only if its folder names are real product names — otherwise the
+  Asset Store lookup attaches unrelated descriptions ("Meshes" matched a
+  landscape pack).
 
 Alternative: `POST /api/web/libraries` with the admin token and a path that lives
 under `PV_LIBRARY_ROOTS` (also reachable from the UI's **Add Library** button when

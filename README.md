@@ -96,6 +96,13 @@ Cost: gzip is not seekable, so a full pass reads the archives once — for the
 (≈5–10 GB, minutes) and the optional full pass up to 256 MB per package. Both
 are budgeted, sequential and resumable.
 
+Multiple libraries: mount each root read-only and list it in `PV_LIBRARIES`
+(colon-separated). The folder name becomes the library name, so
+`/libraries/Other Unity Assets` shows up as **Other Unity Assets**. Every root
+must also sit under `PV_LIBRARY_ROOTS` if you want the in-app "Add Library"
+button to reach it. Keep existing libraries at their existing paths — tags and
+descriptions are keyed by absolute path.
+
 **Unity's cache layout is understood natively.** The export is
 `<Publisher>/<Category>/<Package Name>.unitypackage` with no per-package folder
 and no previews. Poly Vault turns **each package into its own card** (real name,

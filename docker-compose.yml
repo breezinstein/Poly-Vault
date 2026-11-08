@@ -32,8 +32,10 @@ services:
       # same-origin check accepts your users' Origin header.
       PV_PUBLIC_ORIGIN: "${PV_PUBLIC_ORIGIN:-}"
       # --- libraries --------------------------------------------------------
-      PV_LIBRARIES: "/assets"
-      PV_LIBRARY_ROOTS: "/assets"
+      # Colon-separated roots; each one shows up as a library in the UI
+      # (its display name is the folder name).
+      PV_LIBRARIES: "${PV_LIBRARIES:-/assets}"
+      PV_LIBRARY_ROOTS: "${PV_LIBRARY_ROOTS:-/assets:/libraries}"
       # --- scanning / enrichment -------------------------------------------
       # Max age of a cached scan. fs.watch handles local changes immediately on
       # a local disk; inotify does NOT report changes made by other machines on
@@ -57,16 +59,21 @@ services:
       # Asset Store description scraping is outbound internet traffic; turn it
       # off on air-gapped hosts and on libraries that are already tagged.
       ASSETVAULT_NO_ENRICH: "0"
+      # Only auto-describe the Asset Store cache: its folder names are real
+      # product names. Hand-curated folders ("Meshes", "Models") otherwise match
+      # random store products and get misleading descriptions.
+      PV_ENRICH_ROOTS: "${PV_ENRICH_ROOTS:-/assets}"
     volumes:
       # Metadata only (tags, descriptions, library list, import jobs).
       # A named volume is created with the right ownership (uid 10001) for you;
       # a bind mount like ./data:/data needs `chown -R 10001:10001 ./data`.
       - poly_vault_data:/data
-      # Your asset library, mounted read-only (Poly Vault never writes to it).
-      # A local directory is the default; for an NFS export use the volume form
-      # documented in the top-level `volumes:` block below and replace this line
-      # with `nas_unity_assets:/assets:ro`.
+      # Asset libraries, mounted read-only (Poly Vault never writes to them).
+      # Every mounted root must also appear in PV_LIBRARIES, and inside
+      # PV_LIBRARY_ROOTS if you want to add libraries from the UI.
       - "${PV_ASSETS:-/srv/assets}:/assets:ro"
+      # A second library, e.g. a hand-curated folder next to the store cache:
+      # - "${PV_ASSETS_2:-/srv/assets-2}:/libraries/Second Library:ro"
     security_opt:
       - no-new-privileges:true
     cap_drop:
