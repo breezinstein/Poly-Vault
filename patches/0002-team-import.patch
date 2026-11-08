@@ -1,0 +1,767 @@
+diff --git a/src/main/bridgeServer.js b/src/main/bridgeServer.js
+index b2f15f4..d9445a9 100644
+--- a/src/main/bridgeServer.js
++++ b/src/main/bridgeServer.js
+@@ -58,9 +58,27 @@ function createJob(asset, now = new Date()) {
+     createdAt: now.toISOString(),
+     updatedAt: now.toISOString(),
+     note: '',
++    // Team fields (empty in single-user desktop mode): who asked, which
++    // machine may take it, and which machine took it.
++    requestedBy: '',
++    targetUser: '',
++    claimedBy: '',
+   };
+ }
+ 
++// The Unity plugin identifies itself with X-PV-Artist (its configured artist
++// name). Jobs are only handed out to a matching artist, or to anyone when the
++// job has no target.
++function jobArtist(req) {
++  return String(req.headers['x-pv-artist'] || '').trim().toLowerCase();
++}
++
++function visibleToArtist(job, artist) {
++  if (!artist) return true;
++  if (job.claimedBy && job.claimedBy !== artist) return false;
++  return !job.targetUser || String(job.targetUser).toLowerCase() === artist;
++}
++
+ function sendJson(res, code, payload) {
+   const body = JSON.stringify(payload);
+   res.writeHead(code, {
+@@ -406,6 +424,9 @@ function startBridge({ host = '127.0.0.1', port = 7100, getState, tags, meta, on
+           tags: body.tags,
+           importables: body.importables,
+         });
++        const requestedBy = String(req.headers['x-pv-user'] || '').trim();
++        job.requestedBy = requestedBy;
++        job.targetUser = requestedBy;
+         state.jobs.push(job);
+         const pruned = pruneJobs(state.jobs);
+         state.jobs.length = 0;
+@@ -416,14 +437,23 @@ function startBridge({ host = '127.0.0.1', port = 7100, getState, tags, meta, on
+       }
+ 
+       if (req.method === 'GET' && route === '/api/import-jobs') {
+-        sendJson(res, 200, { ok: true, jobs: state.jobs });
++        // The web UI only shows the caller's own requests (plus untargeted
++        // jobs from desktop/shared-token users) so badge state stays per person.
++        const user = String(req.headers['x-pv-user'] || '').trim();
++        const jobs = user
++          ? state.jobs.filter((j) => !j.requestedBy || j.requestedBy === user)
++          : state.jobs;
++        sendJson(res, 200, { ok: true, jobs });
+         return;
+       }
+ 
+       if (req.method === 'GET' && route === '/api/unity/import-jobs') {
+         lastUnitySeen = Date.now();
+-        const active = state.jobs.filter((j) => !TERMINAL_STATES.has(j.status));
+-        sendJson(res, 200, { ok: true, jobs: active });
++        const artist = jobArtist(req);
++        const active = state.jobs
++          .filter((j) => !TERMINAL_STATES.has(j.status))
++          .filter((j) => visibleToArtist(j, artist));
++        sendJson(res, 200, { ok: true, jobs: active, artist });
+         return;
+       }
+ 
+@@ -450,6 +480,8 @@ function startBridge({ host = '127.0.0.1', port = 7100, getState, tags, meta, on
+             ? JOB_STATES.FAILED
+             : JOB_STATES.PROCESSING;
+         job.note = body.note || '';
++        const artist = jobArtist(req);
++        if (artist) job.claimedBy = artist;
+         job.updatedAt = new Date().toISOString();
+         const pruned = pruneJobs(state.jobs);
+         state.jobs.length = 0;
+diff --git a/ui/renderer.js b/ui/renderer.js
+index 1908674..d13ee25 100644
+--- a/ui/renderer.js
++++ b/ui/renderer.js
+@@ -1181,8 +1181,13 @@ function buildDescriptionEditor(targetPath) {
+ 
+ function pathFooter(p) {
+   const f = el('div', 'path-footer');
+-  const open = iconBtn('open-path-btn', 'folderOpen', 'Open folder');
+-  open.title = `Open "${p}" in your file explorer`;
++  // A browser host (web build) cannot open a local file manager; it downloads
++  // the asset folder instead and says so via folderActionLabel.
++  const label = (window.assetVault && window.assetVault.folderActionLabel) || 'Open folder';
++  const open = iconBtn('open-path-btn', 'folderOpen', label);
++  open.title = label === 'Open folder'
++    ? `Open "${p}" in your file explorer`
++    : 'Download this asset folder as a zip';
+   open.addEventListener('click', async (e) => {
+     e.preventDefault();
+     open.disabled = true;
+diff --git a/unity-plugin/PolyVault/Editor/AssetVaultImporter.cs b/unity-plugin/PolyVault/Editor/AssetVaultImporter.cs
+index cc76419..80ade40 100644
+--- a/unity-plugin/PolyVault/Editor/AssetVaultImporter.cs
++++ b/unity-plugin/PolyVault/Editor/AssetVaultImporter.cs
+@@ -3,6 +3,7 @@ using System.Collections.Generic;
+ using System.IO;
+ using UnityEditor;
+ using UnityEngine;
++using UnityEngine.Networking;
+ 
+ namespace AssetVault.EditorTools
+ {
+@@ -110,6 +111,7 @@ namespace AssetVault.EditorTools
+             {
+                 Debug.Log($"[Poly Vault] Package '{packageName}' imported successfully.");
+                 ReportJobResult(job, true, $"Imported package {packageName}.");
++                CleanupCache(job);
+                 AssetVaultQueue.PollNow();
+             }
+         }
+@@ -120,6 +122,7 @@ namespace AssetVault.EditorTools
+             {
+                 Debug.LogWarning($"[Poly Vault] Package '{packageName}' import was cancelled in Unity.");
+                 ReportJobResult(job, false, $"Package '{packageName}' import cancelled in Unity.");
++                CleanupCache(job);
+                 AssetVaultQueue.PollNow();
+             }
+         }
+@@ -130,6 +133,7 @@ namespace AssetVault.EditorTools
+             {
+                 Debug.LogError($"[Poly Vault] Package '{packageName}' import failed: {errorMessage}");
+                 ReportJobResult(job, false, $"Package '{packageName}' import failed: {errorMessage}");
++                CleanupCache(job);
+                 AssetVaultQueue.PollNow();
+             }
+         }
+@@ -183,6 +187,10 @@ namespace AssetVault.EditorTools
+             return combined;
+         }
+ 
++        /// <summary>
++        /// Resolves every importable to a local file, downloading it from the Poly
++        /// Vault server when the library lives on a remote host, then imports.
++        /// </summary>
+         /// <returns>true if the job was accepted (started or completed).</returns>
+         public static bool TryImport(ImportJobDto job, bool interactive, Action<string> log, Action<string, bool> finished)
+         {
+@@ -200,89 +208,40 @@ namespace AssetVault.EditorTools
+             InFlight.Add(job.id);
+             try
+             {
+-                int imported = 0;
+-                int skippedPackages = 0;
+-                bool hasInteractivePackage = false;
+-
+-                string destAssetRoot = Path.Combine(
+-                    ImportRoot.Replace('/', Path.DirectorySeparatorChar),
+-                    Sanitize(job.libraryName),
+-                    Sanitize(job.category),
+-                    Sanitize(job.assetName));
+-
++                var resolved = new List<ResolvedItem>();
+                 foreach (var item in job.importables)
+                 {
+                     if (item == null) continue;
+ 
+-                    if (string.Equals(item.kind, "unitypackage", StringComparison.OrdinalIgnoreCase))
++                    if (!string.IsNullOrEmpty(item.path) && File.Exists(item.path))
+                     {
+-                        if (File.Exists(item.path))
+-                        {
+-                            if (interactive)
+-                            {
+-                                hasInteractivePackage = true;
+-                                RegisterPendingPackage(item, job);
+-                                ReportJobStatus(job, "processing", $"Importing package {item.name} in Unity...");
+-
+-                                // Opens Unity's package import dialog.
+-                                AssetDatabase.ImportPackage(item.path, true);
+-                                log?.Invoke($"Opened package import for {item.name}");
+-                                imported++;
+-                            }
+-                            else
+-                            {
+-                                skippedPackages++;
+-                                log?.Invoke($"Skipped {item.name} (unitypackage needs manual import from the window).");
+-                            }
+-                        }
+-                        else
+-                        {
+-                            log?.Invoke($"Missing file: {item.path}");
+-                        }
+-                        continue;
++                        // Desktop app (or a shared mount): the file is already local.
++                        resolved.Add(new ResolvedItem { Item = item, LocalPath = item.path });
+                     }
+-
+-                    if (!File.Exists(item.path))
++                    else if (AssetVaultSettings.UsesRemoteServer)
+                     {
+-                        log?.Invoke($"Missing file: {item.path}");
+-                        continue;
++                        // Shared web server: fetch it over HTTP into the project cache.
++                        resolved.Add(new ResolvedItem { Item = item, LocalPath = CachePathFor(job, item) });
+                     }
+-
+-                    string dest = UniqueFile(DestinationFor(job, item));
+-                    string destDir = Path.GetDirectoryName(dest);
+-                    if (!Directory.Exists(destDir)) Directory.CreateDirectory(destDir);
+-
+-                    try
++                    else
+                     {
+-                        File.Copy(item.path, dest, overwrite: false);
+-                        imported++;
+-                        log?.Invoke($"Copied {item.name} -> {dest.Replace(Path.DirectorySeparatorChar, '/')}");
+-                    }
+-                    catch (Exception e)
+-                    {
+-                        log?.Invoke($"Copy failed for {item.name}: {e.Message}");
++                        log?.Invoke($"Missing file: {item.path}");
+                     }
+                 }
+ 
+-                AssetDatabase.Refresh();
+-                WriteTagsFile(destAssetRoot, job.tags);
+-
+-                if (hasInteractivePackage)
++                bool needsDownload = false;
++                foreach (var entry in resolved)
+                 {
+-                    finished?.Invoke($"Opened package import dialog for {job.assetName}.", true);
+-                    return true;
++                    if (!File.Exists(entry.LocalPath)) { needsDownload = true; break; }
+                 }
+ 
+-                if (imported == 0 && skippedPackages > 0)
++                if (!needsDownload)
+                 {
+-                    finished?.Invoke("Only unitypackage files pending manual import.", false);
+-                    InFlight.Remove(job.id);
++                    ImportResolved(job, resolved, interactive, log, finished);
+                     return true;
+                 }
+ 
+-                InFlight.Remove(job.id);
+-                ReportJobResult(job, true, $"Imported {imported} file(s).");
+-                finished?.Invoke($"Imported {imported} file(s).", true);
++                DownloadThenImport(job, resolved, 0, interactive, log, finished);
+                 return true;
+             }
+             catch (Exception e)
+@@ -296,6 +255,174 @@ namespace AssetVault.EditorTools
+             }
+         }
+ 
++        private sealed class ResolvedItem
++        {
++            public ImportableDto Item;
++            public string LocalPath;
++        }
++
++        private static string CacheDirFor(ImportJobDto job) =>
++            Path.Combine("Library", "PolyVaultCache", Sanitize(job.id));
++
++        private static string CachePathFor(ImportJobDto job, ImportableDto item)
++        {
++            string rel = string.IsNullOrEmpty(item.rel) ? item.name : item.rel;
++            string root = Path.GetFullPath(CacheDirFor(job));
++            string combined = Path.GetFullPath(Path.Combine(root, rel.Replace('/', Path.DirectorySeparatorChar)));
++            if (!combined.StartsWith(root, StringComparison.OrdinalIgnoreCase))
++                combined = Path.Combine(root, Sanitize(item.name));
++            return combined;
++        }
++
++        private static string DownloadUrlFor(ImportableDto item) =>
++            $"{AssetVaultSettings.ServerUrl}/api/file?path={UnityWebRequest.EscapeURL(item.path)}";
++
++        /// <summary>
++        /// Downloads the still-missing files one at a time, then imports. Sequential
++        /// on purpose: keeps the editor responsive and is kind to the server.
++        /// </summary>
++        private static void DownloadThenImport(ImportJobDto job, List<ResolvedItem> resolved, int index,
++            bool interactive, Action<string> log, Action<string, bool> finished)
++        {
++            while (index < resolved.Count && File.Exists(resolved[index].LocalPath)) index++;
++            if (index >= resolved.Count)
++            {
++                ImportResolved(job, resolved, interactive, log, finished);
++                return;
++            }
++
++            var entry = resolved[index];
++            log?.Invoke($"Downloading {entry.Item.name} ({index + 1}/{resolved.Count})...");
++            ReportJobStatus(job, "processing", $"Downloading {entry.Item.name}");
++
++            AssetVaultWeb.DownloadFile(DownloadUrlFor(entry.Item), entry.LocalPath, (ok, error) =>
++            {
++                if (!ok)
++                {
++                    InFlight.Remove(job.id);
++                    log?.Invoke($"Download failed for {entry.Item.name}: {error}");
++                    ReportJobResult(job, false, $"Download failed for {entry.Item.name}: {error}");
++                    finished?.Invoke($"Download failed: {error}", false);
++                    return;
++                }
++
++                try
++                {
++                    DownloadThenImport(job, resolved, index + 1, interactive, log, finished);
++                }
++                catch (Exception e)
++                {
++                    InFlight.Remove(job.id);
++                    log?.Invoke($"Import failed: {e.Message}");
++                    ReportJobResult(job, false, e.Message);
++                    finished?.Invoke($"Import failed: {e.Message}", false);
++                }
++            });
++        }
++
++        private static void ImportResolved(ImportJobDto job, List<ResolvedItem> resolved, bool interactive,
++            Action<string> log, Action<string, bool> finished)
++        {
++            int imported = 0;
++            int skippedPackages = 0;
++            bool hasInteractivePackage = false;
++
++            string destAssetRoot = Path.Combine(
++                ImportRoot.Replace('/', Path.DirectorySeparatorChar),
++                Sanitize(job.libraryName),
++                Sanitize(job.category),
++                Sanitize(job.assetName));
++
++            foreach (var entry in resolved)
++            {
++                var item = entry.Item;
++                if (item == null) continue;
++
++                if (string.Equals(item.kind, "unitypackage", StringComparison.OrdinalIgnoreCase))
++                {
++                    if (!File.Exists(entry.LocalPath))
++                    {
++                        log?.Invoke($"Missing file: {item.name}");
++                        continue;
++                    }
++                    if (interactive)
++                    {
++                        hasInteractivePackage = true;
++                        RegisterPendingPackage(item, job);
++                        ReportJobStatus(job, "processing", $"Importing package {item.name} in Unity...");
++                        AssetDatabase.ImportPackage(entry.LocalPath, true);
++                        log?.Invoke($"Opened package import for {item.name}");
++                        imported++;
++                    }
++                    else
++                    {
++                        skippedPackages++;
++                        log?.Invoke($"Skipped {item.name} (unitypackage needs manual import from the window).");
++                    }
++                    continue;
++                }
++
++                if (!File.Exists(entry.LocalPath))
++                {
++                    log?.Invoke($"Missing file: {item.name}");
++                    continue;
++                }
++
++                string dest = UniqueFile(DestinationFor(job, item));
++                string destDir = Path.GetDirectoryName(dest);
++                if (!Directory.Exists(destDir)) Directory.CreateDirectory(destDir);
++
++                try
++                {
++                    File.Copy(entry.LocalPath, dest, overwrite: false);
++                    imported++;
++                    log?.Invoke($"Copied {item.name} -> {dest.Replace(Path.DirectorySeparatorChar, '/')}");
++                }
++                catch (Exception e)
++                {
++                    log?.Invoke($"Copy failed for {item.name}: {e.Message}");
++                }
++            }
++
++            AssetDatabase.Refresh();
++            WriteTagsFile(destAssetRoot, job.tags);
++
++            // Unity's package dialog reads the file after ImportPackage returns,
++            // so the cache survives until the pending import completes.
++            if (!hasInteractivePackage) CleanupCache(job);
++
++            if (hasInteractivePackage)
++            {
++                finished?.Invoke($"Opened package import dialog for {job.assetName}.", true);
++                return;
++            }
++
++            if (imported == 0 && skippedPackages > 0)
++            {
++                finished?.Invoke("Only unitypackage files pending manual import.", false);
++                InFlight.Remove(job.id);
++                return;
++            }
++
++            InFlight.Remove(job.id);
++            ReportJobResult(job, true, $"Imported {imported} file(s).");
++            finished?.Invoke($"Imported {imported} file(s).", true);
++        }
++
++        /// <summary>Removes this job's downloaded copies from the project cache; best effort.</summary>
++        private static void CleanupCache(ImportJobDto job)
++        {
++            try
++            {
++                string dir = CacheDirFor(job);
++                if (Directory.Exists(dir)) Directory.Delete(dir, true);
++            }
++            catch (Exception e)
++            {
++                Debug.LogWarning($"[Poly Vault] Could not clean download cache: {e.Message}");
++            }
++        }
++
+         /// <summary>
+         /// Writes the source tags next to the imported asset so the information
+         /// survives inside the project (Assets/.../polyvault.tags.json).
+diff --git a/unity-plugin/PolyVault/Editor/AssetVaultJobs.cs b/unity-plugin/PolyVault/Editor/AssetVaultJobs.cs
+index 7229785..55a20d1 100644
+--- a/unity-plugin/PolyVault/Editor/AssetVaultJobs.cs
++++ b/unity-plugin/PolyVault/Editor/AssetVaultJobs.cs
+@@ -28,6 +28,10 @@ namespace AssetVault.EditorTools
+         public string createdAt;
+         public string updatedAt;
+         public string note;
++        // Team fields set by the server when it runs in team mode.
++        public string requestedBy;
++        public string targetUser;
++        public string claimedBy;
+ 
+         public string DisplayName =>
+             string.IsNullOrEmpty(category) ? assetName : $"{libraryName}/{category}/{assetName}";
+@@ -38,6 +42,8 @@ namespace AssetVault.EditorTools
+     {
+         public bool ok;
+         public List<ImportJobDto> jobs = new List<ImportJobDto>();
++        // Identity the server assigned to this token ("" in shared-token mode).
++        public string artist;
+     }
+ 
+     [Serializable]
+diff --git a/unity-plugin/PolyVault/Editor/AssetVaultQueue.cs b/unity-plugin/PolyVault/Editor/AssetVaultQueue.cs
+index 2baaba2..d316045 100644
+--- a/unity-plugin/PolyVault/Editor/AssetVaultQueue.cs
++++ b/unity-plugin/PolyVault/Editor/AssetVaultQueue.cs
+@@ -20,6 +20,8 @@ namespace AssetVault.EditorTools
+         private static bool _requestInFlight;
+ 
+         public static IReadOnlyList<ImportJobDto> Jobs => LastJobs;
++        /// <summary>Artist/identity the server associated with this token ("" if shared).</summary>
++        public static string Artist { get; private set; } = string.Empty;
+         public static string LastError { get; private set; }
+         public static DateTime LastPollAt { get; private set; }
+         public static event Action JobsChanged;
+@@ -76,8 +78,11 @@ namespace AssetVault.EditorTools
+                 {
+                     var envelope = JsonUtility.FromJson<ImportJobsEnvelope>(text);
+                     LastJobs.Clear();
+-                    if (envelope != null && envelope.jobs != null)
+-                        LastJobs.AddRange(envelope.jobs);
++                    if (envelope != null)
++                    {
++                        Artist = envelope.artist ?? string.Empty;
++                        if (envelope.jobs != null) LastJobs.AddRange(envelope.jobs);
++                    }
+                 }
+                 catch (Exception e)
+                 {
+diff --git a/unity-plugin/PolyVault/Editor/AssetVaultSettings.cs b/unity-plugin/PolyVault/Editor/AssetVaultSettings.cs
+index cfa1767..437521f 100644
+--- a/unity-plugin/PolyVault/Editor/AssetVaultSettings.cs
++++ b/unity-plugin/PolyVault/Editor/AssetVaultSettings.cs
+@@ -4,11 +4,14 @@ using UnityEditor;
+ namespace AssetVault.EditorTools
+ {
+     /// <summary>
+-    /// Editor-pref backed settings for the Asset Vault bridge.
++    /// Editor-pref backed settings for the Poly Vault bridge. Works both against
++    /// the desktop app (loopback, no token) and against a shared web server
++    /// (http(s) URL + access token).
+     /// </summary>
+     public static class AssetVaultSettings
+     {
+         private const string UrlPref = "AssetVault.ServerUrl";
++        private const string TokenPref = "AssetVault.Token";
+         private const string AutoSyncPref = "AssetVault.AutoSync";
+         private const string AutoImportPref = "AssetVault.AutoImport";
+         private const string IntervalPref = "AssetVault.SyncIntervalSec";
+@@ -17,10 +20,27 @@ namespace AssetVault.EditorTools
+ 
+         public static string ServerUrl
+         {
+-            get => EditorPrefs.GetString(UrlPref, DefaultUrl);
+-            set => EditorPrefs.SetString(UrlPref, value);
++            get
++            {
++                string url = EditorPrefs.GetString(UrlPref, DefaultUrl).Trim();
++                return url.TrimEnd('/');
++            }
++            set => EditorPrefs.SetString(UrlPref, (value ?? string.Empty).Trim().TrimEnd('/'));
+         }
+ 
++        /// <summary>
++        /// Access token for a shared Poly Vault web server. Empty when talking to
++        /// the desktop app (which has no auth). Stored in EditorPrefs: it is a
++        /// team-level token, not a personal secret, but keep the machine locked.
++        /// </summary>
++        public static string Token
++        {
++            get => EditorPrefs.GetString(TokenPref, string.Empty);
++            set => EditorPrefs.SetString(TokenPref, (value ?? string.Empty).Trim());
++        }
++
++        public static bool UsesRemoteServer => !string.IsNullOrEmpty(Token);
++
+         public static bool AutoSync
+         {
+             get => EditorPrefs.GetBool(AutoSyncPref, true);
+@@ -39,4 +59,4 @@ namespace AssetVault.EditorTools
+             set => EditorPrefs.SetFloat(IntervalPref, value);
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/unity-plugin/PolyVault/Editor/AssetVaultWeb.cs b/unity-plugin/PolyVault/Editor/AssetVaultWeb.cs
+index b653b61..81c66d3 100644
+--- a/unity-plugin/PolyVault/Editor/AssetVaultWeb.cs
++++ b/unity-plugin/PolyVault/Editor/AssetVaultWeb.cs
+@@ -10,6 +10,9 @@ namespace AssetVault.EditorTools
+     /// Minimal async HTTP for editor scripts. Requests are driven by
+     /// <see cref="EditorApplication.update"/> so they complete on the main thread
+     /// without blocking the UI.
++    ///
++    /// Every request carries the configured access token, so the same code works
++    /// against a local desktop app (no token) and a shared Poly Vault server.
+     /// </summary>
+     public static class AssetVaultWeb
+     {
+@@ -19,11 +22,14 @@ namespace AssetVault.EditorTools
+         {
+             public UnityWebRequest Request;
+             public Action<bool, string> Callback;
++            public bool IsFileDownload;
+         }
+ 
+         private static readonly List<Pending> PendingRequests = new List<Pending>();
+         private static bool _hooked;
+ 
++        public static bool HasToken => !string.IsNullOrEmpty(AssetVaultSettings.Token);
++
+         private static void EnsureHooked()
+         {
+             if (_hooked) return;
+@@ -32,10 +38,18 @@ namespace AssetVault.EditorTools
+             EditorApplication.update += Tick;
+         }
+ 
++        private static void ApplyHeaders(UnityWebRequest req)
++        {
++            string token = AssetVaultSettings.Token;
++            if (!string.IsNullOrEmpty(token))
++                req.SetRequestHeader("Authorization", "Bearer " + token);
++        }
++
+         public static void GetJson(string url, Action<bool, string> done)
+         {
+             var req = UnityWebRequest.Get(url);
+-            req.timeout = 15;
++            req.timeout = 20;
++            ApplyHeaders(req);
+             Start(req, done);
+         }
+ 
+@@ -46,10 +60,42 @@ namespace AssetVault.EditorTools
+             req.uploadHandler = new UploadHandlerRaw(bytes);
+             req.downloadHandler = new DownloadHandlerBuffer();
+             req.SetRequestHeader("Content-Type", "application/json");
+-            req.timeout = 15;
++            req.timeout = 20;
++            ApplyHeaders(req);
+             Start(req, done);
+         }
+ 
++        /// <summary>
++        /// Streams a server file to <paramref name="destPath"/>. Used when the
++        /// asset lives on a shared Poly Vault server instead of the local disk.
++        /// </summary>
++        public static void DownloadFile(string url, string destPath, Action<bool, string> done)
++        {
++            try
++            {
++                string dir = System.IO.Path.GetDirectoryName(destPath);
++                if (!string.IsNullOrEmpty(dir) && !System.IO.Directory.Exists(dir))
++                    System.IO.Directory.CreateDirectory(dir);
++                // DownloadHandlerFile appends/overwrites inconsistently across
++                // Unity versions when the target exists; start from a clean file.
++                if (System.IO.File.Exists(destPath)) System.IO.File.Delete(destPath);
++            }
++            catch (Exception e)
++            {
++                done?.Invoke(false, "Could not create download folder: " + e.Message);
++                return;
++            }
++
++            var req = UnityWebRequest.Get(url);
++            // 0 = no timeout: asset packs can be large on a slow share.
++            req.timeout = 0;
++            req.downloadHandler = new DownloadHandlerFile(destPath);
++            ApplyHeaders(req);
++            EnsureHooked();
++            req.SendWebRequest();
++            PendingRequests.Add(new Pending { Request = req, Callback = done, IsFileDownload = true });
++        }
++
+         private static void Start(UnityWebRequest req, Action<bool, string> done)
+         {
+             EnsureHooked();
+@@ -66,9 +112,22 @@ namespace AssetVault.EditorTools
+                 if (!p.Request.isDone) continue;
+ 
+                 bool ok = p.Request.result == UnityWebRequest.Result.Success;
+-                string textOrError = ok
+-                    ? p.Request.downloadHandler.text
+-                    : (p.Request.error ?? "Request failed");
++                string textOrError;
++                if (!ok)
++                {
++                    textOrError = p.Request.responseCode == 401
++                        ? "401 Unauthorized - check the access token in Window > Poly Vault"
++                        : (p.Request.error ?? "Request failed");
++                }
++                else if (p.IsFileDownload)
++                {
++                    textOrError = string.Empty;
++                }
++                else
++                {
++                    var buffer = p.Request.downloadHandler as DownloadHandlerBuffer;
++                    textOrError = buffer != null ? buffer.text : string.Empty;
++                }
+ 
+                 PendingRequests.RemoveAt(i);
+                 try
+@@ -83,4 +142,4 @@ namespace AssetVault.EditorTools
+             }
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/unity-plugin/PolyVault/Editor/AssetVaultWindow.cs b/unity-plugin/PolyVault/Editor/AssetVaultWindow.cs
+index 807c545..9bb81ba 100644
+--- a/unity-plugin/PolyVault/Editor/AssetVaultWindow.cs
++++ b/unity-plugin/PolyVault/Editor/AssetVaultWindow.cs
+@@ -8,6 +8,7 @@ namespace AssetVault.EditorTools
+     public class AssetVaultWindow : EditorWindow
+     {
+         private string _url = AssetVaultSettings.ServerUrl;
++        private string _token = AssetVaultSettings.Token;
+         private bool _autoSync = AssetVaultSettings.AutoSync;
+         private bool _autoImport = AssetVaultSettings.AutoImport;
+         private float _interval = AssetVaultSettings.SyncIntervalSeconds;
+@@ -53,13 +54,18 @@ namespace AssetVault.EditorTools
+             EditorGUI.BeginChangeCheck();
+ 
+             _url = EditorGUILayout.TextField("Server URL", _url);
++            _token = EditorGUILayout.PasswordField("Access token", _token);
++            if (string.IsNullOrEmpty(_token))
++                EditorGUILayout.HelpBox("No token: talking to the desktop app on this machine only. " +
++                    "For a shared Poly Vault server enter your team token.", MessageType.None);
+             _autoSync = EditorGUILayout.Toggle("Sync in background", _autoSync);
+             _autoImport = EditorGUILayout.Toggle("Auto-import safe jobs", _autoImport);
+             _interval = EditorGUILayout.Slider("Sync interval (s)", _interval, 2f, 120f);
+ 
+             if (EditorGUI.EndChangeCheck())
+             {
+-                AssetVaultSettings.ServerUrl = _url.Trim();
++                AssetVaultSettings.ServerUrl = _url;
++                AssetVaultSettings.Token = _token;
+                 AssetVaultSettings.AutoSync = _autoSync;
+                 AssetVaultSettings.AutoImport = _autoImport;
+                 AssetVaultSettings.SyncIntervalSeconds = _interval;
+@@ -86,8 +92,11 @@ namespace AssetVault.EditorTools
+ 
+                 if (GUILayout.Button("Whitelist help", GUILayout.Height(24)))
+                     EditorUtility.DisplayDialog("Poly Vault",
+-                        "The server only accepts jobs whose asset folder lives inside a registered library.\n\n" +
+-                        "Serves on port 7100 on 127.0.0.1 by default. Edit the URL above to point at your running Poly Vault desktop app.", "OK");
++                        "Point Server URL at your Poly Vault server:\n\n" +
++                        "  desktop app     http://127.0.0.1:7100  (no token)\n" +
++                        "  team web server https://vault.example.com  (with access token)\n\n" +
++                        "Files are downloaded over HTTP and copied into Assets/PolyVaultImports. " +
++                        "The server never modifies your library.", "OK");
+             }
+         }
+ 
+@@ -100,7 +109,7 @@ namespace AssetVault.EditorTools
+             {
+                 EditorGUILayout.HelpBox(
+                     AssetVaultQueue.LastError == null
+-                        ? "No pending imports. Open the Poly Vault desktop app and click “Import to Unity” on an asset."
++                        ? "No pending imports. Click “Import to Unity” on an asset in Poly Vault."
+                         : $"Cannot reach server: {AssetVaultQueue.LastError}",
+                     AssetVaultQueue.LastError == null ? MessageType.Info : MessageType.Warning);
+                 return;
+@@ -135,10 +144,12 @@ namespace AssetVault.EditorTools
+                             EditorGUILayout.LabelField($"• {item.name}  ({item.kind})", EditorStyles.miniLabel);
+                             if (GUILayout.Button("Reveal", EditorStyles.miniButton, GUILayout.Width(58)))
+                             {
++                                // Local (desktop app) jobs reveal the source file; remote
++                                // jobs are only materialised during the import itself.
+                                 if (File.Exists(item.path))
+                                     EditorUtility.RevealInFinder(item.path);
+                                 else
+-                                    Debug.LogWarning($"[Poly Vault] Missing file: {item.path}");
++                                    EditorUtility.RevealInFinder(Path.Combine("Library", "PolyVaultCache", job.id));
+                             }
+                         }
+                     }
+@@ -189,6 +200,16 @@ namespace AssetVault.EditorTools
+             {
+                 EditorGUILayout.HelpBox($"Server error: {AssetVaultQueue.LastError}", MessageType.Warning);
+             }
++            else if (!string.IsNullOrEmpty(AssetVaultQueue.Artist))
++            {
++                EditorGUILayout.LabelField($"Signed in as {AssetVaultQueue.Artist} — jobs addressed to you appear here.",
++                    EditorStyles.miniLabel);
++            }
++            else if (AssetVaultSettings.UsesRemoteServer)
++            {
++                EditorGUILayout.LabelField("Shared token: every machine sees every queued import.",
++                    EditorStyles.miniLabel);
++            }
+ 
+             EditorGUILayout.LabelField(text + "   —   Import target: " + AssetVaultImporter.ImportRoot, EditorStyles.miniLabel);
+         }
+diff --git a/unity-plugin/PolyVault/package.json b/unity-plugin/PolyVault/package.json
+index 3f24391..92ad816 100644
+--- a/unity-plugin/PolyVault/package.json
++++ b/unity-plugin/PolyVault/package.json
+@@ -1,8 +1,8 @@
+ {
+   "name": "com.polyvault.bridge",
+-  "version": "0.4.2",
++  "version": "0.5.2",
+   "displayName": "Poly Vault (Unity bridge)",
+-  "description": "Unity 6 Editor bridge for the Poly Vault desktop app. Pulls import jobs from the local Poly Vault server and imports the queued assets into this project's Assets folder.",
++  "description": "Unity 6 Editor bridge for Poly Vault. Pulls import jobs from a local Poly Vault desktop app or a shared Poly Vault web server and imports them into this project (downloading over HTTP when the library is remote).",
+   "unity": "6000.0",
+   "keywords": [
+     "asset",
+@@ -16,4 +16,4 @@
+     "name": "Zeeshan Qaswar",
+     "email": "zeeshan.qaswar@users.noreply.github.com"
+   }
+-}
+\ No newline at end of file
++}
