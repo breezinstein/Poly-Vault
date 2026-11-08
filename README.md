@@ -30,6 +30,7 @@ decisions taken along the way.
 | `scripts/verify-ui.sh` | 12 browser checks in headless Chromium (sign-in → tag → download → 304 polling) |
 | `scripts/build-plugin.sh` | Builds `dist/PolyVault-Unity-<ver>.tgz/.zip` from the patched source |
 | `scripts/make-fixture-library.sh` | Generates a throwaway library with real PNG previews |
+| `scripts/fetch-webgl.sh` | Vendors the three.js viewers into `ui/webgl/vendor/` (also run by the Dockerfile) |
 | `scripts/backup.sh`, `scripts/restore.sh` | Metadata volume backup + rehearsable restore |
 | `RUNBOOK.md` | Day-2 operations: upgrade, rollback, rotation, troubleshooting |
 | `deploy/Caddyfile.example` | TLS + SSO/basic-auth reverse proxy in front of the container |
@@ -149,6 +150,7 @@ docker volume create poly-vault-data   # then use  poly-vault-data:/data
 | `PV_PACKAGE_INDEX` | `1` | `0` disables the `.unitypackage` index (previews + contents). |
 | `PV_PACKAGE_INDEX_MAX_MB` | `4096` (compose: `150`) | Upper size for the accurate-contents pass. Bigger packages still get a preview plus partial counts. |
 | `PV_SHOW_TOKEN` | `1` | `0` hides the access token in the Settings panel (use with per-person tokens or SSO). |
+| `PV_WEBGL` | `1` | `0` removes the WebGL model viewer deployment-wide (models fall back to Unity thumbnails). |
 | `PV_PUBLIC_ORIGIN` | *(empty)* | Public URL, e.g. `https://vault.example.com`. Needed behind a TLS proxy so the Settings panel hands artists the right URL (otherwise `X-Forwarded-Proto`/`-Host` are used). |
 | `PV_PLUGIN_DIR` | `/app/plugin` | Where the bundled Unity `.tgz` is read from (empty = no download offered). |
 | `PV_ENRICH_ROOTS` | *(empty)* | Only run Asset Store lookups for assets under these paths. |
@@ -208,9 +210,10 @@ assets
   everything inside it — textures, models, audio, scripts, prefabs — with Unity's
   own thumbnails.
 - Selecting a file shows a **preview in the main pane**: images render inline,
-  audio and video get a player, and models show Unity's rendered preview (no 3D
-  engine in this build). Its panel offers **Import this file to Unity**, plus a
-  secondary **Import the whole package instead**.
+  audio and video get a player, and models open in an optional **WebGL viewer**
+  (three.js — OBJ, GLB/glTF, FBX, STL, PLY) with orbit/zoom. With the viewer off,
+  models fall back to Unity's stored thumbnail. Its panel offers **Import this
+  file to Unity**, plus a secondary **Import the whole package instead**.
 - Importing one file makes the server extract it from the archive
   (`GET /api/file?path=<package>&entry=Assets/…`, or the legacy
   `path=<package>#Assets/…` form that add-ons before 0.6.0 build), cache it under
@@ -219,6 +222,21 @@ assets
   prefabs/materials usually need the whole package for their dependencies.
 - Packages indexed by older versions are re-read lazily: the first expand of such
   a package returns `202 indexing`, the UI waits and retries.
+
+## 3D preview (optional WebGL)
+
+Models can be inspected without importing them. The viewer is **three.js**,
+vendored at build time (`scripts/fetch-webgl.sh` → `ui/webgl/vendor/`), so
+nothing is loaded from a CDN, the strict CSP holds, and it works offline.
+
+| | |
+| --- | --- |
+| Formats | OBJ, GLB/glTF, FBX, STL, PLY |
+| Controls | drag to orbit, scroll to zoom (OrbitControls) |
+| Cost | the ~1.1 MB engine is only downloaded when a model is opened, never while the toggle is off |
+| Toggle | **Settings → Preview → 3D model preview (WebGL)** — remembered per browser |
+| Server default | `PV_WEBGL=0` disables it deployment-wide (the toggle hides, models show Unity's thumbnail) |
+| Fallback | unsupported file, parse error or disabled → Unity's stored preview image |
 
 ## What's inside a .unitypackage (previews + contents)
 

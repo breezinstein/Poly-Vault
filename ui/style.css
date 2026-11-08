@@ -1183,3 +1183,16 @@ body.resizing * { cursor: col-resize !important; user-select: none; }
 .entry-preview-audio { width: min(520px, 100%); }
 .entry-preview-note { font-size: 11px; opacity: .6; }
 .entry-preview-actions { font-size: 11px; opacity: .55; margin-top: 8px; }
+
+/* 3D model preview (optional, three.js) */
+.entry-webgl {
+  width: 100%;
+  max-width: 720px;
+  height: 320px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: radial-gradient(circle at 50% 35%, #2b2d34 0%, #1e1f24 70%);
+  cursor: grab;
+}
+.entry-webgl:active { cursor: grabbing; }
+.entry-webgl canvas { display: block; }

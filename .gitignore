@@ -18,3 +18,6 @@ npm-debug.log*
 .DS_Store
 
 # The patch stack is kept for rebasing onto upstream; see patches/README.md
+
+# Vendored by scripts/fetch-webgl.sh at build time
+ui/webgl/vendor/

@@ -59,6 +59,32 @@
     },
 
     fetchUnityDescription: () => Promise.resolve(null),
+
+    // 3D model previews (three.js). The toggle lives in Settings and is stored
+    // per browser; `backend` is filled in asynchronously from the server.
+    webglEnabled: () => {
+      const pref = window.localStorage.getItem(WEBGL_KEY);
+      if (pref === 'on') return true;
+      if (pref === 'off') return false;
+      return Boolean(window.assetVault._webglDefault);
+    },
+    setWebglEnabled: (on) => {
+      window.localStorage.setItem(WEBGL_KEY, on ? 'on' : 'off');
+      window.dispatchEvent(new CustomEvent('pv:webgl-change', { detail: { enabled: Boolean(on) } }));
+    },
+  };
+
+  const WEBGL_KEY = 'pv.webgl';
+  let viewerPromise = null;
+
+  // Lazily import the viewer module (never downloaded while the toggle is off).
+  window.pv3d = {
+    async mount(container, url, name) {
+      if (!window.assetVault.webglEnabled()) throw new Error('3D preview disabled');
+      if (!viewerPromise) viewerPromise = import('/webgl/viewer.js');
+      const mod = await viewerPromise;
+      return mod.mount(container, url, name);
+    },
   };
 
   // -------------------------------------------------------------------------
@@ -117,6 +143,8 @@
   .pv-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 12px; }
   .pv-kbd { border: 1px solid var(--border, #3a3c44); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; font-size: 11px; }
   .pv-sheet a { color: var(--accent, #c8734a); }
+  .pv-toggle { display: flex; align-items: center; gap: 8px; font-size: 12px; cursor: pointer; }
+  .pv-toggle input { accent-color: var(--accent, #c8734a); width: 15px; height: 15px; }
   `;
 
   const el = (tag, cls, text) => {
@@ -153,6 +181,7 @@
     let health = {};
     try {
       session = await fetch('/api/web/session', { credentials: 'same-origin' }).then(json);
+      window.assetVault._webglDefault = Boolean(session.webgl && session.webgl.defaultEnabled);
     } catch (_) { session = {}; }
     try {
       health = await fetch('/healthz', { credentials: 'same-origin' }).then(json);
@@ -243,6 +272,33 @@
     li([document.createTextNode('Click "Import to Unity" on any asset here \u2014 it appears in the editor within a few seconds.')]);
     sheet.appendChild(steps);
 
+    // ---- Preview (WebGL) --------------------------------------------------
+    if (session.webgl && session.webgl.available) {
+      sheet.appendChild(el('h3', '', 'Preview'));
+      const row3d = el('div', 'pv-row');
+      const toggle = el('label', 'pv-toggle');
+      const cb = el('input');
+      cb.type = 'checkbox';
+      cb.checked = window.assetVault.webglEnabled();
+      cb.addEventListener('change', () => {
+        window.assetVault.setWebglEnabled(cb.checked);
+        hint3d.textContent = cb.checked
+          ? 'Models render in 3D (three.js, loaded on demand).'
+          : 'Models show Unity\u2019s stored preview instead.';
+      });
+      toggle.appendChild(cb);
+      toggle.appendChild(el('span', '', ' 3D model preview (WebGL)'));
+      row3d.appendChild(toggle);
+      sheet.appendChild(row3d);
+      const hint3d = el('p', 'pv-hint', cb.checked
+        ? 'Models render in 3D (three.js, loaded on demand).'
+        : 'Models show Unity\u2019s stored preview instead.');
+      sheet.appendChild(hint3d);
+      sheet.appendChild(el('p', 'pv-hint',
+        'Supports OBJ, GLB/glTF, FBX, STL and PLY. Off by default on slow links; '
+        + 'the viewer module is only downloaded when a model is opened.'));
+    }
+
     // ---- Connection -------------------------------------------------------
     sheet.appendChild(el('h3', '', 'Connection'));
 
@@ -316,5 +372,23 @@
     document.head.appendChild(style);
   }
 
-  document.addEventListener('DOMContentLoaded', addSettingsButton);
+  // The 3D toggle defaults to the server's setting, so learn it at startup
+  // rather than when the Settings panel is first opened.
+  async function loadWebglDefault() {
+    try {
+      const session = await fetch('/api/web/session', { credentials: 'same-origin' }).then(json);
+      const enabled = Boolean(session.webgl && session.webgl.defaultEnabled);
+      if (enabled !== Boolean(window.assetVault._webglDefault)) {
+        window.assetVault._webglDefault = enabled;
+        window.dispatchEvent(new CustomEvent('pv:webgl-change', { detail: { enabled } }));
+      } else {
+        window.assetVault._webglDefault = enabled;
+      }
+    } catch (_) { /* offline until login */ }
+  }
+
+  document.addEventListener('DOMContentLoaded', () => {
+    addSettingsButton();
+    loadWebglDefault();
+  });
 }());
