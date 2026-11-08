@@ -11,6 +11,9 @@ namespace AssetVault.EditorTools
         public string path;
         public string rel;
         public string kind;
+        // Set when this file lives inside a .unitypackage: `path` is the package
+        // file and `entry` is the asset path within it (Assets/...).
+        public string entry;
     }
 
     [Serializable]

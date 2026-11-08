@@ -30,6 +30,7 @@ const metrics = require('./metrics');
 const { createAudit } = require('./audit');
 const { createThumbCache, clampWidth } = require('./thumbs');
 const { createPackageIndex } = require('./packageIndex');
+const { kindForPath } = require('./unityPackage');
 const { findAndFetchDescription } = require('../src/main/unityAssetStore');
 const { createEnrichment, mergeMetaEntry } = require('../src/main/enrichment');
 
@@ -59,6 +60,7 @@ const ZIP_CONCURRENCY = Number(env.PV_ZIP_CONCURRENCY || 2);
 const RATE_LIMIT_PER_MIN = Number(env.PV_RATE_LIMIT_PER_MIN || 240);
 const THUMB_MAX_FILES = Number(env.PV_THUMB_CACHE_MAX_FILES || 20000);
 const PACKAGE_INDEX_ENABLED = env.PV_PACKAGE_INDEX !== '0';
+const packagesCacheDir = path.join(DATA_DIR, 'packages');
 const PACKAGE_INDEX_MAX_MB = Number(env.PV_PACKAGE_INDEX_MAX_MB || 4096);
 const ENRICH_ROOTS = (env.PV_ENRICH_ROOTS || '')
   .split(path.delimiter).filter(Boolean).map((p) => path.resolve(p));
@@ -967,6 +969,89 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // --- contents tree of one package (lazy tree expansion in the UI) ---------
+  if (route === '/api/package/tree') {
+    const target = String(url.searchParams.get('path') || '').trim();
+    if (!target) { sendJson(res, 400, { ok: false, error: 'missing path' }); return; }
+    if (!PACKAGE_INDEX_ENABLED) { sendJson(res, 503, { ok: false, error: 'package index disabled' }); return; }
+
+    let real;
+    let stat;
+    try {
+      real = fs.realpathSync(target);
+      stat = fs.statSync(real);
+    } catch (_) { sendJson(res, 404, { ok: false, error: 'not found' }); return; }
+    if (!stat.isFile()) { sendJson(res, 400, { ok: false, error: 'not a file' }); return; }
+
+    const entry = packageIndex.get(real, stat.mtimeMs, stat.size);
+    const current = packageIndex.contentsCap;
+    if (!entry || (entry.contentsCap || 0) < current) {
+      // Indexed before the full listing existed (or never): re-read this one
+      // package on demand instead of re-reading the whole library.
+      packageIndex.enqueue(real, stat.mtimeMs, stat.size, { force: true });
+      metrics.counter('pv_package_tree_pending_total');
+      sendJson(res, 202, { ok: false, indexing: true, cached: entry ? (entry.contents || []).length : 0 });
+      return;
+    }
+
+    const MAX_NODES = 1200;
+    const roots = [];
+    const dirs = new Map();       // entry dir path -> node
+    let leaves = 0;
+    const sorted = (entry.contents || []).slice().sort((a, b) => b.size - a.size);
+
+    function dirNode(dirPath) {
+      if (!dirPath) return null;
+      if (dirs.has(dirPath)) return dirs.get(dirPath);
+      const parts = dirPath.split('/');
+      const name = parts[parts.length - 1];
+      const parentDir = parts.slice(0, -1).join('/');
+      const node = { type: 'container', name, path: dirPath, children: [] };
+      dirs.set(dirPath, node);
+      const parent = dirNode(parentDir);
+      if (parent) parent.children.push(node); else roots.push(node);
+      return node;
+    }
+
+    for (const item of sorted) {
+      if (leaves >= MAX_NODES) break;
+      const parts = item.path.split('/');
+      const name = parts.pop();
+      if (!name) continue;
+      const parent = dirNode(parts.join('/'));
+      const leaf = {
+        type: 'asset',
+        name,
+        path: item.path,
+        size: item.size || 0,
+        kind: kindForPath(item.path),
+      };
+      (parent ? parent.children : roots).push(leaf);
+      leaves += 1;
+    }
+
+    const sortTree = (nodes) => {
+      nodes.sort((a, b) => (a.type === b.type
+        ? (a.type === 'container' ? a.name.localeCompare(b.name) : b.size - a.size)
+        : (a.type === 'container' ? -1 : 1)));
+      for (const n of nodes) if (n.children) sortTree(n.children);
+    };
+    sortTree(roots);
+
+    metrics.counter('pv_package_tree_total');
+    sendJson(res, 200, {
+      ok: true,
+      path: real,
+      totalAssets: entry.totalAssets || 0,
+      listed: (entry.contents || []).length,
+      shown: leaves,
+      partial: Boolean(entry.partial),
+      truncated: leaves >= MAX_NODES,
+      tree: roots,
+    });
+    return;
+  }
+
   // --- Unity package download ----------------------------------------------
   if (route === '/plugin/unity-package.tgz' || route === '/plugin/unity-package.zip') {
     const artifact = route.endsWith('.zip') ? (plugin && plugin.zip) : (plugin && plugin.tgz);
@@ -1091,6 +1176,7 @@ const server = http.createServer(async (req, res) => {
   if (route === '/api/file' || route === '/api/download') {
     const target = String(url.searchParams.get('path') || '').trim();
     if (!target) { sendJson(res, 400, { ok: false, error: 'missing path' }); return; }
+    const entryPath = String(url.searchParams.get('entry') || '').trim();
 
     const libs = getState().libraries;
     const insideLibrary = (p) => libs.some((lib) => {
@@ -1107,6 +1193,44 @@ const server = http.createServer(async (req, res) => {
       stat = fs.statSync(real);
     } catch (_) {
       sendJson(res, 404, { ok: false, error: 'not found' });
+      return;
+    }
+
+    // One file *inside* a .unitypackage: extract it (cached) and stream it, so a
+    // single texture/model/audio file can be imported without the whole package.
+    if (stat.isFile() && entryPath) {
+      if (!PACKAGE_INDEX_ENABLED) { sendJson(res, 503, { ok: false, error: 'package index disabled' }); return; }
+      if (entryPath.includes('\u0000') || entryPath.split('/').some((seg) => seg === '..')) {
+        sendJson(res, 400, { ok: false, error: 'invalid entry path' });
+        return;
+      }
+      const base = path.basename(entryPath);
+      const cacheDir = path.join(packagesCacheDir, 'extracted', crypto.createHash('sha1')
+        .update(`${real}\u0000${Math.trunc(stat.mtimeMs)}`).digest('hex'));
+      const cached = path.join(cacheDir, crypto.createHash('sha1').update(entryPath).digest('hex'));
+      let extractedPath = cached;
+      let size = 0;
+      try {
+        size = fs.statSync(cached).size;
+        metrics.counter('pv_entry_cache_hit_total');
+      } catch (_) {
+        const result = await packageIndex.extractTo(real, entryPath, cached);
+        if (!result.ok) {
+          sendJson(res, 404, { ok: false, error: result.error || 'entry not found' });
+          return;
+        }
+        size = result.size;
+        metrics.counter('pv_entry_extract_total');
+        audit('package_entry_download', { user: who, package: real, entry: entryPath, bytes: size });
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': size,
+        'Content-Disposition': `attachment; filename="${base.replace(/[^\x20-\x7e]/g, '_').replace(/"/g, '')}"; filename*=UTF-8''${encodeURIComponent(base)}`,
+        'Cache-Control': 'private, max-age=0, must-revalidate',
+      });
+      if (req.method === 'HEAD') { res.end(); return; }
+      pipeline(fs.createReadStream(extractedPath), res, () => {});
       return;
     }
 

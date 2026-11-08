@@ -77,6 +77,10 @@ function isFolderAsset(p) {
  * @param {number} [options.maxUncompressedBytes]
  * @param {number} [options.timeoutMs]
  * @param {number} [options.maxContents] how many content entries to return
+ * @param {string} [options.extractPath] also capture the body of this entry
+ * @param {string} [options.extractGuid] capture the asset for this GUID instead
+ *   (second pass, when the pathname follows the asset in the archive)
+ * @param {number} [options.extractMaxBytes]
  * @param {boolean} [options.previewOnly] stop once a good preview is found
  * @param {number} [options.goodPreviewBytes] size that counts as "good"
  * @param {number} [options.stopAfterPreview] stop early (defaults to previewOnly)
@@ -91,12 +95,19 @@ async function readUnityPackage(filePath, options = {}) {
   const previewOnly = Boolean(options.previewOnly);
   const goodPreviewBytes = options.goodPreviewBytes || GOOD_PREVIEW_BYTES;
 
+  // Single-entry extraction (used by "import just this texture/model").
+  const extractPath = String(options.extractPath || '').trim();
+  const extractMaxBytes = Number(options.extractMaxBytes || 512 * 1024 * 1024);
+  const guidsForPath = new Map();     // entry path -> guid
+  let extractGuid = String(options.extractGuid || '');
+
   const byGuid = new Map();          // guid -> { path, size }
   let bestPreview = null;            // { buffer, guid, bytes }
   let scannedBytes = 0;
   let partial = false;
   let truncated = '';
   let sawEnd = false;
+  let extracted = null;      // Buffer of the requested entry, when found
 
   // tar state
   let headerBuf = Buffer.alloc(0);
@@ -117,7 +128,12 @@ async function readUnityPackage(filePath, options = {}) {
   function finishEntry() {
     if (entry && entry.leaf === 'pathname' && capChunks.length) {
       const text = Buffer.concat(capChunks).toString('utf8').split('\n')[0].trim();
-      if (text) recordGuid(entry.guid, { path: text });
+      if (text) {
+        recordGuid(entry.guid, { path: text });
+        if (extractPath && text === extractPath) extractGuid = entry.guid;
+      }
+    } else if (entry && entry.leaf === 'asset' && capChunks.length && extractGuid && entry.guid === extractGuid) {
+      extracted = Buffer.concat(capChunks);
     } else if (entry && entry.leaf === 'preview.png' && capChunks.length) {
       const buffer = Buffer.concat(capChunks);
       if (buffer.length > 0 && (!bestPreview || buffer.length > bestPreview.bytes)) {
@@ -161,7 +177,10 @@ async function readUnityPackage(filePath, options = {}) {
     padLeft = 0;
     if (leaf === 'pathname') capLeft = MAX_PATHNAME_BYTES;
     else if (leaf === 'preview.png') capLeft = MAX_PREVIEW_BYTES;
-    else if (leaf === 'asset') recordGuid(guid, { size });
+    else if (leaf === 'asset') {
+      recordGuid(guid, { size });
+      if (extractGuid && guid === extractGuid) capLeft = extractMaxBytes;
+    }
     else capLeft = 0;
     capChunks = [];
   }
@@ -211,6 +230,7 @@ async function readUnityPackage(filePath, options = {}) {
     for await (const chunk of gunzip) {
       consume(chunk);
       if (sawEnd) break;
+      if (extractGuid && extracted) { truncated = 'entry-found'; break; }
       if (previewOnly && bestPreview && bestPreview.bytes >= goodPreviewBytes) {
         // Good enough for a card: stop reading (a 12 GB package may take
         // minutes to walk, and the thumbnail is all we wanted here).
@@ -258,9 +278,44 @@ async function readUnityPackage(filePath, options = {}) {
     totalBytes,
     folders,
     partial: partial || !sawEnd,
+    extracted,
+    extractGuid,
     truncated: truncated || (sawEnd ? '' : 'archive-truncated'),
     scannedBytes,
   };
 }
 
-module.exports = { readUnityPackage, kindForPath };
+/**
+ * Extracts a single file's bytes from a .unitypackage.
+ *
+ * Unity writes `<guid>/pathname` before `<guid>/asset`, so one pass is normally
+ * enough; if a package orders them the other way the first pass reports the guid
+ * and a second pass captures the body.
+ *
+ * @param {string} filePath
+ * @param {string} entryPath e.g. "Assets/Kit/Textures/kit_albedo.png"
+ * @returns {Promise<{ok:boolean, error?:string, data?:Buffer, size?:number}>}
+ */
+async function extractEntry(filePath, entryPath, options = {}) {
+  const opts = {
+    extractPath: entryPath,
+    extractMaxBytes: options.maxBytes || 512 * 1024 * 1024,
+    maxUncompressedBytes: options.maxUncompressedBytes || 8 * 1024 * 1024 * 1024,
+    timeoutMs: options.timeoutMs || 180000,
+    previewOnly: false,
+  };
+
+  const first = await readUnityPackage(filePath, opts);
+  if (first.extracted && first.extracted.length) {
+    return { ok: true, data: first.extracted, size: first.extracted.length };
+  }
+  if (first.extractGuid) {
+    const second = await readUnityPackage(filePath, { ...opts, extractPath: '', extractGuid: first.extractGuid });
+    if (second.extracted && second.extracted.length) {
+      return { ok: true, data: second.extracted, size: second.extracted.length };
+    }
+  }
+  return { ok: false, error: 'entry not found in package' };
+}
+
+module.exports = { readUnityPackage, extractEntry, kindForPath };

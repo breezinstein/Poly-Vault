@@ -30,7 +30,8 @@ const NOTIFY_MS = 20000;          // at most one ETag bump per 20 s while busy
 const PREVIEW_BUDGET = 64 * 1024 * 1024;
 const FULL_BUDGET = 256 * 1024 * 1024;
 const TIMEOUT_MS = 45000;
-const MAX_CONTENTS = 120;
+const MAX_CONTENTS = 4000;
+const CONTENTS_CAP = MAX_CONTENTS;
 
 function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024 * 1024, onUpdate = null, log = console }) {
   const cacheDir = path.join(dir, 'packages');
@@ -58,6 +59,7 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
   const failures = new Map();   // absPath -> consecutive failures
   let worker = null;
   let pendingReply = null;
+  let pendingExtract = null;
   let draining = false;
   let lastNotify = 0;
   let notifyTimer = null;
@@ -143,14 +145,18 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
     worker = new Worker(path.join(__dirname, 'pkgWorker.js'));
     worker.unref();
     worker.on('message', (msg) => {
-      const reply = pendingReply;
-      pendingReply = null;
+      // An extract job and an index job can be in flight in sequence only, so a
+      // single pending slot per kind is enough.
+      const isExtract = typeof msg.id === 'string' && msg.id.startsWith('extract:');
+      const reply = isExtract ? pendingExtract : pendingReply;
+      if (isExtract) pendingExtract = null; else pendingReply = null;
       if (reply) reply(msg);
     });
     worker.on('error', (err) => {
       log.warn(`[poly-vault] package worker failed: ${err.message}`);
       const reply = pendingReply;
       pendingReply = null;
+      if (pendingExtract) { pendingExtract({ ok: false, error: err.message }); pendingExtract = null; }
       worker = null;
       if (reply) reply({ ok: false, error: err.message });
     });
@@ -172,6 +178,24 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
         });
       } catch (err) {
         pendingReply = null;
+        resolve({ ok: false, error: err.message });
+      }
+    });
+  }
+
+  /**
+   * Extracts one entry to `outPath` on the worker thread.
+   * @returns {Promise<{ok:boolean, size?:number, error?:string}>}
+   */
+  function extractTo(file, entry, outPath, maxBytes = 512 * 1024 * 1024) {
+    if (!enabled) return Promise.resolve({ ok: false, error: 'package index disabled' });
+    return new Promise((resolve) => {
+      const id = `extract:${file}:${entry}`;
+      pendingExtract = resolve;
+      try {
+        ensureWorker().postMessage({ id, action: 'extract', file, entry, outPath, maxBytes, timeoutMs: TIMEOUT_MS });
+      } catch (err) {
+        pendingExtract = null;
         resolve({ ok: false, error: err.message });
       }
     });
@@ -223,6 +247,7 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
     }
 
     entry.previewTried = true;
+    entry.contentsCap = CONTENTS_CAP;
     saveEntry(entry);
     refreshCachedTotals();
     stats.indexed += 1;
@@ -266,7 +291,7 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
   }
 
   // `mtimeMs`/`size` come from the scan result, so a poll never stats the NAS.
-  function enqueue(file, mtimeMs, size) {
+  function enqueue(file, mtimeMs, size, opts = {}) {
     if (!enabled || !file) return false;
 
     let mtime = Math.trunc(mtimeMs || 0);
@@ -283,7 +308,9 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
     // `previewTried` remembers a pass that found no preview (editor-only tools
     // often have none): without it those packages would be re-read forever.
     const needsPreview = !existing || (!existing.previewPath && !existing.previewTried);
-    const needsContents = Boolean(existing) && existing.mode !== 'full' && bytes <= maxPackageBytes;
+    const needsContents = bytes <= maxPackageBytes
+      && Boolean(existing)
+      && (existing.mode !== 'full' || Boolean(opts.force));
     if (!needsPreview && !needsContents) return false;
     if (queued.has(file) || inFlight.has(file)) return false;
     if ((failures.get(file) || 0) >= 3) return false;
@@ -318,7 +345,7 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
     if (worker) { try { worker.terminate(); } catch (_) { /* ignore */ } worker = null; }
   }
 
-  return { get, enqueue, status, close, cacheDir, previewDir };
+  return { get, enqueue, extractTo, status, close, cacheDir, previewDir, contentsCap: CONTENTS_CAP };
 }
 
 module.exports = { createPackageIndex };

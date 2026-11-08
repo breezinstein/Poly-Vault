@@ -9,16 +9,37 @@
 const fs = require('fs');
 const path = require('path');
 const { parentPort } = require('worker_threads');
-const { readUnityPackage } = require('./unityPackage');
+const { readUnityPackage, extractEntry } = require('./unityPackage');
 
-parentPort.on('message', async ({ id, file, mode, previewPath: outPath, maxUncompressedBytes, timeoutMs }) => {
+parentPort.on('message', async (msg) => {
+  const { id, action = 'index', file } = msg;
+
+  // --- extract one entry for "import just this file" ----------------------
+  if (action === 'extract') {
+    try {
+      const result = await extractEntry(file, msg.entry, { maxBytes: msg.maxBytes, timeoutMs: msg.timeoutMs });
+      if (!result.ok) {
+        parentPort.postMessage({ id, ok: false, error: result.error || 'not found' });
+        return;
+      }
+      const out = msg.outPath;
+      fs.mkdirSync(path.dirname(out), { recursive: true });
+      fs.writeFileSync(out, result.data);
+      parentPort.postMessage({ id, ok: true, size: result.data.length, outPath: out });
+    } catch (err) {
+      parentPort.postMessage({ id, ok: false, error: String((err && err.message) || err) });
+    }
+    return;
+  }
+
+  const { mode, previewPath: outPath, maxUncompressedBytes, timeoutMs } = msg;
   try {
     const stat = fs.statSync(file);
     const result = await readUnityPackage(file, {
       previewOnly: mode === 'preview',
       maxUncompressedBytes,
       timeoutMs,
-      maxContents: 120,
+      maxContents: 4000,
     });
 
     let previewPath = '';

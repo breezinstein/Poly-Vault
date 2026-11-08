@@ -1,6 +1,6 @@
 {
   "name": "com.polyvault.bridge",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "displayName": "Poly Vault (Unity bridge)",
   "description": "Unity 6 Editor bridge for Poly Vault. Pulls import jobs from a local Poly Vault desktop app or a shared Poly Vault web server and imports them into this project (downloading over HTTP when the library is remote).",
   "unity": "6000.0",

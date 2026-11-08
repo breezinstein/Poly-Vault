@@ -14,6 +14,8 @@ const state = {
   expanded: new Set(),   // `${libId}::${rel}` container keys
   activeTags: new Set(),
   selectedAssetId: null,
+  packageTrees: new Map(),     // package path -> { tree, loading, error }
+
   detail: null,          // { kind:'asset'|'container'|'library', assetId?, libId?, rel? } | null
   search: '',
   online: false,
@@ -496,6 +498,11 @@ function renderTreeRow(node, libId, parent, depth) {
     }
   });
 
+  // A .unitypackage is browsable like a folder: its entries are read from the
+  // archive index on first expand (they are far too big to ship with each poll).
+  const isPackage = node.type === 'asset' && node.asset && node.asset.packageFile;
+  const pkgKey = nodeKey(libId, node.rel);
+
   if (node.type === 'container') {
     const caret = el('button', 'tree-caret', null, 'Expand / collapse');
     caret.setAttribute('aria-label', `Expand / collapse ${node.name}`);
@@ -518,10 +525,22 @@ function renderTreeRow(node, libId, parent, depth) {
       refresh();
     });
   } else {
-    const spacer = el('span', 'tree-caret spacer', '');
-    spacer.setAttribute('aria-hidden', 'true');
-    row.appendChild(spacer);
-    const ci = iconSpan('cube');
+    if (isPackage) {
+      const caret = el('button', 'tree-caret', null, 'Expand / collapse');
+      caret.setAttribute('aria-label', `Expand / collapse ${node.name}`);
+      caret.appendChild(iconSpan('chevron', 'caret-chevron'));
+      caret.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleContainer(pkgKey);
+        if (state.expanded.has(pkgKey)) loadPackageTree(node.asset);
+      });
+      row.appendChild(caret);
+    } else {
+      const spacer = el('span', 'tree-caret spacer', '');
+      spacer.setAttribute('aria-hidden', 'true');
+      row.appendChild(spacer);
+    }
+    const ci = iconSpan(isPackage ? 'folder' : 'cube');
     ci.classList.add('tree-icon', 'asset-icon');
     row.appendChild(ci);
     row.appendChild(el('span', 'tree-name', node.name));
@@ -538,12 +557,123 @@ function renderTreeRow(node, libId, parent, depth) {
   if (node.type === 'container' && state.expanded.has(key)) {
     for (const child of node.children || []) renderTreeRow(child, libId, parent, depth + 1);
   }
+
+  if (isPackage && state.expanded.has(pkgKey)) {
+    const loaded = state.packageTrees.get(node.asset.folder);
+    if (!loaded || loaded.loading) {
+      parent.appendChild(el('div', 'tree-note', 'reading package\u2026'))
+        .style.paddingLeft = `calc(10px + ${(depth + 1) * 20}px)`;
+    } else if (loaded.error) {
+      const note = el('div', 'tree-note', loaded.error);
+      note.style.paddingLeft = `calc(10px + ${(depth + 1) * 20}px)`;
+      parent.appendChild(note);
+    } else {
+      for (const child of loaded.tree || []) renderPackageNode(child, libId, node.asset, parent, depth + 1, depth + 1);
+      if (loaded.truncated) {
+        const note = el('div', 'tree-note', `showing the ${loaded.shown} largest of ${loaded.totalAssets}`);
+        note.style.paddingLeft = `calc(10px + ${(depth + 1) * 20}px)`;
+        parent.appendChild(note);
+      }
+    }
+  }
 }
 
 function toggleContainer(key) {
   if (state.expanded.has(key)) state.expanded.delete(key);
   else state.expanded.add(key);
   renderSidebar();
+}
+
+// ---------- package entries (a .unitypackage browsed as a folder) ----------
+
+async function loadPackageTree(pkgAsset) {
+  const pkgPath = pkgAsset.folder;
+  const existing = state.packageTrees.get(pkgPath);
+  if (existing && (existing.loading || existing.tree)) return;
+  state.packageTrees.set(pkgPath, { loading: true });
+  renderSidebar();
+
+  const attempt = async (retriesLeft) => {
+    try {
+      const res = await fetch(`${state.serverUrl}/api/package/tree?path=${encodeURIComponent(pkgPath)}`);
+      const json = await res.json();
+      if (json.ok) {
+        state.packageTrees.set(pkgPath, {
+          tree: json.tree || [],
+          totalAssets: json.totalAssets,
+          shown: json.shown,
+          truncated: json.truncated,
+        });
+        renderSidebar();
+        return;
+      }
+      if (json.indexing && retriesLeft > 0) {
+        setTimeout(() => attempt(retriesLeft - 1), 3000);
+        return;
+      }
+      state.packageTrees.set(pkgPath, { error: json.error || 'contents unavailable' });
+      renderSidebar();
+    } catch (_) {
+      if (retriesLeft > 0) { setTimeout(() => attempt(retriesLeft - 1), 3000); return; }
+      state.packageTrees.set(pkgPath, { error: 'contents unavailable' });
+      renderSidebar();
+    }
+  };
+  attempt(20);
+}
+
+function renderPackageNode(node, libId, pkgAsset, parent, depth, baseDepth) {
+  const key = nodeKey(libId, `${pkgAsset.rel}#${node.path}`);
+  const isContainer = node.type === 'container';
+  const expanded = isContainer && state.expanded.has(key);
+  const selected = !isContainer && state.detail
+    && state.detail.kind === 'packageEntry'
+    && state.detail.pkg === pkgAsset.folder
+    && state.detail.entry === node.path;
+
+  const row = el('div', 'tree-row package-row' + (expanded ? ' open' : '') + (selected ? ' selected' : ''));
+  const indent = baseDepth === undefined ? depth : baseDepth;
+  row.style.paddingLeft = `calc(10px + ${indent} * 20px + ${Math.max(0, depth - indent)} * 12px)`;
+  row.tabIndex = 0;
+  row.setAttribute('role', 'treeitem');
+
+  if (isContainer) {
+    const caret = el('button', 'tree-caret', null, 'Expand / collapse');
+    caret.appendChild(iconSpan('chevron', 'caret-chevron'));
+    caret.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleContainer(key);
+    });
+    row.appendChild(caret);
+    const fi = iconSpan('folder');
+    fi.classList.add('tree-icon');
+    row.appendChild(fi);
+    row.appendChild(el('span', 'tree-name', node.name));
+    row.appendChild(el('span', 'tree-count', String((node.children || []).length)));
+    row.addEventListener('click', () => {
+      toggleContainer(key);
+    });
+  } else {
+    const spacer = el('span', 'tree-caret spacer', '');
+    spacer.setAttribute('aria-hidden', 'true');
+    row.appendChild(spacer);
+    const fi = iconSpan('cube');
+    fi.classList.add('tree-icon', 'asset-icon');
+    row.appendChild(fi);
+    row.appendChild(el('span', 'tree-name', node.name));
+    row.addEventListener('click', () => {
+      state.activeLibId = libId;
+      state.activeNode = null;
+      state.selectedAssetId = null;
+      state.detail = { kind: 'packageEntry', libId, pkg: pkgAsset.folder, entry: node.path, node, pkgAsset };
+      refresh();
+    });
+  }
+  parent.appendChild(row);
+
+  if (isContainer && expanded) {
+    for (const child of node.children || []) renderPackageNode(child, libId, pkgAsset, parent, depth + 1, baseDepth);
+  }
 }
 
 function isNodeSelected(libId, rel) {
@@ -876,6 +1006,15 @@ function detailTarget() {
     const a = findAssetById(state.detail.assetId);
     if (a) return { kind: 'asset', asset: a, label: 'Asset' };
   }
+  if (state.detail && state.detail.kind === 'packageEntry') {
+    return {
+      kind: 'packageEntry',
+      entry: state.detail.entry,
+      node: state.detail.node,
+      pkgAsset: state.detail.pkgAsset,
+      label: 'Package file',
+    };
+  }
   if (state.detail && state.detail.kind === 'container') {
     const scan = findLibById(state.detail.libId);
     const node = scan && containerByRel(scan, state.detail.rel);
@@ -911,6 +1050,7 @@ function renderDetail() {
   content.innerHTML = '';
 
   if (target.kind === 'asset') renderAssetDetail(content, target.asset);
+  else if (target.kind === 'packageEntry') renderPackageEntryDetail(content, target);
   else if (target.kind === 'container') renderContainerDetail(content, target);
   else renderLibraryDetail(content, target);
 }
@@ -1357,6 +1497,70 @@ function renderAssetDetail(content, asset) {
   content.appendChild(buildDescriptionEditor(asset.folder));
 
   content.appendChild(pathFooter(asset.folder));
+}
+
+// Detail for one file inside a .unitypackage: import just this file, or the
+// whole package if its dependencies are needed.
+function renderPackageEntryDetail(content, target) {
+  const { entry, node, pkgAsset } = target;
+  const base = entry.split('/').pop();
+
+  content.appendChild(el('h2', '', base));
+  content.appendChild(el('div', 'sub', `${entry} \u00B7 ${fmtBytes(node.size)} \u00B7 ${node.kind}`));
+
+  content.appendChild(buildMetaGrid([
+    ['Package', pkgAsset.name],
+    ['Inside', entry.split('/').slice(0, -1).join('/') || '/'],
+    ['Size', fmtBytes(node.size || 0)],
+    ['Type', node.kind],
+  ]));
+
+  const jobId = `${pkgAsset.id}::${entry}`;
+  const job = state.jobsByAsset.get(jobId);
+  const btn = el('button', 'import-btn', job
+    ? (job.status === 'done' ? 'Re-import this file' : job.status === 'failed' ? 'Retry import' : 'Queued \u2014 waiting for Unity')
+    : 'Import this file to Unity', 'Send only this file to the Unity Editor');
+  if (job && (job.status === 'pending' || job.status === 'processing')) btn.disabled = true;
+  btn.addEventListener('click', () => sendPackageEntryJob(pkgAsset, entry, node));
+  content.appendChild(btn);
+
+  const whole = el('button', 'job-cancel-btn', 'Import the whole package instead', 'Queue the package as one import');
+  whole.addEventListener('click', () => sendImportJob(pkgAsset));
+  content.appendChild(whole);
+
+  content.appendChild(el('div', 'detail-section-title', 'Notes'));
+  content.appendChild(el('div', 'contents-note',
+    'Extracted from the package on demand. Models, textures, audio, fonts and scripts import cleanly on their own; '
+    + 'prefabs/materials may need the whole package for their dependencies.'));
+}
+
+async function sendPackageEntryJob(pkgAsset, entry, node) {
+  if (!state.serverUrl) return;
+  const payload = {
+    assetId: `${pkgAsset.id}::${entry}`,
+    assetName: entry.split('/').pop().replace(/\.[^.]+$/, ''),
+    category: `${pkgAsset.category}/${pkgAsset.name}`,
+    libraryName: pkgAsset.libraryName,
+    assetFolder: pkgAsset.folder,
+    tags: pkgAsset.tags || [],
+    importables: [{
+      name: entry.split('/').pop(),
+      path: pkgAsset.folder,
+      entry,
+      rel: entry,
+      kind: node.kind,
+    }],
+  };
+  const res = await fetch(`${state.serverUrl}/api/import-job`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const json = await res.json();
+  if (json.ok) {
+    state.jobsByAsset.set(payload.assetId, json.job);
+    renderDetail();
+  }
 }
 
 function renderContainerDetail(content, { node, scan }) {
