@@ -1222,9 +1222,17 @@ const server = http.createServer(async (req, res) => {
   // "Open folder" becomes "Download" and the Unity add-on can fetch assets
   // without a shared filesystem.
   if (route === '/api/file' || route === '/api/download') {
-    const target = String(url.searchParams.get('path') || '').trim();
-    if (!target) { sendJson(res, 400, { ok: false, error: 'missing path' }); return; }
-    const entryPath = String(url.searchParams.get('entry') || '').trim();
+    const rawTarget = String(url.searchParams.get('path') || '').trim();
+    if (!rawTarget) { sendJson(res, 400, { ok: false, error: 'missing path' }); return; }
+    // "<package>#<entry>" is how add-ons older than 0.6.0 address a file inside
+    // a package (they have no `entry` field). 0.6.0+ sends `&entry=` instead.
+    let target = rawTarget;
+    let entryPath = String(url.searchParams.get('entry') || '').trim();
+    const hashAt = rawTarget.indexOf('#');
+    if (!entryPath && hashAt > 0) {
+      target = rawTarget.slice(0, hashAt);
+      entryPath = rawTarget.slice(hashAt + 1);
+    }
 
     const libs = getState().libraries;
     const insideLibrary = (p) => libs.some((lib) => {

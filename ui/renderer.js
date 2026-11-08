@@ -1753,7 +1753,9 @@ async function sendPackageEntryJob(pkgAsset, entry, node) {
     tags: pkgAsset.tags || [],
     importables: [{
       name: entry.split('/').pop(),
-      path: pkgAsset.folder,
+      // Older add-ons ignore `entry` and only use `path`, so the same file is
+      // addressed as "<package>#<entry>" for them and via `entry` for 0.6.0+.
+      path: `${pkgAsset.folder}#${entry}`,
       entry,
       rel: entry,
       kind: node.kind,
