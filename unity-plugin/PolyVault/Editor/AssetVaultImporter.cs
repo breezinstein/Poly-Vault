@@ -213,6 +213,21 @@ namespace AssetVault.EditorTools
                 {
                     if (item == null) continue;
 
+                    if (!string.IsNullOrEmpty(item.entry))
+                    {
+                        // One file from inside a package: always fetched from the
+                        // server, which extracts it from the archive.
+                        if (AssetVaultSettings.UsesRemoteServer)
+                        {
+                            resolved.Add(new ResolvedItem { Item = item, LocalPath = CachePathFor(job, item) });
+                        }
+                        else
+                        {
+                            log?.Invoke($"{item.name}: importing files from inside a package needs the Poly Vault web server.");
+                        }
+                        continue;
+                    }
+
                     if (!string.IsNullOrEmpty(item.path) && File.Exists(item.path))
                     {
                         // Desktop app (or a shared mount): the file is already local.
@@ -274,8 +289,14 @@ namespace AssetVault.EditorTools
             return combined;
         }
 
-        private static string DownloadUrlFor(ImportableDto item) =>
-            $"{AssetVaultSettings.ServerUrl}/api/file?path={UnityWebRequest.EscapeURL(item.path)}";
+        private static string DownloadUrlFor(ImportableDto item)
+        {
+            string url = $"{AssetVaultSettings.ServerUrl}/api/file?path={UnityWebRequest.EscapeURL(item.path)}";
+            // A file inside a .unitypackage: the server extracts it on demand.
+            if (!string.IsNullOrEmpty(item.entry))
+                url += $"&entry={UnityWebRequest.EscapeURL(item.entry)}";
+            return url;
+        }
 
         /// <summary>
         /// Downloads the still-missing files one at a time, then imports. Sequential

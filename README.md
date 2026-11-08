@@ -186,6 +186,34 @@ Measured in the container against a **1,009-asset / 3,000-file** library on a bi
 | Library change detection | full walk every poll | `fs.watch` debounce → one rescan; `PV_SCAN_MAX_AGE_MS` covers shares without inotify |
 | Scan blocking | synchronous walk inside the request handler | runs on a worker thread: a 1 s NFS walk leaves `/healthz` at 1–10 ms |
 
+## Packages as folders (import one file, or the whole package)
+
+A `.unitypackage` is browsable in the sidebar exactly like a folder:
+
+```
+assets
+└── 314 Arts
+    └── Complete ProjectsSystems
+        └── Modular Multiplayer FPS Engine   ← the package (import it whole)
+            └── Assets
+                └── Demos
+                    ├── Textures/…  ← textures, importable individually
+                    └── Models/…    ← meshes, audio, scripts, fonts
+```
+
+- The tree is fetched **on demand** when a package is expanded
+  (`GET /api/package/tree`), so the 20-second library poll stays ~700 KB instead
+  of carrying file lists for every package.
+- Selecting a file inside a package opens its own panel with **Import this file
+  to Unity**, and a secondary **Import the whole package instead**.
+- Importing one file makes the server extract it from the archive
+  (`GET /api/file?path=<package>&entry=Assets/…`), cache it under
+  `/data/packages/extracted`, and hand it to the editor like any other asset.
+  Models, textures, audio, fonts and scripts import cleanly on their own;
+  prefabs/materials usually need the whole package for their dependencies.
+- Packages indexed by older versions are re-read lazily: the first expand of such
+  a package returns `202 indexing`, the UI waits and retries.
+
 ## What's inside a .unitypackage (previews + contents)
 
 Unity's Asset Store cache contains no preview images, so 600+ packages would show
@@ -308,6 +336,7 @@ re-applied when upstream moves (`patches/README.md` has the rebase recipe).
 | `0004-package-assets` | Unity Asset Store cache support: one asset per `.unitypackage`; NFS birth-time of 0 is reported as unknown instead of 1970 |
 | `0005-async-scan` | the bridge awaits the scanner, so the web build can run scans off the main thread |
 | `0006-package-contents` | detail panel shows "What's inside" for packages (fetched from `/api/package`) |
+| `0007-unity-window-init` | Unity window reads `EditorPrefs` in `OnEnable` instead of field initializers (Unity 6 throws otherwise) |
 | `0007-unity-window-init` | Unity window reads `EditorPrefs` in `OnEnable` instead of field initializers (Unity 6 throws otherwise) |
 
 The original project README is preserved at
