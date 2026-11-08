@@ -109,6 +109,7 @@ async function readUnityPackage(filePath, options = {}) {
   let truncated = '';
   let sawEnd = false;
   let extracted = null;      // Buffer of the requested entry, when found
+  let stopNow = false;       // set when the tar moves past the requested guid
 
   // tar state
   let headerBuf = Buffer.alloc(0);
@@ -165,6 +166,10 @@ async function readUnityPackage(filePath, options = {}) {
     const guid = slash > 0 ? name.slice(0, slash) : '';
     const leaf = slash > 0 ? name.slice(slash + 1) : '';
     const isFile = typeflag === '0' || typeflag === '\0' || typeflag === '';
+
+    // Packages group entries per GUID, so "a different GUID" means we have
+    // finished with the requested asset (previews follow the asset body).
+    if (extracted && extractGuid && guid && guid !== extractGuid) stopNow = true;
 
     if (!isFile || size === 0) {
       entry = null;
@@ -237,7 +242,11 @@ async function readUnityPackage(filePath, options = {}) {
     for await (const chunk of gunzip) {
       consume(chunk);
       if (sawEnd) break;
-      if (extractGuid && extracted) { truncated = 'entry-found'; break; }
+      if (extractGuid && extracted && (entryPreview || stopNow)) {
+        truncated = 'entry-found';
+        break;
+      }
+      if (stopNow) { truncated = 'entry-found'; break; }
       if (previewOnly && bestPreview && bestPreview.bytes >= goodPreviewBytes) {
         // Good enough for a card: stop reading (a 12 GB package may take
         // minutes to walk, and the thumbnail is all we wanted here).
