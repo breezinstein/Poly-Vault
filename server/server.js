@@ -60,6 +60,11 @@ const ZIP_CONCURRENCY = Number(env.PV_ZIP_CONCURRENCY || 2);
 const RATE_LIMIT_PER_MIN = Number(env.PV_RATE_LIMIT_PER_MIN || 240);
 const THUMB_MAX_FILES = Number(env.PV_THUMB_CACHE_MAX_FILES || 20000);
 const PACKAGE_INDEX_ENABLED = env.PV_PACKAGE_INDEX !== '0';
+// Optional three.js model viewer (vendored at build time). The per-user switch
+// lives in the UI; this is only the capability + the default it starts from.
+const WEBGL_AVAILABLE = fs.existsSync(path.join(__dirname, '..', 'ui', 'webgl', 'viewer.js'))
+  && fs.existsSync(path.join(__dirname, '..', 'ui', 'webgl', 'vendor', 'three.module.min.js'));
+const WEBGL_DEFAULT = env.PV_WEBGL !== '0';
 const packagesCacheDir = path.join(DATA_DIR, 'packages');
 const PACKAGE_INDEX_MAX_MB = Number(env.PV_PACKAGE_INDEX_MAX_MB || 4096);
 const ENRICH_ROOTS = (env.PV_ENRICH_ROOTS || '')
@@ -942,6 +947,11 @@ const server = http.createServer(async (req, res) => {
       targeted: who !== 'shared' && who !== 'anonymous',
       token: showToken ? presented : '',
       tokenHidden: !showToken,
+      webgl: {
+        available: WEBGL_AVAILABLE,
+        // The Settings panel toggle defaults to this and is remembered per browser.
+        defaultEnabled: WEBGL_AVAILABLE && WEBGL_DEFAULT,
+      },
       plugin: plugin
         ? {
           version: plugin.version,

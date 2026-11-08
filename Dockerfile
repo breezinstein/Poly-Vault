@@ -44,7 +44,17 @@ RUN set -eux; \
     ls -l /out
 
 # ---------------------------------------------------------------------------
-# Stage 3 — runtime dependencies (only what the web shell needs)
+# Stage 3 — optional WebGL preview engine (three.js loaders, vendored)
+# ---------------------------------------------------------------------------
+FROM ${NODE_IMAGE} AS webgl
+WORKDIR /app
+RUN apk add --no-cache python3
+COPY scripts/fetch-webgl.sh scripts/flatten_webgl_vendor.py ./scripts/
+COPY ui/webgl/viewer.js ./ui/webgl/viewer.js
+RUN sh scripts/fetch-webgl.sh
+
+# ---------------------------------------------------------------------------
+# Stage 4 — runtime dependencies (only what the web shell needs)
 # ---------------------------------------------------------------------------
 FROM ${NODE_IMAGE} AS deps
 WORKDIR /app
@@ -55,7 +65,7 @@ RUN apk add --no-cache --virtual .build-deps python3 make g++ \
  && npm cache clean --force
 
 # ---------------------------------------------------------------------------
-# Stage 4 — minimal runtime
+# Stage 5 — minimal runtime
 # ---------------------------------------------------------------------------
 FROM ${NODE_IMAGE} AS runtime
 ARG APP_VERSION
@@ -87,6 +97,9 @@ COPY --from=source --chown=root:root /app/package.json ./package.json
 COPY --from=source --chown=root:root /app/src ./src
 COPY --from=source --chown=root:root /app/ui ./ui
 COPY --from=deps --chown=root:root /app/node_modules ./node_modules
+# 3D preview engine (Settings -> Preview toggle). Absent = the UI falls back to
+# Unity's stored thumbnails, so the image still works without it.
+COPY --from=webgl --chown=root:root /app/ui/webgl/vendor ./ui/webgl/vendor
 # The Unity add-on is served from the UI (Settings -> Unity) so artists always
 # get the build that matches this server.
 COPY --from=unity-plugin --chown=root:root /out ./plugin

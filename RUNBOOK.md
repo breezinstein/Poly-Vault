@@ -266,7 +266,23 @@ docker compose exec poly-vault du -sh /data/packages
 - This is also the fastest way to answer "what is in this 500 MB package?" —
   the detail panel lists the largest files inside.
 
-## 10. Troubleshooting
+## 10. 3D preview (WebGL)
+
+`Settings → Preview → 3D model preview (WebGL)` renders OBJ/GLB/FBX/STL/PLY in
+the browser instead of showing Unity's stored thumbnail. It is remembered per
+browser; `PV_WEBGL=0` removes it for everyone.
+
+- The engine is vendored at image build time (`scripts/fetch-webgl.sh`, run in a
+  Docker stage). If the build skipped it, `Settings` shows no toggle and models
+  fall back to thumbnails — check `/api/web/session` →
+  `webgl: {available: true}`.
+- Each viewer downloads ~1.1 MB of modules on first use; nothing is fetched from
+  the internet, so it works on an air-gapped network.
+- Very large or broken models fall back automatically with a note in the panel.
+- Refresh the vendored copy after bumping three.js: `./scripts/fetch-webgl.sh`
+  (then rebuild the image).
+
+## 11. Troubleshooting
 
 | Symptom | Diagnose | Fix |
 | --- | --- | --- |
@@ -280,7 +296,7 @@ docker compose exec poly-vault du -sh /data/packages
 | 429 responses | `pv_rate_limited_total` | raise `PV_RATE_LIMIT_PER_MIN` or investigate the client |
 | Thumbnails missing | `pv_thumb_fallback_total`, `thumbs.available` in `/healthz` | the image build lost `sharp`; the UI still works with original previews |
 
-## 11. Incident checklist
+## 12. Incident checklist
 
 1. `docker compose ps` — is it up and healthy?
 2. `docker compose logs --tail 200 poly-vault` — any stack traces?

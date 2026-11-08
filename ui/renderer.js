@@ -661,6 +661,26 @@ function createPackageEntryCard(entry, pkgAsset, index) {
   return card;
 }
 
+// Any live three.js viewer is torn down before the preview area is rebuilt.
+let activeViewer = null;
+
+// Settings toggle (or the server default arriving late) re-renders the preview.
+window.addEventListener('pv:webgl-change', () => {
+  const pkg = activePackageAsset();
+  if (pkg && state.detail && state.detail.kind === 'packageEntry') renderGrid();
+});
+function disposeViewer() {
+  if (activeViewer) {
+    try { activeViewer.dispose(); } catch (_) { /* ignore */ }
+    activeViewer = null;
+  }
+}
+
+function webglEnabled() {
+  return Boolean(window.assetVault && typeof window.assetVault.webglEnabled === 'function'
+    && window.assetVault.webglEnabled() && window.pv3d);
+}
+
 // Large preview shown at the top of the main pane for the selected file.
 function buildEntryPreview(pkgAsset, entry) {
   const ext = entryExt(entry);
@@ -693,18 +713,43 @@ function buildEntryPreview(pkgAsset, entry) {
     video.src = entryFileUrl(pkgAsset, entry);
     stage.appendChild(video);
   } else if (MODEL_ENTRY_EXT.test(ext)) {
-    // No 3D engine in this build: show Unity's own render of the asset.
-    const img = el('img', 'entry-preview-image');
-    img.loading = 'lazy';
-    img.src = entryPreviewUrl(pkgAsset, entry);
-    img.alt = entry.name;
-    img.addEventListener('error', () => {
-      img.replaceWith(el('div', 'entry-preview-note',
-        'Unity stored no preview for this model. Import it to inspect it in 3D.'));
-    });
-    stage.appendChild(img);
-    stage.appendChild(el('div', 'entry-preview-note',
-      'Unity\u2019s own preview of the model. Import the file to open it in the editor.'));
+    if (webglEnabled()) {
+      const canvasBox = el('div', 'entry-webgl');
+      stage.appendChild(canvasBox);
+      const note = el('div', 'entry-preview-note', 'Unity\u2019s stored preview is shown while the 3D viewer loads.');
+      stage.appendChild(note);
+      // Turn off 3D from Settings and the next render falls back to the image.
+      window.pv3d.mount(canvasBox, entryFileUrl(pkgAsset, entry), entry.name)
+        .then((viewer) => {
+          activeViewer = viewer;
+          note.textContent = `${viewer.triangles.toLocaleString()} triangles \u00B7 drag to orbit, scroll to zoom`;
+        })
+        .catch(() => {
+          canvasBox.remove();
+          note.remove();
+          const img = el('img', 'entry-preview-image');
+          img.src = entryPreviewUrl(pkgAsset, entry);
+          img.alt = entry.name;
+          img.addEventListener('error', () => img.replaceWith(el('div', 'entry-preview-note',
+            'This model could not be previewed. Import the file to inspect it in the editor.')));
+          stage.appendChild(img);
+          stage.appendChild(el('div', 'entry-preview-note',
+            '3D preview unavailable for this file \u2014 showing Unity\u2019s stored preview.'));
+        });
+    } else {
+      // 3D preview disabled: show Unity's own render of the asset.
+      const img = el('img', 'entry-preview-image');
+      img.loading = 'lazy';
+      img.src = entryPreviewUrl(pkgAsset, entry);
+      img.alt = entry.name;
+      img.addEventListener('error', () => {
+        img.replaceWith(el('div', 'entry-preview-note',
+          'Unity stored no preview for this model. Import it to inspect it in 3D.'));
+      });
+      stage.appendChild(img);
+      stage.appendChild(el('div', 'entry-preview-note',
+        'Unity\u2019s own preview of the model. Enable 3D preview in Settings, or import the file.'));
+    }
   } else {
     stage.appendChild(el('div', 'entry-preview-note',
       `No inline preview for .${ext || '?'} \u2014 import it, or open the whole package.`));
@@ -1126,6 +1171,7 @@ function packageEntries(pkgAsset) {
 }
 
 function renderGrid() {
+  disposeViewer();
   const grid = $('#grid');
   const pkg = activePackageAsset();
   const entries = pkg ? packageEntries(pkg) : null;
@@ -1246,6 +1292,7 @@ function renderDetail() {
   const target = detailTarget();
 
   if (!target) {
+    disposeViewer();
     nobody.style.display = 'block';
     content.classList.add('hidden');
     $('#detail-title').textContent = 'Details';

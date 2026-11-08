@@ -12,3 +12,4 @@ npm-debug.log*
 .env.*
 AUDIT-AND-PLAN.md
 RUNBOOK.md
+ui/webgl/vendor
