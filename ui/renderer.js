@@ -755,8 +755,14 @@ function initTagPopover() {
 
 // ---------- grid ----------
 
-function previewUrl(path) {
-  return path ? `${state.serverUrl}/api/preview?path=${encodeURIComponent(path)}` : null;
+// A web host can serve resized thumbnails (assetVault.thumbUrl); the desktop
+// app falls back to the original preview untouched.
+function previewUrl(path, width) {
+  if (!path) return null;
+  if (window.assetVault && typeof assetVault.thumbUrl === 'function') {
+    return assetVault.thumbUrl(path, width || 320);
+  }
+  return `${state.serverUrl}/api/preview?path=${encodeURIComponent(path)}`;
 }
 
 function jobForAsset(asset) {
@@ -773,7 +779,7 @@ function createCard(a, i) {
   card.dataset.assetId = a.id;
   card.style.animationDelay = `${Math.min((i % 12) * 16, 180)}ms`;
   const thumb = el('div', 'thumb');
-  const url = previewUrl(a.preview && a.preview.path);
+  const url = previewUrl(a.preview && a.preview.path, 320);
   if (url) {
     const img = el('img');
     img.src = url;
@@ -1203,7 +1209,7 @@ function pathFooter(p) {
 }
 
 function renderAssetDetail(content, asset) {
-  const url = previewUrl(asset.preview && asset.preview.path);
+  const url = previewUrl(asset.preview && asset.preview.path, 960);
   if (url) {
     const box = el('div', 'preview');
     const img = el('img');
