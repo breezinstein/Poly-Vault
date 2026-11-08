@@ -100,6 +100,7 @@ async function readUnityPackage(filePath, options = {}) {
   const extractMaxBytes = Number(options.extractMaxBytes || 512 * 1024 * 1024);
   const guidsForPath = new Map();     // entry path -> guid
   let extractGuid = String(options.extractGuid || '');
+  let entryPreview = null;            // Buffer: preview.png of the extracted asset
 
   const byGuid = new Map();          // guid -> { path, size }
   let bestPreview = null;            // { buffer, guid, bytes }
@@ -134,6 +135,8 @@ async function readUnityPackage(filePath, options = {}) {
       }
     } else if (entry && entry.leaf === 'asset' && capChunks.length && extractGuid && entry.guid === extractGuid) {
       extracted = Buffer.concat(capChunks);
+    } else if (entry && entry.leaf === 'preview.png' && capChunks.length && extractGuid && entry.guid === extractGuid) {
+      entryPreview = Buffer.concat(capChunks);
     } else if (entry && entry.leaf === 'preview.png' && capChunks.length) {
       const buffer = Buffer.concat(capChunks);
       if (buffer.length > 0 && (!bestPreview || buffer.length > bestPreview.bytes)) {
@@ -176,7 +179,11 @@ async function readUnityPackage(filePath, options = {}) {
     bodyLeft = size;
     padLeft = 0;
     if (leaf === 'pathname') capLeft = MAX_PATHNAME_BYTES;
-    else if (leaf === 'preview.png') capLeft = MAX_PREVIEW_BYTES;
+    else if (leaf === 'preview.png') {
+      // The largest preview in the archive is the card thumbnail; the preview
+      // belonging to the requested entry is kept separately for its own card.
+      capLeft = MAX_PREVIEW_BYTES;
+    }
     else if (leaf === 'asset') {
       recordGuid(guid, { size });
       if (extractGuid && guid === extractGuid) capLeft = extractMaxBytes;
@@ -279,6 +286,7 @@ async function readUnityPackage(filePath, options = {}) {
     folders,
     partial: partial || !sawEnd,
     extracted,
+    entryPreview,
     extractGuid,
     truncated: truncated || (sawEnd ? '' : 'archive-truncated'),
     scannedBytes,
@@ -307,12 +315,12 @@ async function extractEntry(filePath, entryPath, options = {}) {
 
   const first = await readUnityPackage(filePath, opts);
   if (first.extracted && first.extracted.length) {
-    return { ok: true, data: first.extracted, size: first.extracted.length };
+    return { ok: true, data: first.extracted, size: first.extracted.length, preview: first.entryPreview || null };
   }
   if (first.extractGuid) {
     const second = await readUnityPackage(filePath, { ...opts, extractPath: '', extractGuid: first.extractGuid });
     if (second.extracted && second.extracted.length) {
-      return { ok: true, data: second.extracted, size: second.extracted.length };
+      return { ok: true, data: second.extracted, size: second.extracted.length, preview: second.entryPreview || null };
     }
   }
   return { ok: false, error: 'entry not found in package' };

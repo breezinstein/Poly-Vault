@@ -59,9 +59,12 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
   const failures = new Map();   // absPath -> consecutive failures
   let worker = null;
   let pendingReply = null;
-  let pendingExtract = null;
+  const pendingExtracts = new Map();   // message id -> resolve
+  let extractChain = Promise.resolve();
+  const extractInFlight = new Map();   // "file\u0000entry" -> promise
   let draining = false;
   let lastNotify = 0;
+  let extractSeq = 0;
   let notifyTimer = null;
   let version = 0;
 
@@ -145,18 +148,23 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
     worker = new Worker(path.join(__dirname, 'pkgWorker.js'));
     worker.unref();
     worker.on('message', (msg) => {
-      // An extract job and an index job can be in flight in sequence only, so a
-      // single pending slot per kind is enough.
       const isExtract = typeof msg.id === 'string' && msg.id.startsWith('extract:');
-      const reply = isExtract ? pendingExtract : pendingReply;
-      if (isExtract) pendingExtract = null; else pendingReply = null;
+      if (isExtract) {
+        const reply = pendingExtracts.get(msg.id);
+        pendingExtracts.delete(msg.id);
+        if (reply) reply(msg);
+        return;
+      }
+      const reply = pendingReply;
+      pendingReply = null;
       if (reply) reply(msg);
     });
     worker.on('error', (err) => {
       log.warn(`[poly-vault] package worker failed: ${err.message}`);
       const reply = pendingReply;
       pendingReply = null;
-      if (pendingExtract) { pendingExtract({ ok: false, error: err.message }); pendingExtract = null; }
+      for (const [, reply] of pendingExtracts) reply({ ok: false, error: err.message });
+      pendingExtracts.clear();
       worker = null;
       if (reply) reply({ ok: false, error: err.message });
     });
@@ -187,18 +195,32 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
    * Extracts one entry to `outPath` on the worker thread.
    * @returns {Promise<{ok:boolean, size?:number, error?:string}>}
    */
-  function extractTo(file, entry, outPath, maxBytes = 512 * 1024 * 1024) {
+  function extractTo(file, entry, outPath, maxBytes = 512 * 1024 * 1024, previewOutPath = null) {
     if (!enabled) return Promise.resolve({ ok: false, error: 'package index disabled' });
-    return new Promise((resolve) => {
-      const id = `extract:${file}:${entry}`;
-      pendingExtract = resolve;
+
+    // The worker handles one message at a time; two concurrent requests for the
+    // same entry (card thumbnail + large preview) must share one extraction, and
+    // different entries must not interleave or they truncate each other's file.
+    const key = `${file}\u0000${entry}\u0000${outPath}`;
+    if (extractInFlight.has(key)) return extractInFlight.get(key);
+
+    const job = extractChain.then(() => new Promise((resolve) => {
+      const id = `extract:${(extractSeq += 1)}`;
+      pendingExtracts.set(id, resolve);
       try {
-        ensureWorker().postMessage({ id, action: 'extract', file, entry, outPath, maxBytes, timeoutMs: TIMEOUT_MS });
+        ensureWorker().postMessage({
+          id, action: 'extract', file, entry, outPath, maxBytes, previewOutPath, timeoutMs: TIMEOUT_MS,
+        });
       } catch (err) {
-        pendingExtract = null;
+        pendingExtracts.delete(id);
         resolve({ ok: false, error: err.message });
       }
-    });
+    }));
+
+    extractInFlight.set(key, job);
+    extractChain = job.then(() => undefined, () => undefined);
+    job.finally(() => extractInFlight.delete(key));
+    return job;
   }
 
   async function processOne(job) {
