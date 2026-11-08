@@ -1181,8 +1181,13 @@ function buildDescriptionEditor(targetPath) {
 
 function pathFooter(p) {
   const f = el('div', 'path-footer');
-  const open = iconBtn('open-path-btn', 'folderOpen', 'Open folder');
-  open.title = `Open "${p}" in your file explorer`;
+  // A browser host (web build) cannot open a local file manager; it downloads
+  // the asset folder instead and says so via folderActionLabel.
+  const label = (window.assetVault && window.assetVault.folderActionLabel) || 'Open folder';
+  const open = iconBtn('open-path-btn', 'folderOpen', label);
+  open.title = label === 'Open folder'
+    ? `Open "${p}" in your file explorer`
+    : 'Download this asset folder as a zip';
   open.addEventListener('click', async (e) => {
     e.preventDefault();
     open.disabled = true;

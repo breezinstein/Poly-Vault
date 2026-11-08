@@ -4,11 +4,14 @@ using UnityEditor;
 namespace AssetVault.EditorTools
 {
     /// <summary>
-    /// Editor-pref backed settings for the Asset Vault bridge.
+    /// Editor-pref backed settings for the Poly Vault bridge. Works both against
+    /// the desktop app (loopback, no token) and against a shared web server
+    /// (http(s) URL + access token).
     /// </summary>
     public static class AssetVaultSettings
     {
         private const string UrlPref = "AssetVault.ServerUrl";
+        private const string TokenPref = "AssetVault.Token";
         private const string AutoSyncPref = "AssetVault.AutoSync";
         private const string AutoImportPref = "AssetVault.AutoImport";
         private const string IntervalPref = "AssetVault.SyncIntervalSec";
@@ -17,9 +20,26 @@ namespace AssetVault.EditorTools
 
         public static string ServerUrl
         {
-            get => EditorPrefs.GetString(UrlPref, DefaultUrl);
-            set => EditorPrefs.SetString(UrlPref, value);
+            get
+            {
+                string url = EditorPrefs.GetString(UrlPref, DefaultUrl).Trim();
+                return url.TrimEnd('/');
+            }
+            set => EditorPrefs.SetString(UrlPref, (value ?? string.Empty).Trim().TrimEnd('/'));
         }
+
+        /// <summary>
+        /// Access token for a shared Poly Vault web server. Empty when talking to
+        /// the desktop app (which has no auth). Stored in EditorPrefs: it is a
+        /// team-level token, not a personal secret, but keep the machine locked.
+        /// </summary>
+        public static string Token
+        {
+            get => EditorPrefs.GetString(TokenPref, string.Empty);
+            set => EditorPrefs.SetString(TokenPref, (value ?? string.Empty).Trim());
+        }
+
+        public static bool UsesRemoteServer => !string.IsNullOrEmpty(Token);
 
         public static bool AutoSync
         {

@@ -8,6 +8,7 @@ namespace AssetVault.EditorTools
     public class AssetVaultWindow : EditorWindow
     {
         private string _url = AssetVaultSettings.ServerUrl;
+        private string _token = AssetVaultSettings.Token;
         private bool _autoSync = AssetVaultSettings.AutoSync;
         private bool _autoImport = AssetVaultSettings.AutoImport;
         private float _interval = AssetVaultSettings.SyncIntervalSeconds;
@@ -53,13 +54,18 @@ namespace AssetVault.EditorTools
             EditorGUI.BeginChangeCheck();
 
             _url = EditorGUILayout.TextField("Server URL", _url);
+            _token = EditorGUILayout.PasswordField("Access token", _token);
+            if (string.IsNullOrEmpty(_token))
+                EditorGUILayout.HelpBox("No token: talking to the desktop app on this machine only. " +
+                    "For a shared Poly Vault server enter your team token.", MessageType.None);
             _autoSync = EditorGUILayout.Toggle("Sync in background", _autoSync);
             _autoImport = EditorGUILayout.Toggle("Auto-import safe jobs", _autoImport);
             _interval = EditorGUILayout.Slider("Sync interval (s)", _interval, 2f, 120f);
 
             if (EditorGUI.EndChangeCheck())
             {
-                AssetVaultSettings.ServerUrl = _url.Trim();
+                AssetVaultSettings.ServerUrl = _url;
+                AssetVaultSettings.Token = _token;
                 AssetVaultSettings.AutoSync = _autoSync;
                 AssetVaultSettings.AutoImport = _autoImport;
                 AssetVaultSettings.SyncIntervalSeconds = _interval;
@@ -86,8 +92,11 @@ namespace AssetVault.EditorTools
 
                 if (GUILayout.Button("Whitelist help", GUILayout.Height(24)))
                     EditorUtility.DisplayDialog("Poly Vault",
-                        "The server only accepts jobs whose asset folder lives inside a registered library.\n\n" +
-                        "Serves on port 7100 on 127.0.0.1 by default. Edit the URL above to point at your running Poly Vault desktop app.", "OK");
+                        "Point Server URL at your Poly Vault server:\n\n" +
+                        "  desktop app     http://127.0.0.1:7100  (no token)\n" +
+                        "  team web server https://vault.example.com  (with access token)\n\n" +
+                        "Files are downloaded over HTTP and copied into Assets/PolyVaultImports. " +
+                        "The server never modifies your library.", "OK");
             }
         }
 
@@ -100,7 +109,7 @@ namespace AssetVault.EditorTools
             {
                 EditorGUILayout.HelpBox(
                     AssetVaultQueue.LastError == null
-                        ? "No pending imports. Open the Poly Vault desktop app and click “Import to Unity” on an asset."
+                        ? "No pending imports. Click “Import to Unity” on an asset in Poly Vault."
                         : $"Cannot reach server: {AssetVaultQueue.LastError}",
                     AssetVaultQueue.LastError == null ? MessageType.Info : MessageType.Warning);
                 return;
@@ -135,10 +144,12 @@ namespace AssetVault.EditorTools
                             EditorGUILayout.LabelField($"• {item.name}  ({item.kind})", EditorStyles.miniLabel);
                             if (GUILayout.Button("Reveal", EditorStyles.miniButton, GUILayout.Width(58)))
                             {
+                                // Local (desktop app) jobs reveal the source file; remote
+                                // jobs are only materialised during the import itself.
                                 if (File.Exists(item.path))
                                     EditorUtility.RevealInFinder(item.path);
                                 else
-                                    Debug.LogWarning($"[Poly Vault] Missing file: {item.path}");
+                                    EditorUtility.RevealInFinder(Path.Combine("Library", "PolyVaultCache", job.id));
                             }
                         }
                     }
@@ -188,6 +199,16 @@ namespace AssetVault.EditorTools
             if (AssetVaultQueue.LastError != null)
             {
                 EditorGUILayout.HelpBox($"Server error: {AssetVaultQueue.LastError}", MessageType.Warning);
+            }
+            else if (!string.IsNullOrEmpty(AssetVaultQueue.Artist))
+            {
+                EditorGUILayout.LabelField($"Signed in as {AssetVaultQueue.Artist} — jobs addressed to you appear here.",
+                    EditorStyles.miniLabel);
+            }
+            else if (AssetVaultSettings.UsesRemoteServer)
+            {
+                EditorGUILayout.LabelField("Shared token: every machine sees every queued import.",
+                    EditorStyles.miniLabel);
             }
 
             EditorGUILayout.LabelField(text + "   —   Import target: " + AssetVaultImporter.ImportRoot, EditorStyles.miniLabel);

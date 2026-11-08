@@ -28,6 +28,10 @@ namespace AssetVault.EditorTools
         public string createdAt;
         public string updatedAt;
         public string note;
+        // Team fields set by the server when it runs in team mode.
+        public string requestedBy;
+        public string targetUser;
+        public string claimedBy;
 
         public string DisplayName =>
             string.IsNullOrEmpty(category) ? assetName : $"{libraryName}/{category}/{assetName}";
@@ -38,6 +42,8 @@ namespace AssetVault.EditorTools
     {
         public bool ok;
         public List<ImportJobDto> jobs = new List<ImportJobDto>();
+        // Identity the server assigned to this token ("" in shared-token mode).
+        public string artist;
     }
 
     [Serializable]

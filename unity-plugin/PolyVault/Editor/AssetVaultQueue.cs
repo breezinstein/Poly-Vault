@@ -20,6 +20,8 @@ namespace AssetVault.EditorTools
         private static bool _requestInFlight;
 
         public static IReadOnlyList<ImportJobDto> Jobs => LastJobs;
+        /// <summary>Artist/identity the server associated with this token ("" if shared).</summary>
+        public static string Artist { get; private set; } = string.Empty;
         public static string LastError { get; private set; }
         public static DateTime LastPollAt { get; private set; }
         public static event Action JobsChanged;
@@ -76,8 +78,11 @@ namespace AssetVault.EditorTools
                 {
                     var envelope = JsonUtility.FromJson<ImportJobsEnvelope>(text);
                     LastJobs.Clear();
-                    if (envelope != null && envelope.jobs != null)
-                        LastJobs.AddRange(envelope.jobs);
+                    if (envelope != null)
+                    {
+                        Artist = envelope.artist ?? string.Empty;
+                        if (envelope.jobs != null) LastJobs.AddRange(envelope.jobs);
+                    }
                 }
                 catch (Exception e)
                 {

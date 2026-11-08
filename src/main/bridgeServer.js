@@ -58,7 +58,25 @@ function createJob(asset, now = new Date()) {
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
     note: '',
+    // Team fields (empty in single-user desktop mode): who asked, which
+    // machine may take it, and which machine took it.
+    requestedBy: '',
+    targetUser: '',
+    claimedBy: '',
   };
+}
+
+// The Unity plugin identifies itself with X-PV-Artist (its configured artist
+// name). Jobs are only handed out to a matching artist, or to anyone when the
+// job has no target.
+function jobArtist(req) {
+  return String(req.headers['x-pv-artist'] || '').trim().toLowerCase();
+}
+
+function visibleToArtist(job, artist) {
+  if (!artist) return true;
+  if (job.claimedBy && job.claimedBy !== artist) return false;
+  return !job.targetUser || String(job.targetUser).toLowerCase() === artist;
 }
 
 function sendJson(res, code, payload) {
@@ -406,6 +424,9 @@ function startBridge({ host = '127.0.0.1', port = 7100, getState, tags, meta, on
           tags: body.tags,
           importables: body.importables,
         });
+        const requestedBy = String(req.headers['x-pv-user'] || '').trim();
+        job.requestedBy = requestedBy;
+        job.targetUser = requestedBy;
         state.jobs.push(job);
         const pruned = pruneJobs(state.jobs);
         state.jobs.length = 0;
@@ -416,14 +437,23 @@ function startBridge({ host = '127.0.0.1', port = 7100, getState, tags, meta, on
       }
 
       if (req.method === 'GET' && route === '/api/import-jobs') {
-        sendJson(res, 200, { ok: true, jobs: state.jobs });
+        // The web UI only shows the caller's own requests (plus untargeted
+        // jobs from desktop/shared-token users) so badge state stays per person.
+        const user = String(req.headers['x-pv-user'] || '').trim();
+        const jobs = user
+          ? state.jobs.filter((j) => !j.requestedBy || j.requestedBy === user)
+          : state.jobs;
+        sendJson(res, 200, { ok: true, jobs });
         return;
       }
 
       if (req.method === 'GET' && route === '/api/unity/import-jobs') {
         lastUnitySeen = Date.now();
-        const active = state.jobs.filter((j) => !TERMINAL_STATES.has(j.status));
-        sendJson(res, 200, { ok: true, jobs: active });
+        const artist = jobArtist(req);
+        const active = state.jobs
+          .filter((j) => !TERMINAL_STATES.has(j.status))
+          .filter((j) => visibleToArtist(j, artist));
+        sendJson(res, 200, { ok: true, jobs: active, artist });
         return;
       }
 
@@ -450,6 +480,8 @@ function startBridge({ host = '127.0.0.1', port = 7100, getState, tags, meta, on
             ? JOB_STATES.FAILED
             : JOB_STATES.PROCESSING;
         job.note = body.note || '';
+        const artist = jobArtist(req);
+        if (artist) job.claimedBy = artist;
         job.updatedAt = new Date().toISOString();
         const pruned = pruneJobs(state.jobs);
         state.jobs.length = 0;

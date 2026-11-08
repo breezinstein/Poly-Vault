@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.Networking;
 
 namespace AssetVault.EditorTools
 {
@@ -110,6 +111,7 @@ namespace AssetVault.EditorTools
             {
                 Debug.Log($"[Poly Vault] Package '{packageName}' imported successfully.");
                 ReportJobResult(job, true, $"Imported package {packageName}.");
+                CleanupCache(job);
                 AssetVaultQueue.PollNow();
             }
         }
@@ -120,6 +122,7 @@ namespace AssetVault.EditorTools
             {
                 Debug.LogWarning($"[Poly Vault] Package '{packageName}' import was cancelled in Unity.");
                 ReportJobResult(job, false, $"Package '{packageName}' import cancelled in Unity.");
+                CleanupCache(job);
                 AssetVaultQueue.PollNow();
             }
         }
@@ -130,6 +133,7 @@ namespace AssetVault.EditorTools
             {
                 Debug.LogError($"[Poly Vault] Package '{packageName}' import failed: {errorMessage}");
                 ReportJobResult(job, false, $"Package '{packageName}' import failed: {errorMessage}");
+                CleanupCache(job);
                 AssetVaultQueue.PollNow();
             }
         }
@@ -183,6 +187,10 @@ namespace AssetVault.EditorTools
             return combined;
         }
 
+        /// <summary>
+        /// Resolves every importable to a local file, downloading it from the Poly
+        /// Vault server when the library lives on a remote host, then imports.
+        /// </summary>
         /// <returns>true if the job was accepted (started or completed).</returns>
         public static bool TryImport(ImportJobDto job, bool interactive, Action<string> log, Action<string, bool> finished)
         {
@@ -200,89 +208,40 @@ namespace AssetVault.EditorTools
             InFlight.Add(job.id);
             try
             {
-                int imported = 0;
-                int skippedPackages = 0;
-                bool hasInteractivePackage = false;
-
-                string destAssetRoot = Path.Combine(
-                    ImportRoot.Replace('/', Path.DirectorySeparatorChar),
-                    Sanitize(job.libraryName),
-                    Sanitize(job.category),
-                    Sanitize(job.assetName));
-
+                var resolved = new List<ResolvedItem>();
                 foreach (var item in job.importables)
                 {
                     if (item == null) continue;
 
-                    if (string.Equals(item.kind, "unitypackage", StringComparison.OrdinalIgnoreCase))
+                    if (!string.IsNullOrEmpty(item.path) && File.Exists(item.path))
                     {
-                        if (File.Exists(item.path))
-                        {
-                            if (interactive)
-                            {
-                                hasInteractivePackage = true;
-                                RegisterPendingPackage(item, job);
-                                ReportJobStatus(job, "processing", $"Importing package {item.name} in Unity...");
-
-                                // Opens Unity's package import dialog.
-                                AssetDatabase.ImportPackage(item.path, true);
-                                log?.Invoke($"Opened package import for {item.name}");
-                                imported++;
-                            }
-                            else
-                            {
-                                skippedPackages++;
-                                log?.Invoke($"Skipped {item.name} (unitypackage needs manual import from the window).");
-                            }
-                        }
-                        else
-                        {
-                            log?.Invoke($"Missing file: {item.path}");
-                        }
-                        continue;
+                        // Desktop app (or a shared mount): the file is already local.
+                        resolved.Add(new ResolvedItem { Item = item, LocalPath = item.path });
                     }
-
-                    if (!File.Exists(item.path))
+                    else if (AssetVaultSettings.UsesRemoteServer)
+                    {
+                        // Shared web server: fetch it over HTTP into the project cache.
+                        resolved.Add(new ResolvedItem { Item = item, LocalPath = CachePathFor(job, item) });
+                    }
+                    else
                     {
                         log?.Invoke($"Missing file: {item.path}");
-                        continue;
-                    }
-
-                    string dest = UniqueFile(DestinationFor(job, item));
-                    string destDir = Path.GetDirectoryName(dest);
-                    if (!Directory.Exists(destDir)) Directory.CreateDirectory(destDir);
-
-                    try
-                    {
-                        File.Copy(item.path, dest, overwrite: false);
-                        imported++;
-                        log?.Invoke($"Copied {item.name} -> {dest.Replace(Path.DirectorySeparatorChar, '/')}");
-                    }
-                    catch (Exception e)
-                    {
-                        log?.Invoke($"Copy failed for {item.name}: {e.Message}");
                     }
                 }
 
-                AssetDatabase.Refresh();
-                WriteTagsFile(destAssetRoot, job.tags);
-
-                if (hasInteractivePackage)
+                bool needsDownload = false;
+                foreach (var entry in resolved)
                 {
-                    finished?.Invoke($"Opened package import dialog for {job.assetName}.", true);
+                    if (!File.Exists(entry.LocalPath)) { needsDownload = true; break; }
+                }
+
+                if (!needsDownload)
+                {
+                    ImportResolved(job, resolved, interactive, log, finished);
                     return true;
                 }
 
-                if (imported == 0 && skippedPackages > 0)
-                {
-                    finished?.Invoke("Only unitypackage files pending manual import.", false);
-                    InFlight.Remove(job.id);
-                    return true;
-                }
-
-                InFlight.Remove(job.id);
-                ReportJobResult(job, true, $"Imported {imported} file(s).");
-                finished?.Invoke($"Imported {imported} file(s).", true);
+                DownloadThenImport(job, resolved, 0, interactive, log, finished);
                 return true;
             }
             catch (Exception e)
@@ -293,6 +252,174 @@ namespace AssetVault.EditorTools
                 ReportJobResult(job, false, msg);
                 finished?.Invoke($"Import failed: {msg}", false);
                 return true;
+            }
+        }
+
+        private sealed class ResolvedItem
+        {
+            public ImportableDto Item;
+            public string LocalPath;
+        }
+
+        private static string CacheDirFor(ImportJobDto job) =>
+            Path.Combine("Library", "PolyVaultCache", Sanitize(job.id));
+
+        private static string CachePathFor(ImportJobDto job, ImportableDto item)
+        {
+            string rel = string.IsNullOrEmpty(item.rel) ? item.name : item.rel;
+            string root = Path.GetFullPath(CacheDirFor(job));
+            string combined = Path.GetFullPath(Path.Combine(root, rel.Replace('/', Path.DirectorySeparatorChar)));
+            if (!combined.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                combined = Path.Combine(root, Sanitize(item.name));
+            return combined;
+        }
+
+        private static string DownloadUrlFor(ImportableDto item) =>
+            $"{AssetVaultSettings.ServerUrl}/api/file?path={UnityWebRequest.EscapeURL(item.path)}";
+
+        /// <summary>
+        /// Downloads the still-missing files one at a time, then imports. Sequential
+        /// on purpose: keeps the editor responsive and is kind to the server.
+        /// </summary>
+        private static void DownloadThenImport(ImportJobDto job, List<ResolvedItem> resolved, int index,
+            bool interactive, Action<string> log, Action<string, bool> finished)
+        {
+            while (index < resolved.Count && File.Exists(resolved[index].LocalPath)) index++;
+            if (index >= resolved.Count)
+            {
+                ImportResolved(job, resolved, interactive, log, finished);
+                return;
+            }
+
+            var entry = resolved[index];
+            log?.Invoke($"Downloading {entry.Item.name} ({index + 1}/{resolved.Count})...");
+            ReportJobStatus(job, "processing", $"Downloading {entry.Item.name}");
+
+            AssetVaultWeb.DownloadFile(DownloadUrlFor(entry.Item), entry.LocalPath, (ok, error) =>
+            {
+                if (!ok)
+                {
+                    InFlight.Remove(job.id);
+                    log?.Invoke($"Download failed for {entry.Item.name}: {error}");
+                    ReportJobResult(job, false, $"Download failed for {entry.Item.name}: {error}");
+                    finished?.Invoke($"Download failed: {error}", false);
+                    return;
+                }
+
+                try
+                {
+                    DownloadThenImport(job, resolved, index + 1, interactive, log, finished);
+                }
+                catch (Exception e)
+                {
+                    InFlight.Remove(job.id);
+                    log?.Invoke($"Import failed: {e.Message}");
+                    ReportJobResult(job, false, e.Message);
+                    finished?.Invoke($"Import failed: {e.Message}", false);
+                }
+            });
+        }
+
+        private static void ImportResolved(ImportJobDto job, List<ResolvedItem> resolved, bool interactive,
+            Action<string> log, Action<string, bool> finished)
+        {
+            int imported = 0;
+            int skippedPackages = 0;
+            bool hasInteractivePackage = false;
+
+            string destAssetRoot = Path.Combine(
+                ImportRoot.Replace('/', Path.DirectorySeparatorChar),
+                Sanitize(job.libraryName),
+                Sanitize(job.category),
+                Sanitize(job.assetName));
+
+            foreach (var entry in resolved)
+            {
+                var item = entry.Item;
+                if (item == null) continue;
+
+                if (string.Equals(item.kind, "unitypackage", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!File.Exists(entry.LocalPath))
+                    {
+                        log?.Invoke($"Missing file: {item.name}");
+                        continue;
+                    }
+                    if (interactive)
+                    {
+                        hasInteractivePackage = true;
+                        RegisterPendingPackage(item, job);
+                        ReportJobStatus(job, "processing", $"Importing package {item.name} in Unity...");
+                        AssetDatabase.ImportPackage(entry.LocalPath, true);
+                        log?.Invoke($"Opened package import for {item.name}");
+                        imported++;
+                    }
+                    else
+                    {
+                        skippedPackages++;
+                        log?.Invoke($"Skipped {item.name} (unitypackage needs manual import from the window).");
+                    }
+                    continue;
+                }
+
+                if (!File.Exists(entry.LocalPath))
+                {
+                    log?.Invoke($"Missing file: {item.name}");
+                    continue;
+                }
+
+                string dest = UniqueFile(DestinationFor(job, item));
+                string destDir = Path.GetDirectoryName(dest);
+                if (!Directory.Exists(destDir)) Directory.CreateDirectory(destDir);
+
+                try
+                {
+                    File.Copy(entry.LocalPath, dest, overwrite: false);
+                    imported++;
+                    log?.Invoke($"Copied {item.name} -> {dest.Replace(Path.DirectorySeparatorChar, '/')}");
+                }
+                catch (Exception e)
+                {
+                    log?.Invoke($"Copy failed for {item.name}: {e.Message}");
+                }
+            }
+
+            AssetDatabase.Refresh();
+            WriteTagsFile(destAssetRoot, job.tags);
+
+            // Unity's package dialog reads the file after ImportPackage returns,
+            // so the cache survives until the pending import completes.
+            if (!hasInteractivePackage) CleanupCache(job);
+
+            if (hasInteractivePackage)
+            {
+                finished?.Invoke($"Opened package import dialog for {job.assetName}.", true);
+                return;
+            }
+
+            if (imported == 0 && skippedPackages > 0)
+            {
+                finished?.Invoke("Only unitypackage files pending manual import.", false);
+                InFlight.Remove(job.id);
+                return;
+            }
+
+            InFlight.Remove(job.id);
+            ReportJobResult(job, true, $"Imported {imported} file(s).");
+            finished?.Invoke($"Imported {imported} file(s).", true);
+        }
+
+        /// <summary>Removes this job's downloaded copies from the project cache; best effort.</summary>
+        private static void CleanupCache(ImportJobDto job)
+        {
+            try
+            {
+                string dir = CacheDirFor(job);
+                if (Directory.Exists(dir)) Directory.Delete(dir, true);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[Poly Vault] Could not clean download cache: {e.Message}");
             }
         }
 
