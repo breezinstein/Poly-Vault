@@ -10,6 +10,7 @@ const fs = require('fs');
 const path = require('path');
 const { parentPort } = require('worker_threads');
 const { readUnityPackage, extractEntry } = require('./unityPackage');
+const { buildPackageGraph, buildFolderGraph, extractMany, graphSummary } = require('./unityGraph');
 
 let extractChain = Promise.resolve();
 
@@ -19,8 +20,54 @@ parentPort.on('message', (msg) => {
     extractChain = extractChain.then(() => handleExtract(msg)).catch(() => undefined);
     return;
   }
+  if (msg.action === 'extractMany') {
+    extractChain = extractChain.then(() => handleExtractMany(msg)).catch(() => undefined);
+    return;
+  }
+  if (msg.action === 'graph') {
+    handleGraph(msg);
+    return;
+  }
+  if (msg.action === 'folderGraph') {
+    // Loose Unity folders: walking .meta files on NFS must not block HTTP.
+    try {
+      const graph = buildFolderGraph(msg.dir, { maxFiles: msg.maxFiles });
+      fs.mkdirSync(path.dirname(msg.outPath), { recursive: true });
+      fs.writeFileSync(`${msg.outPath}.tmp`, JSON.stringify(graph));
+      fs.renameSync(`${msg.outPath}.tmp`, msg.outPath);
+      parentPort.postMessage({ id: msg.id, ok: true, summary: graphSummary(graph) });
+    } catch (err) {
+      parentPort.postMessage({ id: msg.id, ok: false, error: String((err && err.message) || err) });
+    }
+    return;
+  }
   handleIndex(msg);
 });
+
+// Link map: written to disk here so a multi-MB object never crosses threads.
+async function handleGraph(msg) {
+  const { id, file, outPath, timeoutMs } = msg;
+  try {
+    const graph = await buildPackageGraph(file, { timeoutMs });
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    const tmp = `${outPath}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(graph));
+    fs.renameSync(tmp, outPath);
+    parentPort.postMessage({ id, ok: true, summary: graphSummary(graph) });
+  } catch (err) {
+    parentPort.postMessage({ id, ok: false, error: String((err && err.message) || err) });
+  }
+}
+
+async function handleExtractMany(msg) {
+  const { id, file, targets, timeoutMs } = msg;
+  try {
+    const result = await extractMany(file, targets, { timeoutMs });
+    parentPort.postMessage({ id, ok: true, ...result });
+  } catch (err) {
+    parentPort.postMessage({ id, ok: false, error: String((err && err.message) || err) });
+  }
+}
 
 async function handleExtract(msg) {
   const { id, file } = msg;

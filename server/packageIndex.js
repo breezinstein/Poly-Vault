@@ -25,6 +25,8 @@ const path = require('path');
 const crypto = require('crypto');
 const { Worker } = require('worker_threads');
 
+const { GRAPH_SCHEMA, graphSummary } = require('./unityGraph');
+
 const sha1 = (value) => crypto.createHash('sha1').update(value).digest('hex');
 const NOTIFY_MS = 20000;          // at most one ETag bump per 20 s while busy
 const PREVIEW_BUDGET = 64 * 1024 * 1024;
@@ -33,13 +35,21 @@ const TIMEOUT_MS = 45000;
 const MAX_CONTENTS = 4000;
 const CONTENTS_CAP = MAX_CONTENTS;
 
-function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024 * 1024, onUpdate = null, log = console }) {
+function createPackageIndex({
+  dir, enabled = true, maxPackageBytes = 4096 * 1024 * 1024, onUpdate = null, log = console,
+  graphEnabled = true, graphTimeoutMs = 30 * 60 * 1000,
+}) {
   const cacheDir = path.join(dir, 'packages');
   const previewDir = path.join(cacheDir, 'previews');
   const metaDir = path.join(cacheDir, 'meta');
+  // Link maps (guid -> path, materials, prefabs, importer settings). Named
+  // <sha1(file)>-<mtime>-<size>-s<schema>.json so freshness is a name lookup.
+  const graphDir = path.join(cacheDir, 'graph');
+  const graphFailFile = path.join(graphDir, 'failed.json');
+  const useGraph = enabled && graphEnabled;
 
   if (enabled) {
-    for (const d of [cacheDir, previewDir, metaDir]) {
+    for (const d of [cacheDir, previewDir, metaDir, ...(useGraph ? [graphDir] : [])]) {
       try { fs.mkdirSync(d, { recursive: true }); } catch (err) { log.warn(`[poly-vault] package cache unavailable: ${err.message}`); }
     }
   }
@@ -91,6 +101,39 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
     try { stats.cachedPreviews = fs.readdirSync(previewDir).length; } catch (_) { stats.cachedPreviews = 0; }
   }
   if (enabled) refreshCachedTotals();
+
+  // --- link-map state --------------------------------------------------------
+  const graphIndex = new Map();       // sha1(file) -> { mtimeMs, size, schema, name }
+  const graphQueue = [];              // { file, size, mtimeMs }
+  const graphQueued = new Set();
+  const graphCache = new Map();       // file -> parsed graph (small LRU)
+  let graphActiveFile = '';
+  let graphFailures = {};             // file -> { mtimeMs, size, error, count, at }
+  const graphStats = { built: 0, failed: 0, bytesRead: 0, lastFile: '', lastMs: 0 };
+  const GRAPH_NAME = /^([0-9a-f]{40})-(\d+)-(\d+)-s(\d+)\.json$/;
+  if (useGraph) {
+    try {
+      for (const name of fs.readdirSync(graphDir)) {
+        const m = GRAPH_NAME.exec(name);
+        if (!m || Number(m[4]) !== GRAPH_SCHEMA) continue;
+        const prev = graphIndex.get(m[1]);
+        if (!prev || Number(m[2]) > prev.mtimeMs) graphIndex.set(m[1], { mtimeMs: Number(m[2]), size: Number(m[3]), schema: Number(m[4]), name });
+      }
+    } catch (_) { /* first run */ }
+    try { graphFailures = JSON.parse(fs.readFileSync(graphFailFile, 'utf8')) || {}; } catch (_) { graphFailures = {}; }
+  }
+  const graphPath = (file, mtimeMs, size) => path.join(graphDir, `${sha1(file)}-${Math.trunc(mtimeMs)}-${size}-s${GRAPH_SCHEMA}.json`);
+  const graphFresh = (file, mtimeMs, size) => {
+    const g = graphIndex.get(sha1(file));
+    return g && Math.abs(g.mtimeMs - Math.trunc(mtimeMs)) <= 2 && g.size === size ? g : null;
+  };
+  const graphFailed = (file, mtimeMs, size) => {
+    const f = graphFailures[file];
+    return f && Math.abs(f.mtimeMs - Math.trunc(mtimeMs)) <= 2 && f.size === size ? f : null;
+  };
+  const saveGraphFailures = () => {
+    try { fs.writeFileSync(graphFailFile, JSON.stringify(graphFailures)); } catch (_) { /* best effort */ }
+  };
 
   const metaPath = (file) => path.join(metaDir, `${sha1(file)}.json`);
   const previewPath = (file, mtimeMs) => path.join(previewDir, `${sha1(file)}-${Math.trunc(mtimeMs)}.png`);
@@ -223,6 +266,165 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
     return job;
   }
 
+  /**
+   * Extracts several assets (by GUID) in one archive pass on the worker.
+   * @param {{guid:string,outPath:string,maxBytes?:number}[]} targets
+   * @returns {Promise<{ok:boolean, results?:Object, scannedBytes?:number, error?:string}>}
+   */
+  function extractMany(file, targets) {
+    if (!enabled) return Promise.resolve({ ok: false, error: 'package index disabled' });
+    if (!targets.length) return Promise.resolve({ ok: true, results: {}, scannedBytes: 0 });
+    const job = extractChain.then(() => new Promise((resolve) => {
+      const id = `extract:${(extractSeq += 1)}`;
+      pendingExtracts.set(id, resolve);
+      try {
+        ensureWorker().postMessage({ id, action: 'extractMany', file, targets, timeoutMs: graphTimeoutMs });
+      } catch (err) {
+        pendingExtracts.delete(id);
+        resolve({ ok: false, error: err.message });
+      }
+    }));
+    extractChain = job.then(() => undefined, () => undefined);
+    return job;
+  }
+
+  // --- link maps --------------------------------------------------------------
+
+  function graphMessage(file, outPath) {
+    return new Promise((resolve) => {
+      pendingReply = resolve;
+      try {
+        ensureWorker().postMessage({ id: `${file}:graph`, action: 'graph', file, outPath, timeoutMs: graphTimeoutMs });
+      } catch (err) {
+        pendingReply = null;
+        resolve({ ok: false, error: err.message });
+      }
+    });
+  }
+
+  async function processGraph(job) {
+    let stat;
+    try { stat = fs.statSync(job.file); } catch (err) {
+      graphStats.failed += 1;
+      graphFailures[job.file] = { mtimeMs: job.mtimeMs, size: job.size, error: `stat: ${err.code || err.message}`, count: 3, at: new Date().toISOString() };
+      saveGraphFailures();
+      return;
+    }
+    const mtime = Math.trunc(stat.mtimeMs);
+    if (graphFresh(job.file, mtime, stat.size)) return;
+    graphActiveFile = job.file;
+    const started = Date.now();
+    const out = graphPath(job.file, mtime, stat.size);
+    const reply = await graphMessage(job.file, out);
+    graphActiveFile = '';
+    graphStats.lastMs = Date.now() - started;
+    graphStats.lastFile = path.basename(job.file);
+    if (!reply.ok) {
+      graphStats.failed += 1;
+      const prev = graphFailed(job.file, mtime, stat.size);
+      graphFailures[job.file] = { mtimeMs: mtime, size: stat.size, error: reply.error, count: (prev ? prev.count : 0) + 1, at: new Date().toISOString() };
+      saveGraphFailures();
+      log.warn(`[poly-vault] link map failed for ${path.basename(job.file)}: ${reply.error}`);
+      return;
+    }
+    const key = sha1(job.file);
+    const old = graphIndex.get(key);
+    if (old && old.name !== path.basename(out)) {
+      try { fs.unlinkSync(path.join(graphDir, old.name)); } catch (_) { /* ignore */ }
+    }
+    graphIndex.set(key, { mtimeMs: mtime, size: stat.size, schema: GRAPH_SCHEMA, name: path.basename(out) });
+    graphCache.delete(job.file);
+    if (graphFailures[job.file]) { delete graphFailures[job.file]; saveGraphFailures(); }
+    graphStats.built += 1;
+    graphStats.bytesRead += (reply.summary && reply.summary.scannedBytes) || 0;
+    // No ETag bump: link maps are not part of the library payload, and the
+    // eager pass would otherwise make every browser refetch it every 20 s.
+  }
+
+  function enqueueGraph(file, mtimeMs, size, opts = {}) {
+    if (!useGraph || !file || !mtimeMs || !size) return false;
+    if (graphFresh(file, mtimeMs, size)) return false;
+    if (graphQueued.has(file) || graphActiveFile === file) return false;
+    const failed = graphFailed(file, mtimeMs, size);
+    if (failed && failed.count >= 3 && !opts.force) return false;
+    const item = { file, size, mtimeMs: Math.trunc(mtimeMs) };
+    // On-demand requests (someone opened a model) jump the background queue.
+    if (opts.priority) graphQueue.unshift(item); else graphQueue.push(item);
+    graphQueued.add(file);
+    drain().catch((err) => log.warn(`[poly-vault] package index drain failed: ${err.message}`));
+    return true;
+  }
+
+  // Loose folders (assets with .meta siblings): built on demand on the worker,
+  // cached on disk for FOLDER_TTL_MS (folders change rarely; "Update" clears).
+  const FOLDER_TTL_MS = 10 * 60 * 1000;
+  const folderInFlight = new Map();
+  function folderGraph(dirPath, opts = {}) {
+    if (!useGraph) return Promise.resolve(null);
+    const out = path.join(graphDir, 'folders', `${sha1(dirPath)}.json`);
+    const cached = graphCache.get(`dir:${dirPath}`);
+    if (!opts.force && cached && Date.now() - cached.at < FOLDER_TTL_MS) return Promise.resolve(cached.graph);
+    if (!opts.force) {
+      try {
+        const st = fs.statSync(out);
+        if (Date.now() - st.mtimeMs < FOLDER_TTL_MS) {
+          const graph = JSON.parse(fs.readFileSync(out, 'utf8'));
+          graphCache.set(`dir:${dirPath}`, { at: st.mtimeMs, graph });
+          return Promise.resolve(graph);
+        }
+      } catch (_) { /* build it */ }
+    }
+    if (folderInFlight.has(dirPath)) return folderInFlight.get(dirPath);
+    const job = new Promise((resolve) => {
+      const id = `extract:${(extractSeq += 1)}`;
+      pendingExtracts.set(id, (msg) => {
+        if (!msg.ok) { log.warn(`[poly-vault] folder link map failed for ${dirPath}: ${msg.error}`); resolve(null); return; }
+        try {
+          const graph = JSON.parse(fs.readFileSync(out, 'utf8'));
+          graphCache.set(`dir:${dirPath}`, { at: Date.now(), graph });
+          resolve(graph);
+        } catch (_) { resolve(null); }
+      });
+      try {
+        ensureWorker().postMessage({ id, action: 'folderGraph', dir: dirPath, outPath: out, maxFiles: opts.maxFiles || 50000 });
+      } catch (err) {
+        pendingExtracts.delete(id);
+        resolve(null);
+      }
+    });
+    folderInFlight.set(dirPath, job);
+    job.finally(() => folderInFlight.delete(dirPath));
+    return job;
+  }
+
+  /** Parsed link map of a package, or null when it is not built yet. */
+  function getGraph(file, mtimeMs, size) {
+    if (!useGraph) return null;
+    const g = graphFresh(file, mtimeMs, size);
+    if (!g) return null;
+    const cached = graphCache.get(file);
+    if (cached && cached.name === g.name) return cached.graph;
+    try {
+      const graph = JSON.parse(fs.readFileSync(path.join(graphDir, g.name), 'utf8'));
+      graphCache.set(file, { name: g.name, graph });
+      while (graphCache.size > 8) graphCache.delete(graphCache.keys().next().value);
+      return graph;
+    } catch (_) {
+      graphIndex.delete(sha1(file));
+      return null;
+    }
+  }
+
+  function graphState(file, mtimeMs, size) {
+    if (!useGraph) return { state: 'disabled' };
+    if (graphFresh(file, mtimeMs, size)) return { state: 'ready' };
+    if (graphActiveFile === file) return { state: 'building' };
+    if (graphQueued.has(file)) return { state: 'queued', position: graphQueue.findIndex((j) => j.file === file) + 1 };
+    const failed = graphFailed(file, mtimeMs, size);
+    if (failed) return { state: failed.count >= 3 ? 'failed' : 'retrying', error: failed.error, attempts: failed.count };
+    return { state: 'missing' };
+  }
+
   async function processOne(job) {
     let stat;
     try { stat = fs.statSync(job.file); } catch (_) { stats.failed += 1; return; }
@@ -289,7 +491,20 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
     if (draining) return;
     draining = true;
     try {
-      while (queue.length) {
+      while (queue.length || graphQueue.length) {
+        // Previews/contents first (cards), link maps when that queue is idle.
+        if (!queue.length) {
+          const g = graphQueue.shift();
+          graphQueued.delete(g.file);
+          try {
+            await processGraph(g);
+          } catch (err) {
+            graphStats.failed += 1;
+            graphActiveFile = '';
+            log.warn(`[poly-vault] link map error: ${err.message}`);
+          }
+          continue;
+        }
         const job = queue.shift();
         queued.delete(job.file);
         if (inFlight.has(job.file)) continue;
@@ -326,6 +541,9 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
       } catch (_) { stats.skipped += 1; return false; }
     }
 
+    // Every package gets a link map, eagerly, behind previews and contents.
+    enqueueGraph(file, mtime, bytes);
+
     const existing = readEntry(file, mtime, bytes);
     // `previewTried` remembers a pass that found no preview (editor-only tools
     // often have none): without it those packages would be re-read forever.
@@ -359,7 +577,24 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
       maxPackageBytes,
       previewBudgetBytes: PREVIEW_BUDGET,
       fullBudgetBytes: FULL_BUDGET,
+      graph: {
+        enabled: useGraph,
+        schema: GRAPH_SCHEMA,
+        ready: graphIndex.size,
+        queued: graphQueue.length,
+        building: graphActiveFile ? path.basename(graphActiveFile) : '',
+        failed: Object.values(graphFailures).filter((f) => f.count >= 3).length,
+        builtThisRun: graphStats.built,
+        failedThisRun: graphStats.failed,
+        bytesRead: graphStats.bytesRead,
+        lastFile: graphStats.lastFile,
+        lastMs: graphStats.lastMs,
+      },
     };
+  }
+
+  function graphFailuresList() {
+    return Object.entries(graphFailures).map(([file, f]) => ({ file, ...f }));
   }
 
   function close() {
@@ -367,7 +602,10 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
     if (worker) { try { worker.terminate(); } catch (_) { /* ignore */ } worker = null; }
   }
 
-  return { get, enqueue, extractTo, status, close, cacheDir, previewDir, contentsCap: CONTENTS_CAP };
+  return {
+    get, enqueue, extractTo, extractMany, status, close, cacheDir, previewDir, contentsCap: CONTENTS_CAP,
+    enqueueGraph, getGraph, graphState, graphSummary, graphFailuresList, folderGraph,
+  };
 }
 
 module.exports = { createPackageIndex };

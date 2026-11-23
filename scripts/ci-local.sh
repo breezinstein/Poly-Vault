@@ -33,6 +33,11 @@ echo "==> upstream smoke tests"
 docker build -q --target source -t poly-vault:ci-source . >/dev/null
 docker run --rm --entrypoint node poly-vault:ci-source /app/tests/smoke.js
 
+echo "==> unit tests (link map: yaml, tar walk, graphs, extraction)"
+for t in tests/*.test.js; do
+  docker run --rm -v "$PWD":/w:ro -w /w node:24-alpine node "$t"
+done
+
 echo "==> fixture library"
 ./scripts/make-fixture-library.sh "$ASSETS" >/dev/null
 chmod -R a+rX "$WORK"
@@ -81,6 +86,21 @@ expect "rig root asset fallback signed out" "text/html; charset=utf-8" "$(ctype 
 expect "rig fallback never serves html" 404 "$(code -H 'Authorization: Bearer tok-alice' "$BASE/create.html")"
 expect "own UI asset wins over rig" "image/png" "$(ctype -H 'Authorization: Bearer tok-alice' "$BASE/assets/logo.png")"
 expect "rig traversal rejected" 404 "$(code -H 'Authorization: Bearer tok-alice' "$BASE/rig/..%2f..%2fserver/server.js")"
+
+echo "==> link map (/api/package/graph)"
+PKG="$(cd "$ASSETS" && find . -name '*.unitypackage' | head -1 | sed 's#^\./#/assets/#')"
+QPKG="$(printf '%s' "$PKG" | sed 's/ /%20/g')"
+graph_code=0
+for _ in $(seq 1 30); do
+  graph_code="$(code -H 'Authorization: Bearer tok-alice' "$BASE/api/package/graph?path=$QPKG")"
+  [ "$graph_code" = 200 ] && break
+  sleep 1
+done
+expect "fixture package gets a link map" 200 "$graph_code"
+expect "link map summary is complete" true "$(curl -s -H 'Authorization: Bearer tok-alice' "$BASE/api/package/graph?path=$QPKG" | grep -o '"complete":[a-z]*' | cut -d: -f2)"
+expect "link map outside libraries refused" 404 "$(code -H 'Authorization: Bearer tok-alice' "$BASE/api/package/graph?path=/etc/passwd")"
+expect "link map needs auth" 401 "$(code "$BASE/api/package/graph?path=$QPKG")"
+expect "healthz reports link maps" 1 "$(curl -s -H 'Authorization: Bearer tok-alice' "$BASE/healthz" | grep -c '"graph":{"enabled":true')"
 
 if [ "$status" -ne 0 ]; then
   echo "==> FAILED — container logs:"

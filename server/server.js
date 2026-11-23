@@ -189,7 +189,23 @@ const packageIndex = createPackageIndex({
   enabled: PACKAGE_INDEX_ENABLED,
   maxPackageBytes: PACKAGE_INDEX_MAX_MB * 1024 * 1024,
   onUpdate: () => { scanGeneration += 1; }, // new preview/metadata -> new ETag
+  // Link maps (materials/prefabs/importer settings) for every package.
+  graphEnabled: env.PV_PACKAGE_GRAPH !== '0',
+  graphTimeoutMs: Number(env.PV_GRAPH_TIMEOUT_MS || 30 * 60 * 1000),
 });
+
+// Resolve a client-supplied path to a real file/dir inside a library, or null.
+function resolveInLibrary(target) {
+  let real;
+  try { real = fs.realpathSync(String(target || '').trim()); } catch (_) { return null; }
+  const inside = getState().libraries.some((lib) => {
+    if (lib.missing) return false;
+    let root;
+    try { root = fs.realpathSync(lib.path); } catch (_) { root = path.resolve(lib.path); }
+    return real === root || real.startsWith(root + path.sep);
+  });
+  return inside ? real : null;
+}
 
 const enrichment = createEnrichment({
   getMeta: metaOf,
@@ -1027,6 +1043,33 @@ const server = http.createServer(async (req, res) => {
       ETag: `W/"ep-${path.basename(previewFile)}"`,
     });
     pipeline(fs.createReadStream(previewFile), res, () => {});
+    return;
+  }
+
+  // --- link map status of a package or loose Unity folder --------------------
+  // Summary only (counts, completeness, state); the map itself stays server-side.
+  if (route === '/api/package/graph') {
+    const real = resolveInLibrary(url.searchParams.get('path'));
+    if (!real) { sendJson(res, 404, { ok: false, error: 'not found in any library' }); return; }
+    let stat;
+    try { stat = fs.statSync(real); } catch (_) { sendJson(res, 404, { ok: false, error: 'not found' }); return; }
+    if (stat.isDirectory()) {
+      const graph = await packageIndex.folderGraph(real, { force: url.searchParams.get('refresh') === '1' });
+      sendJson(res, 200, { ok: Boolean(graph), path: real, state: graph ? 'ready' : 'failed', summary: packageIndex.graphSummary(graph) });
+      return;
+    }
+    const graph = packageIndex.getGraph(real, stat.mtimeMs, stat.size);
+    if (!graph) {
+      // Opening it is a signal someone wants it now: move it to the front.
+      packageIndex.enqueueGraph(real, stat.mtimeMs, stat.size, { priority: true, force: url.searchParams.get('retry') === '1' });
+      sendJson(res, 202, { ok: false, path: real, ...packageIndex.graphState(real, stat.mtimeMs, stat.size) });
+      return;
+    }
+    sendJson(res, 200, { ok: true, path: real, state: 'ready', summary: packageIndex.graphSummary(graph), errors: graph.errors });
+    return;
+  }
+  if (route === '/api/package/graph-failures') {
+    sendJson(res, 200, { ok: true, failures: packageIndex.graphFailuresList() });
     return;
   }
 
