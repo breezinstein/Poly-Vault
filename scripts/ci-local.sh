@@ -139,6 +139,9 @@ expect "saved file on disk" 1 "$(ls "$RIGGED/Crate" 2>/dev/null | grep -c 'Crate
 sleep 1
 expect "rigged card tagged in the library" 1 "$(curl -s -H 'Authorization: Bearer tok-alice' "$BASE/api/library" | grep -o '"tags":\["rigged","rig:create","mesh2motion"\]' | head -1 | wc -l)"
 
+echo "==> 3D in a browser (scripts/verify-3d.sh)"
+./scripts/verify-3d.sh "$IMAGE" || status=1
+
 [ "${status_unit:-0}" -ne 0 ] && status=1
 if [ "$status" -ne 0 ]; then
   echo "==> FAILED — container logs:"

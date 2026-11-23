@@ -977,7 +977,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // --- web-only session/state endpoints (replace Electron IPC) --------------
-  if (route.startsWith('/api/web/') && !['/api/web/state', '/api/web/session', '/api/web/libraries', '/api/web/rigged', '/api/web/rigged/preview'].includes(route)) {
+  if (route.startsWith('/api/web/') && !['/api/web/state', '/api/web/session', '/api/web/libraries', '/api/web/rigged', '/api/web/rigged/preview', '/api/web/report'].includes(route)) {
     sendJson(res, 404, { ok: false, error: 'not found' });
     return;
   }
@@ -1020,6 +1020,17 @@ const server = http.createServer(async (req, res) => {
     });
     return;
   }
+  // --- 3D fidelity report summary (scripts/fidelity-report.sh writes it) ----
+  if (route === '/api/web/report') {
+    try {
+      const summary = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'reports', 'fidelity-latest.json'), 'utf8'));
+      sendJson(res, 200, { ok: true, summary });
+    } catch (_) {
+      sendJson(res, 200, { ok: false, error: 'no report yet — run scripts/fidelity-report.sh' });
+    }
+    return;
+  }
+
   // --- Mesh2Motion "Save to vault" -----------------------------------------
   if ((route === '/api/web/rigged' || route === '/api/web/rigged/preview') && req.method === 'POST') {
     const query = Object.fromEntries(url.searchParams);

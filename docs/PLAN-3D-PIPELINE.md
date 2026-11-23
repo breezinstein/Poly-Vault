@@ -120,3 +120,65 @@ and the material has no albedo.
 Custom shaders are approximate (badged). Not rendered: terrain, particles, LOD > 0.
 `.blend/.max/.ma` cannot be previewed (Unity needs the DCC app). PSDs without a
 composite fall back to grey.
+
+---
+
+## Status — delivered 2026-11-23 (branch `feat/3d-pipeline`)
+
+| Phase | Commit | State |
+|---|---|---|
+| 0 Merge | `feat(rig): serve Mesh2Motion at /rig/ …` | done |
+| 1 Link map | `feat(index): link map for every package …` | done — 636/636 packages, 0 failures |
+| 2 Materials | `feat(3d): show models with their Unity materials …` | done |
+| 3 Mesh2Motion loop | `feat(rig): Mesh2Motion loop …` | done — standalone stack retired |
+| 4 Prefabs | `feat(3d): show prefabs assembled …` | done |
+| 5 Proof + docs | `feat(3d): fidelity report, browser acceptance …` | done |
+
+### What changed from the plan, and why
+
+- **No patches to Mesh2Motion's source.** A bridge script injected at build
+  time (`rig-bridge/pv-bridge.js`) loads models through Mesh2Motion's own file
+  input and catches its export for "Save to vault". Survives upstream updates;
+  `patches/m2m/` stays empty. Mesh2Motion's root-relative asset requests
+  (`/assets/<rig>/…`, `/images/…`) are answered by a fallback in
+  `server/rigStatic.js` instead of rewriting its code.
+- **Entry order inside packages** is asset → meta → preview → *pathname last*,
+  so materials/prefabs are recognised by their `%YAML` header and kept until
+  their path arrives.
+- **Unity's hashed sub-asset IDs**: mesh fileIDs are
+  `xxHash64("Type:Mesh->" + name + index)` (verified 86/86 on real prefabs);
+  the same rule does **not** hold for renderer components (≈2% matched), so
+  material overrides on nested model instances use legacy name tables or a
+  single-renderer rule, else fall back to the model's own materials (noted).
+- **FBX 6** (15% of sampled FBX files, 21% of packages with FBX) is not read
+  by three.js; added a server-side FBX 6 → GLB converter (static).
+- **Scenes** (`.unity`) are part of the link map (schema 2): Unity 4-era packs
+  assign materials on scene objects.
+- **"Generated" materials**: when Unity's legacy search finds nothing, Unity
+  generates the material from the FBX on import — treated as exact, not
+  missing.
+- **Fuzzy texture matching** (token overlap, never normal/mask maps) as a last
+  resort for renamed files and Unity 4 binary materials; always "approximate".
+
+### Verification
+
+- Unit: `tests/unity-graph.test.js` (14), `tests/model-resolver.test.js` (24).
+- Browser: `scripts/verify-3d.sh` (10 checks on a generated fixture: textured
+  FBX 7, prefab of two crates, FBX 6 with TGA, Mesh2Motion hand-off).
+- Endpoints/security: `scripts/ci-local.sh` (link map, models, Save to vault,
+  `/rig/`), plus the existing phase 2/3/UI suites.
+- Real packages in headless Chromium: textured models and prefabs from
+  URP/Standard/Unity 4 packs; package model → Mesh2Motion Create → Human
+  skeleton → Finish → Save to vault (FBX) → card → Animate in Mesh2Motion →
+  Retarget loads the rig.
+- Known pre-existing failure, unchanged: `verify-ui.sh`'s two 304-polling
+  checks fail on `main` too.
+
+### Known limits
+
+- Custom shaders are approximate (texture slots by name).
+- Unity 4 binary prefabs/materials/scenes cannot be read (reported).
+- Overrides inside nested prefabs beyond the root transform are not applied.
+- Prefabs with a SkinnedMeshRenderer (not a nested model) show in bind pose.
+- 3ds Max biped rigs need manual bone mapping in Mesh2Motion's Retarget.
+- FBX 6 models are static after conversion (no skin/animation).

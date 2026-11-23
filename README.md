@@ -25,6 +25,11 @@ decisions taken along the way.
 | `server/rigStatic.js` | Serves Mesh2Motion (built into the image) at `/rig/` behind the same sign-in, with its own CSP |
 | `server/thumbs.js` | WebP thumbnail cache (sharp), keyed by file+mtime+width |
 | `server/unityPackage.js`, `server/packageIndex.js`, `server/pkgWorker.js` | Reads `.unitypackage` archives: embedded previews, real content lists, type counts |
+| `server/tarWalk.js`, `server/unityYaml.js`, `server/unityGraph.js`, `server/xxhash64.js` | Link maps: one streaming pass per package keeps `.meta`/`.mat`/`.prefab`/`.unity` text and maps GUIDs, materials, prefabs and Unity's hashed sub-asset IDs |
+| `server/modelResolver.js`, `server/prefabResolver.js`, `server/fbxScan.js` | Which material each part of a model/prefab uses, in Unity's own order, and how close the browser can show it |
+| `server/modelService.js`, `server/textureConvert.js`, `server/fbx6.js` | `/api/model/*`: manifests, textures (TGA/PSD/BMP → WebP, packed metal/gloss → ORM), FBX 6 → GLB |
+| `server/riggedStore.js`, `rig-bridge/pv-bridge.js` | Mesh2Motion "Save to vault" (Rigged library) and the in-page bridge that loads vault models into Mesh2Motion |
+| `server/fidelityReport.js`, `scripts/fidelity-report.sh` | Library-wide report: how many models look exactly as in Unity, and why the rest do not |
 | `server/metrics.js`, `server/audit.js` | Prometheus counters + JSONL audit trail |
 | `scripts/verify-phase2.sh` | 18 checks: gzip, ETag/304, thumbnails, audit, metrics, incremental scan |
 | `scripts/verify-phase3.sh` | 25 checks: downloads + per-artist import routing |
@@ -178,6 +183,13 @@ docker volume create poly-vault-data   # then use  poly-vault-data:/data
 | `GET /api/download?path=…` | yes | Streams a ZIP of an asset folder. Powers the "Download" button and needs no temp space. |
 | `GET /api/thumb?path=…&w=320` | yes | Resized WebP from the thumbnail cache; falls back to the original preview if sharp cannot decode it. Also serves previews extracted from packages (`/data/packages/previews`). |
 | `GET|PUT /api/library`, `/api/tags`, `/api/meta`, `/api/preview`, `/api/import-*`, `/api/unity/*`, `/api/update`, `/api/enrichment` | yes | Upstream bridge API, proxied same-origin. Identity headers (`X-PV-User`, `X-PV-Artist`) are injected by the front door and never trusted from the client. |
+| `GET /api/package/graph?path=…` | yes | Link-map status/summary of a package or loose Unity folder (`202` + queue position while it builds). |
+| `GET /api/model/manifest?path=…&entry=…` | yes | How Unity shows a model or prefab: materials per part, texture URLs, fidelity, notes. |
+| `GET /api/model/texture?path=…&key=…&w=…` | yes | One texture converted to WebP (keys are validated against the package). |
+| `GET /api/model/converted?path=…&entry=…` | yes | FBX 6 model converted to GLB. |
+| `POST /api/web/rigged?name=…` (+ `/preview?folder=…`) | yes | Mesh2Motion "Save to vault": FBX/GLB (magic-checked, size-capped) into the Rigged library. |
+| `GET /api/web/report` | yes | Latest 3D fidelity report summary. |
+| `GET /rig/…` | yes | Mesh2Motion (static build) with its own CSP. |
 | `/__diag` | — | Disabled (404). It drives the Electron renderer and has no place in a shared service. |
 
 ## Performance
@@ -242,6 +254,52 @@ nothing is loaded from a CDN, the strict CSP holds, and it works offline.
 | Toggle | **Settings → Preview → 3D model preview (WebGL)** — remembered per browser |
 | Server default | `PV_WEBGL=0` disables it deployment-wide (the toggle hides, models show Unity's thumbnail) |
 | Fallback | unsupported file, parse error or disabled → Unity's stored preview image |
+
+## Models with their Unity materials, and Mesh2Motion
+
+Opening a model or prefab (inside a package or a loose Unity folder) shows it
+**the way Unity does**: the server reads the package's own wiring — material
+remaps in the `.meta`, prefab and scene renderers, Unity's material search
+rules, materials embedded in the FBX — and serves the textures converted for
+the browser. A badge says how close that is:
+
+| Badge | Means |
+| --- | --- |
+| **Matches Unity** | every part's material came from Unity's own rules, with a shader we translate one-to-one (Standard, URP, HDRP, legacy built-ins) |
+| **Close to Unity** | at least one part was approximated: custom shader (texture slots matched by name), Unity 4 binary material, renamed texture, override we could not place |
+| **Materials not found** | nothing could be resolved |
+| **No meshes** | animation-only or rig-only file |
+
+`details` lists every part with its material, where it came from and why.
+
+How it works (full design and measurements: [`docs/PLAN-3D-PIPELINE.md`](docs/PLAN-3D-PIPELINE.md)):
+
+- **Link maps.** Every package is streamed once in the background; small text
+  entries (`.meta`, `.mat`, `.prefab`, `.unity`) are parsed and stored in
+  `/data/packages/graph`. Progress: Settings → *This server*, or `/healthz` →
+  `packages.graph`.
+- **One read per model.** Opening a model extracts it and the textures it is
+  likely to need in a single pass over the archive (a second only when the
+  model itself names more textures). Results are cached.
+- **Formats.** FBX 7 (binary/ASCII), OBJ, GLB/glTF directly; FBX 6 (2006–2010,
+  common in Unity 4-era packs) is converted to GLB on the server (static: no
+  skinning/animation). Textures: PNG, JPG, TGA, PSD (with a composite), TIF,
+  BMP, GIF, WebP.
+- **Prefabs** are assembled: hierarchy, transforms, meshes (Unity's hashed
+  mesh IDs), LOD0, Unity's built-in shapes, nested prefabs (4 levels) and model
+  instances.
+
+**Mesh2Motion** is built into the image and served at `/rig/` behind the same
+sign-in. In the viewer, *Rig in Mesh2Motion* (static models → Create) or
+*Animate in Mesh2Motion* (rigged models → Retarget) opens it in a new tab with
+the model — textures included — already loaded. Mesh2Motion gains a **Save to
+vault** button: the export (FBX with the Unity preset by default) lands in the
+**Rigged** library as its own card, tagged `rigged`, with a description naming
+the source package, ready for *Import to Unity* or another round in
+Mesh2Motion.
+
+Quality across the whole library: `./scripts/fidelity-report.sh`, then
+Settings → *3D fidelity* (or `/data/reports/fidelity-latest.md`).
 
 ## What's inside a .unitypackage (previews + contents)
 

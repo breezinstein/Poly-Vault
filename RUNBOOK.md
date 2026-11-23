@@ -282,6 +282,33 @@ browser; `PV_WEBGL=0` removes it for everyone.
 - Refresh the vendored copy after bumping three.js: `./scripts/fetch-webgl.sh`
   (then rebuild the image).
 
+## 10b. Models, materials and Mesh2Motion
+
+- **Link maps** build in the background for every package after an upgrade
+  that bumps their schema (currently 2): roughly one full read of the library
+  (~110 GB, 30–60 min on 1 GbE), behind thumbnails, one package at a time.
+  Watch `/healthz` → `packages.graph` (`ready`, `queued`, `building`,
+  `failed`). Packages that failed three times are listed at
+  `/api/package/graph-failures`; `?retry=1` on `/api/package/graph` forces one.
+- **Caches** under `/data/packages`: `graph/` (link maps, keep), `extracted/`
+  (files pulled out of packages), `textures/` (converted WebP, capped by
+  `PV_TEXTURE_CACHE_MAX_FILES`), `converted/` (FBX 6 → GLB). All but `graph/`
+  are disposable.
+- **Rigged library.** A writable NFS export, mounted read-write and `hard`
+  at `/libraries/Rigged` (`PV_RIGGED_DIR`). Uploads stage in
+  `/libraries/Rigged/.incoming` and are renamed into place; leftovers older
+  than 6 h are removed at start-up. Settings → *This server* and
+  `/api/web/session` → `rig.canSave` say whether saving works; `false` means
+  the mount is read-only or missing.
+- **Mesh2Motion** is pinned by `M2M_COMMIT` in the Dockerfile. To update:
+  bump it, `docker compose build`, then `./scripts/ci-local.sh` (it checks the
+  `/rig/` pages, the bridge injection and Save to vault). `scripts/m2m-rebase.sh`
+  fails the build if new root-absolute paths appear upstream. The standalone
+  Mesh2Motion stack is retired.
+- **Quality report**: `./scripts/fidelity-report.sh` (reads every package with
+  models once; run it after the link maps are complete). Settings → *3D
+  fidelity* shows the summary; `/data/reports/fidelity-latest.md` the detail.
+
 ## 11. Troubleshooting
 
 | Symptom | Diagnose | Fix |
@@ -295,6 +322,10 @@ browser; `PV_WEBGL=0` removes it for everyone.
 | `pv_watch_errors_total` climbing | inotify on NFS/SMB | expected; the TTL rescan keeps data fresh, lower `PV_SCAN_MAX_AGE_MS` to taste |
 | 429 responses | `pv_rate_limited_total` | raise `PV_RATE_LIMIT_PER_MIN` or investigate the client |
 | Thumbnails missing | `pv_thumb_fallback_total`, `thumbs.available` in `/healthz` | the image build lost `sharp`; the UI still works with original previews |
+| Model shows "package queued for indexing" | `/healthz` → `packages.graph.queued` | the link-map pass has not reached it; opening it moves it to the front |
+| Model grey / "Close to Unity" | viewer → `details` | custom shader, Unity 4 binary material, or textures not in the package — see the notes per part |
+| "Save to vault" says not writable | `/api/web/session` → `rig.canSave` | NAS export read-only or not mounted; check the NFS rule for this host and uid 10001 |
+| Mesh2Motion tab opens empty | browser console in that tab | pop-ups blocked for the vault, or the model failed to export; the vault viewer shows the reason under the button |
 
 ## 12. Incident checklist
 
