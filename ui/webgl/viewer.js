@@ -345,6 +345,118 @@ function applyManifest(object, manifest) {
   });
 }
 
+// --- prefabs -------------------------------------------------------------------
+// Unity is left-handed and imports FBX by mirroring X; the scene here is built
+// in the model files' own (three.js) space, so every Unity transform is
+// conjugated by that mirror: position (-x, y, z), rotation (x, -y, -z, w).
+
+function unityToThree(node, obj) {
+  obj.position.set(-node.t[0], node.t[1], node.t[2]);
+  obj.quaternion.set(node.r[0], -node.r[1], -node.r[2], node.r[3]);
+  obj.scale.set(node.s[0], node.s[1], node.s[2]);
+}
+
+async function buildPrefab(manifest, manager) {
+  const get = materialFactory(manifest);
+  const buffers = new Map();
+  const fetchBuf = (url) => {
+    if (!buffers.has(url)) buffers.set(url, fetch(url, { credentials: 'same-origin' }).then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.arrayBuffer(); }));
+    return buffers.get(url);
+  };
+  const parse = async (info) => {
+    const buf = await fetchBuf(info.url);
+    if (info.format === 'obj') return { object: new OBJLoader(manager).parse(new TextDecoder().decode(buf)), animations: [] };
+    if (info.format === 'glb' || info.format === 'gltf') {
+      const gltf = await new GLTFLoader(manager).parseAsync(buf.slice(0), '');
+      return { object: gltf.scene, animations: gltf.animations || [] };
+    }
+    const object = new FBXLoader(manager).parse(buf.slice(0), '');
+    return { object, animations: object.animations || [] };
+  };
+  const meshIndexes = new Map();
+  const meshIndex = async (guid) => {
+    if (!meshIndexes.has(guid)) {
+      meshIndexes.set(guid, parse(manifest.models[guid]).then(({ object }) => {
+        const idx = new Map();
+        object.traverse((n) => { if (n.isMesh && !idx.has(sanitize(n.name))) idx.set(sanitize(n.name), n); });
+        return idx;
+      }));
+    }
+    return meshIndexes.get(guid);
+  };
+
+  const root = new THREE.Group();
+  root.name = manifest.model.path.split('/').pop();
+  const byId = new Map();
+  for (const n of manifest.nodes) {
+    const g = new THREE.Group();
+    g.name = n.name;
+    g.visible = n.active !== false;
+    unityToThree(n, g);
+    byId.set(n.id, g);
+  }
+  for (const n of manifest.nodes) (byId.get(n.parent) || root).add(byId.get(n.id));
+
+  // Unity's built-in meshes at Unity's sizes (Plane is 10x10, Cylinder/Capsule 2 tall).
+  const builtinGeometry = (shape) => {
+    switch (shape) {
+      case 'cube': return new THREE.BoxGeometry(1, 1, 1);
+      case 'sphere': return new THREE.SphereGeometry(0.5, 32, 16);
+      case 'cylinder': return new THREE.CylinderGeometry(0.5, 0.5, 2, 32);
+      case 'capsule': return new THREE.CapsuleGeometry(0.5, 1, 8, 16);
+      case 'plane': return new THREE.PlaneGeometry(10, 10).rotateX(-Math.PI / 2);
+      case 'quad': return new THREE.PlaneGeometry(1, 1);
+      default: return null;
+    }
+  };
+
+  let animations = [];
+  for (const n of manifest.nodes) {
+    const holder = byId.get(n.id);
+    if (n.builtin) {
+      const geometry = builtinGeometry(n.builtin.shape);
+      if (geometry) {
+        const mat = (n.builtin.materials[0] && get(n.builtin.materials[0])) || get('default');
+        const mesh = new THREE.Mesh(geometry, mat);
+        mesh.name = n.name;
+        holder.add(mesh);
+      }
+    } else if (n.mesh) {
+      const info = manifest.models[n.mesh.model];
+      if (!info || info.missing) continue;
+      let src = null;
+      try { src = (await meshIndex(n.mesh.model)).get(n.mesh.key); } catch (_) { src = null; }
+      if (!src) continue;
+      const mats = n.mesh.materials.map((k) => (k ? get(k, src) : null) || get('default'));
+      const mesh = new THREE.Mesh(src.geometry, mats.length > 1 ? mats : (mats[0] || get('default')));
+      mesh.name = n.name;
+      mesh.scale.setScalar(info.fileScale || 1);
+      holder.add(mesh);
+    } else if (n.instance) {
+      const info = manifest.models[n.instance.model];
+      if (!info || info.missing) continue;
+      let parsed;
+      try { parsed = await parse(info); } catch (_) { continue; }
+      const inst = n.instance;
+      applyManifest(parsed.object, { ...manifest, byName: inst.byName, bindings: inst.bindings, embedded: inst.embedded, fallback: inst.fallback, fileTextures: inst.fileTextures });
+      parsed.object.traverse((m) => {
+        if (!m.isMesh) return;
+        const ov = inst.overrides[sanitize(m.name)];
+        if (!ov) return;
+        const list = Array.isArray(m.material) ? [...m.material] : [m.material];
+        ov.forEach((k, i) => { if (k && i < list.length) list[i] = get(k, m) || list[i]; });
+        m.material = Array.isArray(m.material) ? list : list[0];
+      });
+      const wrap = new THREE.Group();
+      wrap.scale.setScalar(info.fileScale || 1);
+      wrap.add(parsed.object);
+      holder.add(wrap);
+      if (!animations.length && parsed.animations.length) animations = parsed.animations;
+    }
+  }
+  return { object: root, animations };
+}
+
 // --- UI bits -------------------------------------------------------------------
 
 const FIDELITY_TEXT = {
@@ -554,9 +666,11 @@ export async function mountUnity(container, source) {
     return key && manifest.textures[key] ? manifest.textures[key].url : BLANK;
   });
 
-  const { object, animations } = await loadModel(manifest.model.url, manifest.model.format, manager);
+  const { object, animations } = manifest.kind === 'prefab'
+    ? await buildPrefab(manifest, manager)
+    : await loadModel(manifest.model.url, manifest.model.format, manager);
   if (stage.disposed) return { dispose() {}, triangles: 0, manifest, object: null, skinned: false, clips: 0 };
-  applyManifest(object, manifest);
+  if (manifest.kind !== 'prefab') applyManifest(object, manifest);
   let skinned = false;
   object.traverse((n) => { if (n.isSkinnedMesh) skinned = true; });
 

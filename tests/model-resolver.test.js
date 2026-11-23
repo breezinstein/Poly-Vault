@@ -9,6 +9,7 @@ const assert = require('assert');
 const zlib = require('zlib');
 
 const { resolveModel, translateMaterial } = require('../server/modelResolver');
+const { resolvePrefab } = require('../server/prefabResolver');
 const { scanFbx } = require('../server/fbxScan');
 const { convertFbx6, fbxVersion } = require('../server/fbx6');
 const { unityFileId } = require('../server/xxhash64');
@@ -163,6 +164,116 @@ test('custom shader: slots by name, approximate, vertex colours allowed', () => 
 test('no geometry (animation-only FBX) is "none", not missing', () => {
   const m = resolveModel(graph({ paths: { [g(1)]: 'Assets/Anim@Run.fbx' } }), 'Assets/Anim@Run.fbx', { ok: true, meshes: [], materials: [], textures: [], models: ['Hips'], hasGeometry: false });
   assert.strictEqual(m.fidelity, 'none');
+});
+
+// --- prefabs ---------------------------------------------------------------------
+
+test('prefab: hierarchy, transforms, mesh + materials, LOD0 only', () => {
+  const fbx = g(1);
+  const gr = graph({
+    paths: { [fbx]: 'Assets/K/Kit.fbx', [g(2)]: 'Assets/K/Wood.mat', [g(3)]: 'Assets/K/Table.prefab' },
+    metas: { [fbx]: { imp: 'ModelImporter', mat: { mode: 0, name: 0, search: 1, location: 1 }, fileScale: 0.01 } },
+    mats: { [g(2)]: { n: 'Wood', sh: { f: '46', g: BUILTIN }, kw: [], tex: {}, f: {}, c: {} } },
+    prefabs: { [g(3)]: { o: {
+      1: { c: 1, n: 'Table', a: 1, comps: ['4'] },
+      4: { c: 4, go: '1', p: [0, 0, 0], r: [0, 0, 0, 1], s: [1, 1, 1], fa: '0', ch: ['40', '41'] },
+      10: { c: 1, n: 'Top_LOD0', a: 1, comps: [] },
+      40: { c: 4, go: '10', p: [0, 1, 0], r: [0, 0, 0, 1], s: [1, 1, 1], fa: '4', ch: [] },
+      33: { c: 33, go: '10', mesh: { f: unityFileId('Mesh', 'Top', 0), g: fbx } },
+      23: { c: 23, go: '10', en: 1, mats: [{ f: '2100000', g: g(2) }] },
+      11: { c: 1, n: 'Top_LOD1', a: 1, comps: [] },
+      41: { c: 4, go: '11', p: [0, 1, 0], r: [0, 0, 0, 1], s: [1, 1, 1], fa: '4', ch: [] },
+      34: { c: 33, go: '11', mesh: { f: unityFileId('Mesh', 'Top_low', 0), g: fbx } },
+      24: { c: 23, go: '11', en: 1, mats: [{ f: '2100000', g: g(2) }] },
+      205: { c: 205, go: '1', lods: [['23'], ['24']] },
+    } } },
+  });
+  const m = resolvePrefab(gr, 'Assets/K/Table.prefab', () => structure([{ name: 'Top', materials: ['x'] }, { name: 'Top_low', materials: ['x'] }]));
+  const names = m.nodes.map((n) => n.name);
+  assert.deepStrictEqual(names, ['Table', 'Top_LOD0', 'Top_LOD1']);
+  const top = m.nodes.find((n) => n.name === 'Top_LOD0');
+  assert.strictEqual(top.parent, m.nodes[0].id);
+  assert.deepStrictEqual(top.t, [0, 1, 0]);
+  assert.deepStrictEqual(top.mesh, { model: fbx, name: 'Top', key: 'Top', materials: [g(2)], skinned: false });
+  assert.strictEqual(m.nodes.find((n) => n.name === 'Top_LOD1').mesh, undefined, 'LOD1 hidden');
+  assert.strictEqual(m.models[fbx].fileScale, 0.01);
+  assert.strictEqual(m.fidelity, 'exact');
+});
+
+test('prefab: nested prefab placed by its root override; model instance with table override', () => {
+  const fbx = g(1);
+  const inner = g(5);
+  const outer = g(6);
+  const gr = graph({
+    paths: { [fbx]: 'Assets/C/Hero.fbx', [g(2)]: 'Assets/C/Skin.mat', [g(3)]: 'Assets/C/Gold.mat', [inner]: 'Assets/C/Lamp.prefab', [outer]: 'Assets/C/Room.prefab', [g(7)]: 'Assets/C/lamp.fbx' },
+    metas: {
+      [fbx]: { imp: 'ModelImporter', ids: { 2300000: { c: 23, n: 'Body' }, 400000: { c: 4, n: '//RootNode' } }, ext: [{ type: 'UnityEngine:Material', name: 'Skin', g: g(2), f: '2100000' }], mat: { mode: 1, name: 0, search: 1, location: 1 } },
+      [g(7)]: { imp: 'ModelImporter', mat: { mode: 1, name: 0, search: 1, location: 1 } },
+    },
+    mats: {
+      [g(2)]: { n: 'Skin', sh: { f: '46', g: BUILTIN }, kw: [], tex: {}, f: {}, c: {} },
+      [g(3)]: { n: 'Gold', sh: { f: '46', g: BUILTIN }, kw: [], tex: {}, f: {}, c: {} },
+    },
+    prefabs: {
+      [inner]: { o: {
+        1: { c: 1, n: 'Lamp', a: 1, comps: [] },
+        4: { c: 4, go: '1', p: [0, 0, 0], r: [0, 0, 0, 1], s: [1, 1, 1], fa: '0', ch: [] },
+        33: { c: 33, go: '1', mesh: { f: unityFileId('Mesh', 'Lamp', 0), g: g(7) } },
+        23: { c: 23, go: '1', en: 1, mats: [{ f: '2100000', g: g(3) }] },
+      } },
+      [outer]: { o: {
+        1: { c: 1, n: 'Room', a: 1, comps: [] },
+        4: { c: 4, go: '1', p: [0, 0, 0], r: [0, 0, 0, 1], s: [1, 1, 1], fa: '0', ch: [] },
+        900: { c: 1001, src: { f: '100100000', g: inner }, pa: '4', rm: [], mods: [
+          { t: { f: '4', g: inner }, p: 'm_LocalPosition.x', v: '2' }, { t: { f: '4', g: inner }, p: 'm_LocalPosition.y', v: '0' },
+          { t: { f: '4', g: inner }, p: 'm_LocalPosition.z', v: '5' }, { t: { f: '4', g: inner }, p: 'm_LocalRotation.w', v: '1' },
+          { t: { f: '4', g: inner }, p: 'm_LocalRotation.x', v: '0' }, { t: { f: '4', g: inner }, p: 'm_LocalRotation.y', v: '0' },
+          { t: { f: '4', g: inner }, p: 'm_LocalRotation.z', v: '0' },
+        ] },
+        901: { c: 1001, src: { f: '100100000', g: fbx }, pa: '4', rm: [], mods: [
+          { t: { f: '400000', g: fbx }, p: 'm_LocalPosition.x', v: '-1' }, { t: { f: '400000', g: fbx }, p: 'm_LocalPosition.y', v: '0' },
+          { t: { f: '400000', g: fbx }, p: 'm_LocalPosition.z', v: '0' },
+          { t: { f: '2300000', g: fbx }, p: 'm_Materials.Array.data[0]', v: '', r: { f: '2100000', g: g(3) } },
+        ] },
+      } },
+    },
+  });
+  const structures = { [fbx]: structure([{ name: 'Body', materials: ['Skin'] }], [{ name: 'Skin' }]), [g(7)]: structure([{ name: 'Lamp', materials: ['m'] }]) };
+  const m = resolvePrefab(gr, 'Assets/C/Room.prefab', (x) => structures[x] || null);
+  const lampHolder = m.nodes.find((n) => n.id.endsWith(':900'));
+  const lampRoot = m.nodes.find((n) => n.name === 'Lamp' && n.mesh);
+  assert.strictEqual(lampRoot.parent, lampHolder.id);
+  assert.deepStrictEqual(lampRoot.t, [2, 0, 5], 'root override applied to the nested root');
+  assert.strictEqual(lampRoot.mesh.materials[0], g(3));
+  const hero = m.nodes.find((n) => n.instance);
+  assert.deepStrictEqual(hero.t, [-1, 0, 0]);
+  assert.deepStrictEqual(hero.instance.overrides, { Body: [g(3)] });
+  assert.strictEqual(hero.instance.byName.Skin, g(2), "the model's own remap still applies elsewhere");
+});
+
+test('prefab: built-in Unity meshes (Plane) and stripped transforms', () => {
+  const gr = graph({
+    paths: { [g(1)]: 'Assets/Ground.prefab', [g(2)]: 'Assets/Grass.mat' },
+    mats: { [g(2)]: { n: 'Grass', sh: { f: '46', g: BUILTIN }, kw: [], tex: {}, f: {}, c: {} } },
+    prefabs: { [g(1)]: { o: {
+      1: { c: 1, n: 'Ground', a: 1, comps: [] },
+      4: { c: 4, go: '1', p: [0, 0, 0], r: [0, 0, 0, 1], s: [2, 1, 2], fa: '0', ch: [] },
+      33: { c: 33, go: '1', mesh: { f: '10209', g: '0000000000000000e000000000000000' } },
+      23: { c: 23, go: '1', en: 1, mats: [{ f: '2100000', g: g(2) }] },
+      77: { c: 4, st: 1, src: { f: '11', g: g(9) }, pi: '700' },
+    } } },
+  });
+  const m = resolvePrefab(gr, 'Assets/Ground.prefab', () => null);
+  assert.deepStrictEqual(m.nodes.map((n) => n.name), ['Ground']);
+  assert.deepStrictEqual(m.nodes[0].builtin, { shape: 'plane', materials: [g(2)] });
+  assert.strictEqual(m.fidelity, 'exact');
+});
+
+test('prefab: binary (Unity 4) prefab is reported, not shown', () => {
+  const gr = graph({ paths: { [g(1)]: 'Assets/Old.prefab' }, prefabs: { [g(1)]: { o: {}, bin: 1 } } });
+  const m = resolvePrefab(gr, 'Assets/Old.prefab', () => null);
+  assert.strictEqual(m.fidelity, 'none');
+  assert.ok(m.notes.some((n) => /binary/.test(n)));
 });
 
 // --- FBX structure + conversion --------------------------------------------------------

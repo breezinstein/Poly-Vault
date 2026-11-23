@@ -712,7 +712,7 @@ function buildEntryPreview(pkgAsset, entry) {
     video.preload = 'none';
     video.src = entryFileUrl(pkgAsset, entry);
     stage.appendChild(video);
-  } else if (MODEL_ENTRY_EXT.test(ext)) {
+  } else if (MODEL_ENTRY_EXT.test(ext) || (/^prefab$/i.test(ext) && window.pv3d && window.pv3d.mountUnity)) {
     if (webglEnabled()) {
       const canvasBox = el('div', 'entry-webgl');
       stage.appendChild(canvasBox);

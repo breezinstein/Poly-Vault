@@ -27,6 +27,7 @@ function readBinary(buf) {
   const headerSize = wide ? 25 : 13;
   const objects = [];
   const connections = [];
+  let unitScale = 0;
 
   function readProps(off, count) {
     const props = [];
@@ -93,6 +94,14 @@ function readBinary(buf) {
     const nameLen = buf[off + (wide ? 24 : 12)];
     const nameStart = off + (wide ? 25 : 13);
     const name = buf.toString('ascii', nameStart, nameStart + nameLen);
+    if (name === 'GlobalSettings') {
+      const [node] = readNode(off, true);
+      const props = (node.children.find((c) => c.name === 'Properties70' || c.name === 'Properties60') || { children: [] }).children;
+      for (const p of props) {
+        const pp = p.props || [];
+        if (pp[0] === 'UnitScaleFactor') unitScale = Number(pp.slice(1).find((v) => typeof v === 'number'));
+      }
+    }
     if (name === 'Objects' || name === 'Connections') {
       const [node] = readNode(off, true);
       if (name === 'Objects') {
@@ -128,7 +137,7 @@ function readBinary(buf) {
     }
     off = end;
   }
-  return { version, objects, connections };
+  return { version, objects, connections, unitScale };
 }
 
 // --- ASCII -----------------------------------------------------------------------
@@ -153,7 +162,9 @@ function readAscii(text) {
     const unq = (v) => v.replace(/^"|"$/g, '');
     connections.push({ type: m[1], child: unq(m[2]), parent: unq(m[3]), prop: m[4] || '' });
   }
-  return { version: 0, objects, connections };
+  const unit = /UnitScaleFactor"\s*,\s*"double"\s*,\s*"Number"\s*,\s*""\s*,\s*([\d.eE+-]+)/.exec(text)
+    || /Property:\s*"UnitScaleFactor"\s*,\s*"double"\s*,\s*""\s*,\s*([\d.eE+-]+)/.exec(text);
+  return { version: 0, objects, connections, unitScale: unit ? Number(unit[1]) : 0 };
 }
 
 // --- summary -------------------------------------------------------------------
@@ -253,6 +264,7 @@ function scanFbx(buffer) {
     textures,
     models: raw.objects.filter((o) => o.cls === 'Model').map((o) => o.name),
     hasGeometry: meshes.length > 0 || raw.objects.some((o) => o.cls === 'Geometry'),
+    unitScale: raw.unitScale > 0 ? raw.unitScale : 0,
   };
 }
 

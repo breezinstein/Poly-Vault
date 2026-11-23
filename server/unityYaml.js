@@ -289,6 +289,10 @@ function compactMeta(text) {
     };
     out.anim = { type: num(body.animationType, 0) };
     if (body.meshes && body.meshes.globalScale !== undefined) out.scale = num(body.meshes.globalScale, 1);
+    // Unity 5 stores the file-unit scale it applied (e.g. 0.01 for cm).
+    if (body.meshes && body.meshes.fileScale !== undefined && num(body.meshes.useFileScale, 1) !== 0) {
+      out.fileScale = num(body.meshes.fileScale, 1);
+    }
   }
   if (imp === 'TextureImporter') {
     const mip = body.mipmaps || {};

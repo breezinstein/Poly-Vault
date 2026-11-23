@@ -12,6 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { resolveModel, modelStructure, MODEL_EXT } = require('./modelResolver');
+const { resolvePrefab } = require('./prefabResolver');
 const tex = require('./textureConvert');
 const { convertFbx6, fbxVersion } = require('./fbx6');
 
@@ -121,9 +122,73 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
     return `/api/model/texture?path=${encodeURIComponent(src.real)}&key=${encodeURIComponent(key)}`;
   }
 
+  // URL the viewer loads for a model file; FBX 6 is served converted to GLB.
+  function modelFileUrl(src, entry, bytes) {
+    const format = path.extname(entry).slice(1).toLowerCase();
+    if (format === 'fbx') {
+      const v = fbxVersion(bytes);
+      if (v > 0 && v < 7000) {
+        const conv = convertedGlb(src, entry, bytes);
+        if (conv.ok) return { url: `/api/model/converted?path=${encodeURIComponent(src.real)}&entry=${encodeURIComponent(entry)}`, format: 'glb', converted: `FBX ${(v / 1000).toFixed(1)}` };
+      }
+    }
+    return { url: modelUrl(src, entry), format };
+  }
+
+  // Models a prefab (and its nested prefabs, to depth 4) uses.
+  function prefabModels(graph, guid, depth = 0, out = new Set()) {
+    const pf = graph.prefabs[guid];
+    if (!pf || depth > 4) return out;
+    for (const o of Object.values(pf.o || {})) {
+      const ref = o.c === 33 || o.c === 137 ? o.mesh : o.c === 1001 ? o.src : null;
+      if (!ref || !ref.g || !graph.paths[ref.g]) continue;
+      if (MODEL_EXT.test(graph.paths[ref.g])) out.add(ref.g);
+      else if (/\.prefab$/i.test(graph.paths[ref.g])) prefabModels(graph, ref.g, depth + 1, out);
+    }
+    return out;
+  }
+
+  async function buildPrefabManifest(src) {
+    const g = src.graph;
+    const guid = Object.entries(g.paths).find(([, p]) => p === src.entry);
+    if (!guid) return { error: 404, message: 'prefab not in this package' };
+    const models = [...prefabModels(g, guid[0])].slice(0, 64);
+    // Pass 1: every model the prefab tree uses.
+    await ensureExtracted(src, models);
+    const structures = new Map();
+    const bytesOf = new Map();
+    for (const m of models) {
+      try {
+        const bytes = readSourceFile(src, m);
+        bytesOf.set(m, bytes);
+        structures.set(m, modelStructure(bytes, path.extname(g.paths[m]).slice(1).toLowerCase()));
+      } catch (_) { /* not extracted: shown as missing */ }
+    }
+    const manifest = resolvePrefab(g, src.entry, (m) => structures.get(m) || null);
+    // Pass 2: textures.
+    await ensureExtracted(src, Object.values(manifest.textures).map((t) => t.guid));
+    for (const [key, t] of Object.entries(manifest.textures)) {
+      t.url = textureUrl(src, key);
+      delete t.guid;
+      if (t.role === 'orm') delete t.recipe;
+    }
+    for (const [m, info] of Object.entries(manifest.models)) {
+      const bytes = bytesOf.get(m);
+      if (!bytes) { info.missing = true; continue; }
+      Object.assign(info, modelFileUrl(src, g.paths[m], bytes));
+      if (info.converted) manifest.notes.push(`${path.basename(g.paths[m])}: ${info.converted} converted for the browser (no skinning or animation)`);
+    }
+    manifest.model = { guid: guid[0], path: src.entry, format: 'prefab' };
+    manifest.source = { kind: src.kind, path: src.real, entry: src.entry };
+    manifest.notes = [...new Set(manifest.notes)];
+    stats.manifests += 1;
+    return { ok: true, manifest };
+  }
+
   async function buildManifest(src) {
     const entry = src.entry;
-    if (!MODEL_EXT.test(entry)) return { error: 400, message: 'not a model file' };
+    if (/\.prefab$/i.test(entry)) return buildPrefabManifest(src);
+    if (!MODEL_EXT.test(entry)) return { error: 400, message: 'not a model or prefab file' };
     const byPath = new Map(Object.entries(src.graph.paths).map(([g, p]) => [p, g]));
     const guid = byPath.get(entry);
     if (!guid && src.kind === 'package') return { error: 404, message: 'entry not in package' };
