@@ -20,6 +20,7 @@ import { GLTFLoader } from './vendor/GLTFLoader.js';
 import { STLLoader } from './vendor/STLLoader.js';
 import { PLYLoader } from './vendor/PLYLoader.js';
 import { FBXLoader } from './vendor/FBXLoader.js';
+import { GLTFExporter } from './vendor/GLTFExporter.js';
 
 const EXT = (path) => (/\.([A-Za-z0-9]+)$/.exec(path || '') || [])[1]?.toLowerCase() || '';
 const sanitize = (name) => THREE.PropertyBinding.sanitizeNodeName(String(name || ''));
@@ -423,6 +424,96 @@ function animationBar(stage, object, clips) {
   return bar;
 }
 
+// --- hand-off to Mesh2Motion -----------------------------------------------------
+
+let sessionPromise = null;
+const session = () => {
+  if (!sessionPromise) sessionPromise = fetch('/api/web/session', { credentials: 'same-origin' }).then((r) => r.json()).catch(() => ({}));
+  return sessionPromise;
+};
+
+// Every texture image decoded, so the exporter does not embed blanks.
+function texturesReady(object, timeoutMs = 20000) {
+  const pending = [];
+  object.traverse((node) => {
+    if (!node.isMesh) return;
+    for (const m of Array.isArray(node.material) ? node.material : [node.material]) {
+      if (!m) continue;
+      for (const v of Object.values(m)) {
+        const img = v && v.isTexture ? v.image : null;
+        if (img && typeof img.complete === 'boolean' && !img.complete) {
+          pending.push(new Promise((r) => { img.addEventListener('load', r, { once: true }); img.addEventListener('error', r, { once: true }); }));
+        }
+      }
+    }
+  });
+  return Promise.race([Promise.all(pending), new Promise((r) => setTimeout(r, timeoutMs))]);
+}
+
+async function exportGlb(object, animations) {
+  await texturesReady(object);
+  const exporter = new GLTFExporter();
+  return exporter.parseAsync(object, { binary: true, onlyVisible: true, animations: animations || [], maxTextureSize: 2048 });
+}
+
+/**
+ * Open Mesh2Motion in a new tab and hand it the model. The tab is opened
+ * synchronously (inside the click) so pop-up blockers allow it; the GLB is
+ * posted once both the export and the page are ready. Same origin only.
+ */
+function handOff(page, makeGlb, meta) {
+  const id = Math.random().toString(36).slice(2);
+  const url = page === 'retarget' ? `/rig/retarget/?pv=handoff&id=${id}` : `/rig/create.html?pv=handoff&id=${id}`;
+  const win = window.open(url, '_blank');
+  if (!win) return Promise.reject(new Error('the browser blocked the new tab — allow pop-ups for this site'));
+  let ready = false;
+  let glb = null;
+  let done = false;
+  return new Promise((resolve, reject) => {
+    const send = () => {
+      if (!ready || !glb || done) return;
+      done = true;
+      window.removeEventListener('message', onMessage);
+      win.postMessage({ type: 'pv-handoff', name: meta.name, buffer: glb, source: meta.source, preview: meta.preview }, location.origin, [glb]);
+      resolve();
+    };
+    const onMessage = (event) => {
+      if (event.origin !== location.origin || event.source !== win) return;
+      if (event.data && event.data.type === 'pv-handoff-ready' && event.data.id === id) { ready = true; send(); }
+    };
+    window.addEventListener('message', onMessage);
+    setTimeout(() => { if (!done) { window.removeEventListener('message', onMessage); reject(new Error('Mesh2Motion did not answer')); } }, 120000);
+    makeGlb().then((buf) => { glb = buf; send(); }, (err) => { done = true; window.removeEventListener('message', onMessage); win.close(); reject(err); });
+  });
+}
+
+function rigBar(source, viewer) {
+  const bar = el('div', 'pv3d-actions');
+  const skinned = viewer.skinned;
+  const btn = el('button', 'pv3d-rig', skinned ? 'Animate in Mesh2Motion' : 'Rig in Mesh2Motion');
+  btn.title = skinned
+    ? 'Already rigged: open it in Mesh2Motion to preview and retarget animations'
+    : 'Open this model in Mesh2Motion to fit a skeleton and add animations';
+  const status = el('span', 'pv3d-rig-status');
+  btn.addEventListener('click', () => {
+    btn.disabled = true;
+    status.textContent = 'preparing the model…';
+    const name = `${(source.name || 'model').replace(/\.[^.]+$/, '')}.glb`;
+    let preview = '';
+    try { preview = viewer.canvas.toDataURL('image/png'); } catch (_) { preview = ''; }
+    handOff(skinned ? 'retarget' : 'create', () => exportGlb(viewer.object, viewer.animations), {
+      name,
+      preview: preview.length < 3 * 1024 * 1024 ? preview : '',
+      source: { name: source.name || name, path: source.path || '', entry: source.entry || '' },
+    }).then(() => { status.textContent = 'opened in a new tab'; })
+      .catch((err) => { status.textContent = err.message; })
+      .finally(() => { btn.disabled = false; });
+  });
+  bar.appendChild(btn);
+  bar.appendChild(status);
+  return bar;
+}
+
 async function fetchManifest(source, onWait) {
   const q = `path=${encodeURIComponent(source.path)}${source.entry ? `&entry=${encodeURIComponent(source.entry)}` : ''}`;
   for (let attempt = 0; attempt < 60; attempt += 1) {
@@ -480,7 +571,7 @@ export async function mountUnity(container, source) {
   if (anim) overlay.appendChild(anim);
   container.appendChild(overlay);
 
-  return {
+  const viewer = {
     triangles: countTriangles(object),
     manifest,
     object,
@@ -488,6 +579,10 @@ export async function mountUnity(container, source) {
     clips: (animations || []).length,
     animations: animations || [],
     canvas: stage.renderer.domElement,
+    exportGlb: () => exportGlb(object, animations),
     dispose: () => stage.dispose(),
   };
+  const s = await session();
+  if (s && s.rig && s.rig.available && manifest.fidelity !== 'none') overlay.appendChild(rigBar(source, viewer));
+  return viewer;
 }

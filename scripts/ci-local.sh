@@ -16,6 +16,7 @@ VOLUME="pv-ci-local-data"
 BASE="http://127.0.0.1:${PORT}"
 WORK="$(mktemp -d)"
 ASSETS="$WORK/assets"
+RIGGED="$WORK/rigged"
 
 cleanup() {
   if [ "${KEEP:-0}" != "1" ]; then
@@ -42,6 +43,7 @@ done
 
 echo "==> fixture library"
 ./scripts/make-fixture-library.sh "$ASSETS" >/dev/null
+mkdir -p "$RIGGED" && chmod 777 "$RIGGED"
 chmod -R a+rX "$WORK"
 
 echo "==> start $NAME on :$PORT"
@@ -51,8 +53,12 @@ docker run -d --name "$NAME" --init --read-only --tmpfs /tmp \
   -e PV_USERS="alice:tok-alice,bob:tok-bob" \
   -e PV_ADMIN_TOKEN=ci-admin \
   -e ASSETVAULT_NO_ENRICH=1 \
+  -e PV_LIBRARIES="/assets:/libraries/Rigged" \
+  -e PV_LIBRARY_ROOTS="/assets:/libraries" \
+  -e PV_RIGGED_DIR=/libraries/Rigged \
   -v "$VOLUME":/data \
   -v "$ASSETS":/assets:ro \
+  -v "$RIGGED":/libraries/Rigged \
   "$IMAGE" >/dev/null
 for _ in $(seq 1 30); do
   curl -fsS "$BASE/healthz" 2>/dev/null | grep -q '"ok":true' && break
@@ -116,6 +122,22 @@ expect "manifest needs auth" 401 "$(code "$BASE/api/model/manifest?path=$QPKG&en
 expect "manifest outside libraries refused" 404 "$(code -H 'Authorization: Bearer tok-alice' "$BASE/api/model/manifest?path=/etc/passwd&entry=x.fbx")"
 expect "texture key validated" 400 "$(code -H 'Authorization: Bearer tok-alice' "$BASE/api/model/texture?path=$QPKG&key=../../etc")"
 expect "texture outside package refused" 404 "$(code -H 'Authorization: Bearer tok-alice' "$BASE/api/model/texture?path=$QPKG&key=albedo:0123456789abcdef0123456789abcdef")"
+
+echo "==> Save to vault (/api/web/rigged)"
+GLB="$WORK/t.glb"
+printf 'glTF\002\000\000\000\024\000\000\000\000\000\000\000JSON' > "$GLB"
+post() { curl -s -o /dev/null -w '%{http_code}' -X POST -H "Origin: $BASE" "$@"; }
+expect "bridge injected into Mesh2Motion" 1 "$(curl -s -H 'Authorization: Bearer tok-alice' "$BASE/rig/create.html" | grep -c 'pv-bridge.js')"
+expect "session says the vault can save" 1 "$(curl -s -H 'Authorization: Bearer tok-alice' "$BASE/api/web/session" | grep -c '"canSave":true')"
+expect "save rigged GLB" 200 "$(post -H 'Authorization: Bearer tok-alice' --data-binary @"$GLB" "$BASE/api/web/rigged?name=Crate.glb&kind=create&from=Crate.fbx")"
+expect "name/content mismatch refused" 415 "$(post -H 'Authorization: Bearer tok-alice' --data-binary @"$GLB" "$BASE/api/web/rigged?name=Crate.fbx")"
+expect "non-model refused" 415 "$(post -H 'Authorization: Bearer tok-alice' --data-binary 'hello' "$BASE/api/web/rigged?name=x.glb")"
+expect "cross-origin save refused" 403 "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Authorization: Bearer tok-alice' -H 'Origin: https://evil.example' --data-binary @"$GLB" "$BASE/api/web/rigged?name=a.glb")"
+expect "save needs auth" 401 "$(post --data-binary @"$GLB" "$BASE/api/web/rigged?name=a.glb")"
+expect "preview folder traversal refused" 400 "$(post -H 'Authorization: Bearer tok-alice' --data-binary 'x' "$BASE/api/web/rigged/preview?folder=..")"
+expect "saved file on disk" 1 "$(ls "$RIGGED/Crate" 2>/dev/null | grep -c 'Crate__rigged.glb')"
+sleep 1
+expect "rigged card tagged in the library" 1 "$(curl -s -H 'Authorization: Bearer tok-alice' "$BASE/api/library" | grep -o '"tags":\["rigged","rig:create","mesh2motion"\]' | head -1 | wc -l)"
 
 [ "${status_unit:-0}" -ne 0 ] && status=1
 if [ "$status" -ne 0 ]; then

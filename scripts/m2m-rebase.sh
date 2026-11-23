@@ -23,6 +23,11 @@ find . -type f \( -name '*.html' -o -name '*.css' -o -name '*.js' \) | while rea
   sed -i -E "s#([\"'\`(=])/(($NAMES)([/\"'\`)?#]|\$))#\\1$PREFIX/\\2#g" "$f"
 done
 
+# Poly Vault bridge (hand-off + "Save to vault"), when bundled next to the pages.
+if [ -f pv-bridge.js ]; then
+  find . -type f -name '*.html' -exec sed -i "s#</body>#<script src=\"$PREFIX/pv-bridge.js\"></script></body>#" {} +
+fi
+
 # Bare links to the app root ("Explore") point at the prefix root.
 find . -type f -name '*.html' -exec sed -i -E "s#href=\"/\"#href=\"$PREFIX/\"#g" {} +
 find . -type f -name '*.html' -exec sed -i -E '/fonts\.(googleapis|gstatic)\.com/d' {} +

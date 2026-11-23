@@ -73,10 +73,12 @@ COPY patches/m2m/ /patches/
 RUN set -eu; for p in /patches/*.patch; do [ -f "$p" ] || continue; echo "applying $p"; git apply --whitespace=nowarn "$p"; done
 ENV WORKERS_CI_COMMIT_SHA=${M2M_COMMIT} WORKERS_CI_BRANCH=main
 COPY scripts/m2m-rebase.sh /usr/local/bin/m2m-rebase.sh
+COPY rig-bridge/pv-bridge.js /m2m-bridge/pv-bridge.js
 RUN npm run build \
  && rm -rf dist/test-files \
  && find dist -name '*.map' -delete \
  && cp src/favicon.ico dist/favicon.ico \
+ && cp /m2m-bridge/pv-bridge.js dist/pv-bridge.js \
  && sh /usr/local/bin/m2m-rebase.sh dist /rig \
  && du -sh dist
 

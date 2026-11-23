@@ -1220,3 +1220,14 @@ body.resizing * { cursor: col-resize !important; user-select: none; }
 .pv3d-anim select, .pv3d-anim button { font: inherit; color: var(--text); background: var(--bg-panel-2); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); padding: 3px 8px; }
 .pv3d-anim select { flex: 1; min-width: 0; }
 .pv3d-anim button { cursor: pointer; }
+
+/* Mesh2Motion hand-off (viewer overlay + folder asset detail) */
+.pv3d-actions { display: flex; align-items: center; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
+.pv3d-rig, .m2m-btn {
+  padding: 7px 12px; border-radius: var(--radius-sm); border: 1px solid var(--accent);
+  background: var(--accent-soft); color: var(--text); font: inherit; font-weight: 600; cursor: pointer;
+}
+.pv3d-rig:hover, .m2m-btn:hover { background: color-mix(in srgb, var(--accent) 30%, transparent); }
+.pv3d-rig[disabled] { opacity: .6; cursor: progress; }
+.pv3d-rig-status { color: var(--text-dim); font-size: 12px; }
+.m2m-btn { display: block; width: 100%; margin-top: 8px; font-size: 13px; padding: 9px 12px; border-radius: var(--radius); }

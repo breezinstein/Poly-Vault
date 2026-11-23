@@ -1721,6 +1721,25 @@ function renderAssetDetail(content, asset) {
   btn.addEventListener('click', () => sendImportJob(asset));
   content.appendChild(btn);
 
+  // Models in a folder asset (e.g. the Rigged library) open in Mesh2Motion:
+  // rigged ones in Retarget (animate), others in Create (rig).
+  const modelFile = (asset.importables || []).find((f) => /\.(fbx|glb)$/i.test(f.name || f.path || ''));
+  if (modelFile && !asset.packageFile) {
+    const rigged = (asset.tags || []).includes('rigged');
+    const m2m = el('button', 'm2m-btn', rigged ? 'Animate in Mesh2Motion' : 'Rig in Mesh2Motion',
+      rigged ? 'Open this rigged model in Mesh2Motion to preview and retarget animations' : 'Open this model in Mesh2Motion to rig it');
+    m2m.addEventListener('click', () => {
+      const q = new URLSearchParams({
+        pv: 'url',
+        model: `/api/file?path=${encodeURIComponent(modelFile.path)}`,
+        name: modelFile.name || modelFile.path.split('/').pop(),
+        src: asset.path || '',
+      });
+      window.open(`/rig/${rigged ? 'retarget/' : 'create.html'}?${q}`, '_blank');
+    });
+    content.appendChild(m2m);
+  }
+
   if (job && (job.status === 'pending' || job.status === 'processing')) {
     const cancelBtn = el('button', 'job-cancel-btn', 'Cancel import request', 'Cancel this in-flight import request');
     cancelBtn.addEventListener('click', async () => {

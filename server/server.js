@@ -35,6 +35,7 @@ const { findAndFetchDescription } = require('../src/main/unityAssetStore');
 const { createEnrichment, mergeMetaEntry } = require('../src/main/enrichment');
 const rig = require('./rigStatic');
 const { createModelService } = require('./modelService');
+const { createRiggedStore } = require('./riggedStore');
 
 // ---------------------------------------------------------------------------
 // Configuration (all via environment; see README)
@@ -195,6 +196,15 @@ const packageIndex = createPackageIndex({
   graphTimeoutMs: Number(env.PV_GRAPH_TIMEOUT_MS || 30 * 60 * 1000),
 });
 
+// A library changed on disk outside the watcher's view (NFS): rescan it.
+function markLibraryDirty(dirPath) {
+  if (!dirPath) return;
+  for (const lib of settings.get('libraries') || []) {
+    if (path.resolve(lib.path) === path.resolve(dirPath)) dirtyLibs.add(lib.id);
+  }
+  bump();
+}
+
 // The library root (real path) a real path lives under, or null.
 function libraryRootOf(real) {
   for (const lib of getState().libraries) {
@@ -218,6 +228,13 @@ function resolveInLibrary(target) {
   });
   return inside ? real : null;
 }
+
+// Mesh2Motion "Save to vault" target (the one writable library).
+const riggedStore = createRiggedStore({
+  dir: env.PV_RIGGED_DIR || '',
+  maxBytes: Number(env.PV_RIGGED_MAX_BYTES || 256 * 1024 * 1024),
+});
+riggedStore.cleanStaging();
 
 // Models with their Unity materials (manifest + converted textures).
 const modelService = createModelService({
@@ -960,7 +977,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // --- web-only session/state endpoints (replace Electron IPC) --------------
-  if (route.startsWith('/api/web/') && !['/api/web/state', '/api/web/session', '/api/web/libraries'].includes(route)) {
+  if (route.startsWith('/api/web/') && !['/api/web/state', '/api/web/session', '/api/web/libraries', '/api/web/rigged', '/api/web/rigged/preview'].includes(route)) {
     sendJson(res, 404, { ok: false, error: 'not found' });
     return;
   }
@@ -992,7 +1009,7 @@ const server = http.createServer(async (req, res) => {
         defaultEnabled: WEBGL_AVAILABLE && WEBGL_DEFAULT,
       },
       // Mesh2Motion at /rig/ (rig static meshes, retarget skinned ones).
-      rig: { available: rig.available, url: '/rig/' },
+      rig: { available: rig.available, url: '/rig/', canSave: riggedStore.available(), riggedDir: riggedStore.root || '' },
       plugin: plugin
         ? {
           version: plugin.version,
@@ -1003,6 +1020,33 @@ const server = http.createServer(async (req, res) => {
     });
     return;
   }
+  // --- Mesh2Motion "Save to vault" -----------------------------------------
+  if ((route === '/api/web/rigged' || route === '/api/web/rigged/preview') && req.method === 'POST') {
+    const query = Object.fromEntries(url.searchParams);
+    try {
+      if (route === '/api/web/rigged/preview') {
+        const saved = await riggedStore.savePreview(req, query);
+        markLibraryDirty(riggedStore.root);
+        sendJson(res, 200, { ok: true, folder: saved.folder });
+        return;
+      }
+      const saved = await riggedStore.saveModel(req, query);
+      const kind = query.kind === 'retarget' ? 'retarget' : 'create';
+      setTagsFor([{ path: saved.dir, tags: ['rigged', `rig:${kind}`, 'mesh2motion'] }]);
+      const from = [query.from, query.src ? path.basename(String(query.src)) : '', query.entry].filter(Boolean);
+      writeMetaEntry(saved.dir, {
+        description: `${kind === 'retarget' ? 'Animated' : 'Rigged'} in Mesh2Motion by ${who}${from.length ? ` from ${from.join(' \u203A ')}` : ''}.`,
+      });
+      markLibraryDirty(riggedStore.root);
+      metrics.counter('pv_rigged_saved_total');
+      audit('rigged_saved', { user: who, folder: saved.folder, bytes: saved.size, kind, source: query.src || '', entry: query.entry || '' });
+      sendJson(res, 200, { ok: true, folder: saved.folder, file: path.basename(saved.file), bytes: saved.size });
+    } catch (err) {
+      sendJson(res, err.status || 500, { ok: false, error: err.message });
+    }
+    return;
+  }
+
   if (route === '/api/web/libraries' && req.method === 'POST') {
     if (!isAdmin(req)) { sendJson(res, 403, { ok: false, error: 'admin token required' }); return; }
     let body;
