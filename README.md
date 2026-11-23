@@ -33,6 +33,7 @@ decisions taken along the way.
 | `scripts/fetch-webgl.sh` | Vendors the three.js viewers into `ui/webgl/vendor/` (also run by the Dockerfile) |
 | `scripts/backup.sh`, `scripts/restore.sh` | Metadata volume backup + rehearsable restore |
 | `RUNBOOK.md` | Day-2 operations: upgrade, rollback, rotation, troubleshooting |
+| `docs/ROADMAP.md` | Planned next work: store metadata, file metadata, search syntax, dependency graph, duplicate audit, AI captions/embeddings |
 | `deploy/Caddyfile.example` | TLS + SSO/basic-auth reverse proxy in front of the container |
 
 Upstream `src/main/index.js` (Electron main) and `src/preload.js` are **not used**.
