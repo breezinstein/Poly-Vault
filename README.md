@@ -22,11 +22,15 @@ decisions taken along the way.
 | `server/server.js` | The web front door: auth, static UI, scan cache, downloads, proxy to the untouched bridge API |
 | `server/zipStream.js` | Zero-dependency streaming ZIP writer for "Download" (no temp files, works on a read-only rootfs) |
 | `server/web-shim.js` | Replaces Electron's `preload.js` (`window.assetVault`) in the browser |
+| `server/rigStatic.js` | Serves Mesh2Motion (built into the image) at `/rig/` behind the same sign-in, with its own CSP |
 | `server/thumbs.js` | WebP thumbnail cache (sharp), keyed by file+mtime+width |
 | `server/unityPackage.js`, `server/packageIndex.js`, `server/pkgWorker.js` | Reads `.unitypackage` archives: embedded previews, real content lists, type counts |
 | `server/metrics.js`, `server/audit.js` | Prometheus counters + JSONL audit trail |
 | `scripts/verify-phase2.sh` | 18 checks: gzip, ETag/304, thumbnails, audit, metrics, incremental scan |
 | `scripts/verify-phase3.sh` | 25 checks: downloads + per-artist import routing |
+| `scripts/ci-local.sh` | Runs every acceptance suite against a throwaway container on :18080 (never the live one) |
+| `scripts/m2m-rebase.sh` | Re-roots the Mesh2Motion build under `/rig/` (Dockerfile stage `rig`) |
+| `docs/PLAN-3D-PIPELINE.md` | Plan for Mesh2Motion integration and model/material display |
 | `scripts/verify-ui.sh` | 12 browser checks in headless Chromium (sign-in → tag → download → 304 polling) |
 | `scripts/build-plugin.sh` | Builds `dist/PolyVault-Unity-<ver>.tgz/.zip` from the patched source |
 | `scripts/make-fixture-library.sh` | Generates a throwaway library with real PNG previews |

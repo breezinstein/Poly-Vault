@@ -190,6 +190,11 @@ about (and optionally include) the entries it references.
 
 ### C1. Intra-package graph
 
+> **Being delivered by [`PLAN-3D-PIPELINE.md`](PLAN-3D-PIPELINE.md) Phase 1:** the
+> `.meta`/`.mat`/`.prefab` capture, guid map and reference graph land there (for
+> material linking). What remains here is the deps endpoint and "Import with
+> dependencies".
+
 - [ ] `unityPackage.js`: capture `<guid>/asset.meta` (small YAML, need `guid:`), and
       text assets under a size cap (≤ 256 KB) for `.prefab/.unity/.mat/.asset/
       .controller/.anim/.asset` plus `.cs`/`.shader` if cheap.

@@ -54,6 +54,33 @@ COPY ui/webgl/viewer.js ./ui/webgl/viewer.js
 RUN sh scripts/fetch-webgl.sh
 
 # ---------------------------------------------------------------------------
+# Stage 3b — Mesh2Motion (MIT), served at /rig/ behind Poly Vault's sign-in
+# ---------------------------------------------------------------------------
+# Pinned upstream commit + our patches (patches/m2m/*.patch, applied in order).
+# Upstream builds with base './', so only the absolute nav links need moving
+# under /rig/. test-files and source maps are not shipped.
+FROM ${NODE_IMAGE} AS rig
+ARG M2M_REPO=https://github.com/Mesh2Motion/mesh2motion-app.git
+ARG M2M_COMMIT=017169ae6f7574d8fa75d893c38c2776386ca40b
+RUN apk add --no-cache git
+WORKDIR /m2m
+RUN git init -q . \
+ && git remote add origin "$M2M_REPO" \
+ && git fetch -q --depth 1 origin "$M2M_COMMIT" \
+ && git checkout -q FETCH_HEAD
+RUN npm ci --no-audit --no-fund
+COPY patches/m2m/ /patches/
+RUN set -eu; for p in /patches/*.patch; do [ -f "$p" ] || continue; echo "applying $p"; git apply --whitespace=nowarn "$p"; done
+ENV WORKERS_CI_COMMIT_SHA=${M2M_COMMIT} WORKERS_CI_BRANCH=main
+COPY scripts/m2m-rebase.sh /usr/local/bin/m2m-rebase.sh
+RUN npm run build \
+ && rm -rf dist/test-files \
+ && find dist -name '*.map' -delete \
+ && cp src/favicon.ico dist/favicon.ico \
+ && sh /usr/local/bin/m2m-rebase.sh dist /rig \
+ && du -sh dist
+
+# ---------------------------------------------------------------------------
 # Stage 4 — runtime dependencies (only what the web shell needs)
 # ---------------------------------------------------------------------------
 FROM ${NODE_IMAGE} AS deps
@@ -100,6 +127,8 @@ COPY --from=deps --chown=root:root /app/node_modules ./node_modules
 # 3D preview engine (Settings -> Preview toggle). Absent = the UI falls back to
 # Unity's stored thumbnails, so the image still works without it.
 COPY --from=webgl --chown=root:root /app/ui/webgl/vendor ./ui/webgl/vendor
+# Mesh2Motion static build (rigging / retargeting), served at /rig/.
+COPY --from=rig --chown=root:root /m2m/dist ./rig
 # The Unity add-on is served from the UI (Settings -> Unity) so artists always
 # get the build that matches this server.
 COPY --from=unity-plugin --chown=root:root /out ./plugin

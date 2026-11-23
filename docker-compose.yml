@@ -33,8 +33,10 @@ services:
       # same-origin check accepts your users' Origin header.
       PV_PUBLIC_ORIGIN: "${PV_PUBLIC_ORIGIN:-}"
       # --- libraries --------------------------------------------------------
-      PV_LIBRARIES: "/assets:/libraries/${PV_LIBRARY_2_NAME:-Second Library}"
+      PV_LIBRARIES: "/assets:/libraries/${PV_LIBRARY_2_NAME:-Second Library}:/libraries/Rigged"
       PV_LIBRARY_ROOTS: "/assets:/libraries"
+      # The one writable library: Mesh2Motion's "Save to vault" lands here.
+      PV_RIGGED_DIR: "/libraries/Rigged"
       # --- scanning / enrichment -------------------------------------------
       # Max age of a cached scan. fs.watch handles local changes immediately on
       # a local disk; inotify does NOT report changes made by other machines on
@@ -73,6 +75,8 @@ services:
       # 2) hand-made / other Unity assets, mounted under its own name so the
       #    UI shows its name (PV_LIBRARY_2_NAME in .env)
       - nas_library_2:/libraries/${PV_LIBRARY_2_NAME:-Second Library}:ro
+      # 3) rigged output from Mesh2Motion — the only writable library
+      - nas_rigged:/libraries/Rigged
       # Local alternative (mutually exclusive with the line above):
       # - /srv/assets:/assets:ro
     security_opt:
@@ -137,6 +141,15 @@ volumes:
       type: nfs
       o: "addr=${PV_NFS_ADDR:?set PV_NFS_ADDR in .env},nolock,soft,ro,actimeo=60"
       device: ":${PV_NFS_EXPORT_2:?set PV_NFS_EXPORT_2 in .env}"
+
+  # Rigged models saved from Mesh2Motion. Read-write, and `hard` rather than
+  # `soft`: a soft mount can return EIO mid-write and leave a truncated file;
+  # hard retries until the NAS answers (writes are small and rare).
+  nas_rigged:
+    driver_opts:
+      type: nfs
+      o: "addr=${PV_NFS_ADDR:?set PV_NFS_ADDR in .env},nolock,hard,rw,actimeo=60"
+      device: ":${PV_NFS_EXPORT_RIGGED:?set PV_NFS_EXPORT_RIGGED in .env}"
 
 # Uncomment when using the optional Caddy service above.
 #   caddy_data:

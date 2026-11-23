@@ -33,6 +33,7 @@ const { createPackageIndex } = require('./packageIndex');
 const { kindForPath } = require('./unityPackage');
 const { findAndFetchDescription } = require('../src/main/unityAssetStore');
 const { createEnrichment, mergeMetaEntry } = require('../src/main/enrichment');
+const rig = require('./rigStatic');
 
 // ---------------------------------------------------------------------------
 // Configuration (all via environment; see README)
@@ -952,6 +953,8 @@ const server = http.createServer(async (req, res) => {
         // The Settings panel toggle defaults to this and is remembered per browser.
         defaultEnabled: WEBGL_AVAILABLE && WEBGL_DEFAULT,
       },
+      // Mesh2Motion at /rig/ (rig static meshes, retarget skinned ones).
+      rig: { available: rig.available, url: '/rig/' },
       plugin: plugin
         ? {
           version: plugin.version,
@@ -1458,6 +1461,9 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // --- Mesh2Motion (rigging / retargeting), same origin, same sign-in -------
+  if (rig.handleRig(req, res, route)) return;
+
   // --- static UI ------------------------------------------------------------
   let rel = route === '/' ? 'index.html' : route.slice(1);
   if (rel === 'web-shim.js') {
@@ -1468,6 +1474,8 @@ const server = http.createServer(async (req, res) => {
   }
   const file = path.join(UI_DIR, path.normalize(rel).replace(/^(\.\.[/\\])+/, ''));
   if (!file.startsWith(UI_DIR) || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
+    // Not ours: maybe a Mesh2Motion asset requested root-relative.
+    if (rig.handleRigFallback(req, res, route)) return;
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('not found');
     return;
