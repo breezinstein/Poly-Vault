@@ -716,13 +716,21 @@ function buildEntryPreview(pkgAsset, entry) {
     if (webglEnabled()) {
       const canvasBox = el('div', 'entry-webgl');
       stage.appendChild(canvasBox);
-      const note = el('div', 'entry-preview-note', 'Unity\u2019s stored preview is shown while the 3D viewer loads.');
+      const note = el('div', 'entry-preview-note', 'Loading the model with its Unity materials\u2026');
       stage.appendChild(note);
       // Turn off 3D from Settings and the next render falls back to the image.
-      window.pv3d.mount(canvasBox, entryFileUrl(pkgAsset, entry), entry.name)
+      // mountUnity applies the package's materials/textures; older servers
+      // without it fall back to the bare model.
+      const mountIt = window.pv3d.mountUnity
+        ? window.pv3d.mountUnity(canvasBox, { path: pkgAsset.folder, entry: entry.path, name: entry.name })
+          .catch(() => window.pv3d.mount(canvasBox, entryFileUrl(pkgAsset, entry), entry.name))
+        : window.pv3d.mount(canvasBox, entryFileUrl(pkgAsset, entry), entry.name);
+      mountIt
         .then((viewer) => {
           activeViewer = viewer;
-          note.textContent = `${viewer.triangles.toLocaleString()} triangles \u00B7 drag to orbit, scroll to zoom`;
+          const anim = viewer.clips ? ` \u00B7 ${viewer.clips} animation${viewer.clips > 1 ? 's' : ''}` : '';
+          note.textContent = `${viewer.triangles.toLocaleString()} triangles${anim} \u00B7 drag to orbit, scroll to zoom`;
+          document.dispatchEvent(new CustomEvent('pv:model-ready', { detail: { viewer, pkgAsset, entry } }));
         })
         .catch(() => {
           canvasBox.remove();

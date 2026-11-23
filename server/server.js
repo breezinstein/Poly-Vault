@@ -34,6 +34,7 @@ const { kindForPath } = require('./unityPackage');
 const { findAndFetchDescription } = require('../src/main/unityAssetStore');
 const { createEnrichment, mergeMetaEntry } = require('../src/main/enrichment');
 const rig = require('./rigStatic');
+const { createModelService } = require('./modelService');
 
 // ---------------------------------------------------------------------------
 // Configuration (all via environment; see README)
@@ -194,6 +195,17 @@ const packageIndex = createPackageIndex({
   graphTimeoutMs: Number(env.PV_GRAPH_TIMEOUT_MS || 30 * 60 * 1000),
 });
 
+// The library root (real path) a real path lives under, or null.
+function libraryRootOf(real) {
+  for (const lib of getState().libraries) {
+    if (lib.missing) continue;
+    let root;
+    try { root = fs.realpathSync(lib.path); } catch (_) { root = path.resolve(lib.path); }
+    if (real === root || real.startsWith(root + path.sep)) return root;
+  }
+  return null;
+}
+
 // Resolve a client-supplied path to a real file/dir inside a library, or null.
 function resolveInLibrary(target) {
   let real;
@@ -206,6 +218,16 @@ function resolveInLibrary(target) {
   });
   return inside ? real : null;
 }
+
+// Models with their Unity materials (manifest + converted textures).
+const modelService = createModelService({
+  packageIndex,
+  entryCachePath: (pkgReal, stat, entryPath) => entryCachePath(pkgReal, stat, entryPath),
+  dataDir: DATA_DIR,
+  resolveInLibrary,
+  libraryRootOf,
+  maxTextureFiles: Number(env.PV_TEXTURE_CACHE_MAX_FILES || 20000),
+});
 
 const enrichment = createEnrichment({
   getMeta: metaOf,
@@ -1070,6 +1092,45 @@ const server = http.createServer(async (req, res) => {
   }
   if (route === '/api/package/graph-failures') {
     sendJson(res, 200, { ok: true, failures: packageIndex.graphFailuresList() });
+    return;
+  }
+
+  // --- a model the way Unity shows it: materials, textures, fidelity ---------
+  if (route === '/api/model/manifest') {
+    const result = await modelService.manifest(url.searchParams.get('path'), url.searchParams.get('entry'));
+    if (result.pending) {
+      metrics.counter('pv_model_manifest_pending_total');
+      sendJson(res, 202, { ok: false, pending: true, state: result.state, position: result.position || 0, error: result.error || '' });
+      return;
+    }
+    if (result.error) { sendJson(res, result.error, { ok: false, error: result.message }); return; }
+    metrics.counter('pv_model_manifest_total');
+    audit('model_manifest', { user: who, path: result.manifest.source.path, entry: result.manifest.source.entry, fidelity: result.manifest.fidelity });
+    sendJson(res, 200, result);
+    return;
+  }
+  if (route === '/api/model/converted') {
+    const result = await modelService.converted(url.searchParams.get('path'), url.searchParams.get('entry'));
+    if (result.error) { sendJson(res, result.error, { ok: false, error: result.message }); return; }
+    const st = fs.statSync(result.file);
+    res.writeHead(200, { 'Content-Type': 'model/gltf-binary', 'Content-Length': st.size, 'Cache-Control': 'private, max-age=86400' });
+    pipeline(fs.createReadStream(result.file), res, () => {});
+    return;
+  }
+  if (route === '/api/model/texture') {
+    const result = await modelService.texture(url.searchParams.get('path'), url.searchParams.get('key'), url.searchParams.get('w'));
+    if (result.error) { sendJson(res, result.error, { ok: false, error: result.message }); return; }
+    metrics.counter('pv_model_texture_total');
+    const st = fs.statSync(result.file);
+    const etag = `W/"t-${path.basename(result.file, '.webp').slice(0, 16)}"`;
+    if (req.headers['if-none-match'] === etag) { res.writeHead(304, { ETag: etag }); res.end(); return; }
+    res.writeHead(200, {
+      'Content-Type': 'image/webp',
+      'Content-Length': st.size,
+      'Cache-Control': 'private, max-age=86400',
+      ETag: etag,
+    });
+    pipeline(fs.createReadStream(result.file), res, () => {});
     return;
   }
 

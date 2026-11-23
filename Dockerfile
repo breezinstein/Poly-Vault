@@ -87,7 +87,7 @@ FROM ${NODE_IMAGE} AS deps
 WORKDIR /app
 # sharp ships prebuilt libvips binaries (musl included); no toolchain needed.
 RUN apk add --no-cache --virtual .build-deps python3 make g++ \
- && npm install --omit=dev --no-audit --no-fund sharp@0.33.5 \
+ && npm install --omit=dev --no-audit --no-fund sharp@0.33.5 ag-psd@34.1.0 \
  && apk del .build-deps \
  && npm cache clean --force
 

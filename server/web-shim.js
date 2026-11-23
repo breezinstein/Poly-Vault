@@ -85,6 +85,13 @@
       const mod = await viewerPromise;
       return mod.mount(container, url, name);
     },
+    // The model as Unity shows it (materials, textures, fidelity badge).
+    async mountUnity(container, source) {
+      if (!window.assetVault.webglEnabled()) throw new Error('3D preview disabled');
+      if (!viewerPromise) viewerPromise = import('/webgl/viewer.js');
+      const mod = await viewerPromise;
+      return mod.mountUnity(container, source);
+    },
   };
 
   // -------------------------------------------------------------------------

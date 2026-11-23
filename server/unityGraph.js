@@ -21,13 +21,15 @@ const path = require('path');
 const { walkUnityPackage } = require('./tarWalk');
 const { compactMeta, compactMaterial, compactPrefab } = require('./unityYaml');
 
-const GRAPH_SCHEMA = 1;
+// 2: scenes (.unity) captured too — old packs put materials on scene objects.
+const GRAPH_SCHEMA = 2;
 const YAML_MAGIC = Buffer.from('%YAML');
 const LIMITS = {
   pathname: 8 * 1024,
   meta: 64 * 1024,
   mat: 256 * 1024,
   prefab: 4 * 1024 * 1024,
+  scene: 16 * 1024 * 1024,
   errors: 200,
 };
 
@@ -53,6 +55,7 @@ function emptyGraph(kind, file, stat) {
     metas: {},
     mats: {},
     prefabs: {},
+    scenes: {},
     errors: {},
   };
 }
@@ -84,7 +87,8 @@ function finishGuid(graph, guid, group) {
     return;
   }
   if (group.yaml && (ext === '.mat' || ext === '.prefab')) {
-    if (group.yamlTruncated) { addError(graph, guid, `${ext} larger than ${ext === '.mat' ? LIMITS.mat : LIMITS.prefab} bytes`); return; }
+    const cap = ext === '.mat' ? LIMITS.mat : LIMITS.prefab;
+    if (group.yamlTruncated || group.yaml.length > cap) { addError(graph, guid, `${ext} larger than ${cap} bytes`); return; }
     try {
       if (ext === '.mat') {
         const mat = compactMaterial(group.yaml);
@@ -93,6 +97,16 @@ function finishGuid(graph, guid, group) {
         graph.prefabs[guid] = compactPrefab(group.yaml);
       }
     } catch (err) { addError(graph, guid, `${ext}: ${err.message}`); }
+  }
+  // Scenes have the same structure as prefabs (GameObjects, renderers); only
+  // what affects looks is kept. Binary scenes are skipped silently.
+  if (group.yaml && ext === '.unity') {
+    if (group.yamlTruncated) { addError(graph, guid, `.unity larger than ${LIMITS.scene} bytes`); return; }
+    try {
+      const scene = compactPrefab(group.yaml);
+      // Keep only scenes that actually render meshes of this package.
+      if (Object.values(scene.o).some((o) => (o.c === 33 || o.c === 137) && o.mesh && o.mesh.g)) graph.scenes[guid] = scene;
+    } catch (err) { addError(graph, guid, `.unity: ${err.message}`); }
   }
 }
 
@@ -129,7 +143,7 @@ async function buildPackageGraph(file, opts = {}) {
       if (size === 0) return null;
       if (leaf === 'pathname') return { capture: LIMITS.pathname };
       if (leaf === 'asset.meta' || leaf === 'metaData') return { capture: LIMITS.meta };
-      if (leaf === 'asset') return { capture: LIMITS.prefab, sniff: YAML_MAGIC };
+      if (leaf === 'asset') return { capture: LIMITS.scene, sniff: YAML_MAGIC };
       return null;
     },
     onEntry(guid, leaf, buffer, info) {
@@ -193,11 +207,11 @@ function buildFolderGraph(dir, opts = {}) {
       if (isDir) continue;
       const group = { pathname: targetRel, meta: metaText };
       const ext = extOf(targetRel);
-      if (ext === '.mat' || ext === '.prefab') {
+      if (ext === '.mat' || ext === '.prefab' || ext === '.unity') {
         try {
           const tst = fs.statSync(target);
           newest = Math.max(newest, tst.mtimeMs);
-          if (tst.size <= (ext === '.mat' ? LIMITS.mat : LIMITS.prefab)) {
+          if (tst.size <= ({ '.mat': LIMITS.mat, '.prefab': LIMITS.prefab, '.unity': LIMITS.scene })[ext]) {
             const text = fs.readFileSync(target, 'utf8');
             if (text.startsWith('%YAML')) group.yaml = text;
           } else group.yamlTruncated = true;
@@ -285,7 +299,7 @@ function fbxNodeNames(buffer) {
 /** Summary counts for status endpoints. */
 function graphSummary(graph) {
   if (!graph) return null;
-  const counts = { assets: 0, models: 0, textures: 0, materials: 0, prefabs: 0, remaps: 0 };
+  const counts = { assets: 0, models: 0, textures: 0, materials: 0, prefabs: 0, scenes: 0, remaps: 0 };
   counts.assets = Object.keys(graph.paths).length;
   for (const meta of Object.values(graph.metas)) {
     if (meta.imp === 'ModelImporter') counts.models += 1;
@@ -294,6 +308,7 @@ function graphSummary(graph) {
   }
   counts.materials = Object.keys(graph.mats).length;
   counts.prefabs = Object.keys(graph.prefabs).length;
+  counts.scenes = Object.keys(graph.scenes || {}).length;
   return {
     schema: graph.schema,
     kind: graph.kind,

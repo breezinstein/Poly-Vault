@@ -33,9 +33,11 @@ echo "==> upstream smoke tests"
 docker build -q --target source -t poly-vault:ci-source . >/dev/null
 docker run --rm --entrypoint node poly-vault:ci-source /app/tests/smoke.js
 
-echo "==> unit tests (link map: yaml, tar walk, graphs, extraction)"
+echo "==> unit tests (link map, material resolution, FBX, textures)"
+# The deps stage has sharp + ag-psd, so texture tests run for real.
+docker build -q --target deps -t poly-vault:ci-deps . >/dev/null
 for t in tests/*.test.js; do
-  docker run --rm -v "$PWD":/w:ro -w /w node:24-alpine node "$t"
+  docker run --rm -e NODE_PATH=/app/node_modules -v "$PWD":/w:ro -w /w poly-vault:ci-deps node "$t" | tail -1 || status_unit=1
 done
 
 echo "==> fixture library"
@@ -102,6 +104,20 @@ expect "link map outside libraries refused" 404 "$(code -H 'Authorization: Beare
 expect "link map needs auth" 401 "$(code "$BASE/api/package/graph?path=$QPKG")"
 expect "healthz reports link maps" 1 "$(curl -s -H 'Authorization: Bearer tok-alice' "$BASE/healthz" | grep -c '"graph":{"enabled":true')"
 
+echo "==> models (/api/model/*)"
+MODEL="$(curl -s -H 'Authorization: Bearer tok-alice' "$BASE/api/package/tree?path=$QPKG" | grep -o '"path":"[^"]*\.\(fbx\|obj\|FBX\)"' | head -1 | cut -d'"' -f4)"
+if [ -n "$MODEL" ]; then
+  QMODEL="$(printf '%s' "$MODEL" | sed 's/ /%20/g')"
+  expect "model manifest" 200 "$(code -H 'Authorization: Bearer tok-alice' "$BASE/api/model/manifest?path=$QPKG&entry=$QMODEL")"
+else
+  echo "  (fixture has no model file: manifest check skipped)"
+fi
+expect "manifest needs auth" 401 "$(code "$BASE/api/model/manifest?path=$QPKG&entry=x.fbx")"
+expect "manifest outside libraries refused" 404 "$(code -H 'Authorization: Bearer tok-alice' "$BASE/api/model/manifest?path=/etc/passwd&entry=x.fbx")"
+expect "texture key validated" 400 "$(code -H 'Authorization: Bearer tok-alice' "$BASE/api/model/texture?path=$QPKG&key=../../etc")"
+expect "texture outside package refused" 404 "$(code -H 'Authorization: Bearer tok-alice' "$BASE/api/model/texture?path=$QPKG&key=albedo:0123456789abcdef0123456789abcdef")"
+
+[ "${status_unit:-0}" -ne 0 ] && status=1
 if [ "$status" -ne 0 ]; then
   echo "==> FAILED — container logs:"
   docker logs --tail 80 "$NAME" || true

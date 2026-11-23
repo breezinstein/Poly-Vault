@@ -322,7 +322,7 @@ test('package graph: one pass, paths, metas, materials, prefabs, binary', async 
   assert.deepStrictEqual(g.mats[G.binmat], { n: 'Old', bin: 1 });
   assert.strictEqual(g.prefabs[G.prefab].o['3300'].mesh.g, G.fbx);
   const s = graphSummary(g);
-  assert.deepStrictEqual(s.counts, { assets: 6, models: 1, textures: 2, materials: 2, prefabs: 1, remaps: 1 });
+  assert.deepStrictEqual(s.counts, { assets: 6, models: 1, textures: 2, materials: 2, prefabs: 1, scenes: 0, remaps: 1 });
 });
 
 test('extractMany: several assets in one pass, atomic writes', async () => {
