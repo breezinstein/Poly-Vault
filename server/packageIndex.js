@@ -26,6 +26,7 @@ const crypto = require('crypto');
 const { Worker } = require('worker_threads');
 
 const { GRAPH_SCHEMA, graphSummary } = require('./unityGraph');
+const { contentsFromGraph } = require('./unityPackage');
 
 const sha1 = (value) => crypto.createHash('sha1').update(value).digest('hex');
 const NOTIFY_MS = 20000;          // at most one ETag bump per 20 s while busy
@@ -336,6 +337,7 @@ function createPackageIndex({
     graphCache.delete(job.file);
     if (graphFailures[job.file]) { delete graphFailures[job.file]; saveGraphFailures(); }
     graphStats.built += 1;
+    fillFromGraph(job.file, mtime, stat.size);
     graphStats.bytesRead += (reply.summary && reply.summary.scannedBytes) || 0;
     // No ETag bump: link maps are not part of the library payload, and the
     // eager pass would otherwise make every browser refetch it every 20 s.
@@ -478,6 +480,7 @@ function createPackageIndex({
     stats.bytesRead += entry.scannedBytes || 0;
     if (entry.previewPath) stats.previews += 1;
     if (entry.mode === 'full') stats.fullPasses += 1;
+    fillFromGraph(job.file, stat.mtimeMs, stat.size);
 
     // Second pass: accurate contents for packages small enough to be worth it.
     if (entry.mode === 'preview' && stat.size <= maxPackageBytes) {
@@ -565,6 +568,36 @@ function createPackageIndex({
   function get(file, mtimeMs, size) {
     if (!enabled || !file) return null;
     return readEntry(file, mtimeMs, size);
+  }
+
+  // Big packages: the contents pass stops at its byte budget, but the link map
+  // walks every header. Fill "what's inside" (counts, file list) from it.
+  function fillFromGraph(file, mtimeMs, size) {
+    if (!enabled || !useGraph) return false;
+    const entry = readEntry(file, mtimeMs, size);
+    if (!entry || entry.contentsSource === 'graph' || (!entry.partial && entry.mode === 'full')) return false;
+    const merged = contentsFromGraph(entry, getGraph(file, mtimeMs, size), MAX_CONTENTS);
+    if (!merged) return false;
+    saveEntry({ ...entry, ...merged });
+    notify();
+    return true;
+  }
+
+  // Once per start: entries indexed before this existed.
+  if (enabled && useGraph) {
+    const t = setTimeout(() => {
+      let filled = 0;
+      let names = [];
+      try { names = fs.readdirSync(metaDir); } catch (_) { names = []; }
+      for (const name of names) {
+        let e;
+        try { e = JSON.parse(fs.readFileSync(path.join(metaDir, name), 'utf8')); } catch (_) { continue; }
+        if (!e || !e.path || e.contentsSource === 'graph' || (!e.partial && e.mode === 'full')) continue;
+        if (fillFromGraph(e.path, e.mtimeMs, e.size)) filled += 1;
+      }
+      if (filled) log.info?.(`[poly-vault] filled contents of ${filled} large package(s) from their link maps`);
+    }, 2000);
+    t.unref?.();
   }
 
   function status() {

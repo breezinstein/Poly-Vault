@@ -142,6 +142,26 @@ test('mesh asset (Unity 5-2018): 8 channels, second stream aligned to 16, half U
   assert.strictEqual(half(0x3800), 0.5);
 });
 
+test('mesh asset: skinned mesh (m_Skin with weight[0] keys before m_VertexData) still decodes', () => {
+  // Unity 5 writes bone weights as `- weight[0]: 1` blocks. A key reader that
+  // rejected brackets stopped the whole document there, losing the vertices.
+  const skin = `  m_BindPose:
+  - e00: 1
+    e01: 0
+  m_Skin:
+${[0, 1, 2, 3].map(() => '  - weight[0]: 1\n    weight[1]: 0\n    boneIndex[0]: 0\n    boneIndex[1]: 0').join('\n')}
+`;
+  const yaml = modernQuad().replace('  m_VertexData:', `${skin}  m_VertexData:`);
+  assert.ok(yaml.indexOf('m_Skin') < yaml.indexOf('m_VertexData'));
+  const { parseDocuments } = require('../server/unityYaml');
+  const body = parseDocuments(asset(yaml).toString()).find((d) => d.classId === 43).body;
+  assert.strictEqual(body.m_Skin.length, 4);
+  assert.deepStrictEqual(Object.keys(body.m_Skin[0]), ['weight[0]', 'weight[1]', 'boneIndex[0]', 'boneIndex[1]']);
+  assert.strictEqual(Number(body.m_Skin[0]['weight[0]']), 1);
+  assert.strictEqual(Number(body.m_VertexData.m_VertexCount), 4);
+  assert.strictEqual(convertMeshAsset(asset(yaml)).triangles, 2);
+});
+
 test('mesh asset: several meshes in one file, each addressed by fileID', () => {
   const buf = asset(modernQuad({ name: 'A', fileID: '4300000' }), modernQuad({ name: 'B', fileID: '-123456789' }));
   assert.deepStrictEqual(meshAssetStructure(buf).fileIds, { 4300000: 'A', '-123456789': 'B' });

@@ -98,6 +98,14 @@ exploits). Poly Vault reads that archive directly, so package cards get:
 - **a real thumbnail** — extracted from the archive, no Asset Store request;
 - **honest type counts** — e.g. "240 meshes, 239 prefabs, 10 animations";
 - **a "What's inside" list** — the largest files with their project paths.
+  Packages too big for the full contents pass get their complete file list and
+  counts from the link map, which reads every entry's path (sizes are shown
+  only where the contents pass saw them).
+
+Loose asset folders (a Unity project's `Assets`, a hand-made pack with `.meta`
+files) open the same way: clicking one lists its files (`.meta` sidecars
+hidden), and its models, prefabs and Unity mesh assets open in 3D with
+materials resolved across sibling folders (`Meshes/` → `Materials/`).
 
 Everything is streamed, cached per `(path, mtime, size)` under `/data/packages`,
 and parsed on a worker thread so a 12 GB package never stalls the API.
@@ -302,7 +310,10 @@ the source package, ready for *Import to Unity* or another round in
 Mesh2Motion.
 
 Quality across the whole library: `./scripts/fidelity-report.sh`, then
-Settings → *3D fidelity* (or `/data/reports/fidelity-latest.md`).
+Settings → *3D fidelity* (or `/data/reports/fidelity-latest.md`). It covers
+every package and every loose asset folder; `--only "<path>"` limits it to
+one library (written to `fidelity-only-latest.md`, the library-wide report is
+left alone).
 
 ## What's inside a .unitypackage (previews + contents)
 
@@ -322,7 +333,7 @@ How it stays cheap on a 100 GB NFS library:
 
 | Constraint | Handling |
 | --- | --- |
-| Packages from 10 KB to 12.6 GB | Pass 1 stops at the first usable preview (usually < 10 MB read); pass 2 (accurate contents) only for packages ≤ `PV_PACKAGE_INDEX_MAX_MB` |
+| Packages from 10 KB to 12.6 GB | Pass 1 stops at the first usable preview (usually < 10 MB read); pass 2 (accurate contents) only for packages ≤ `PV_PACKAGE_INDEX_MAX_MB`; when a pass stops at its byte budget, the link map (which reads every header) fills in the full list and counts |
 | Must not block the UI | Parsing runs in a worker thread (`server/pkgWorker.js`), one package at a time |
 | Must not re-read 100 GB on restart | Cached per `(path, mtime, size)` in `/data/packages` (17.8 MB for 632 packages), so a restart resumes |
 | Must not blow up the poll payload | Cards carry the 12 largest entries; the full list stays on disk |

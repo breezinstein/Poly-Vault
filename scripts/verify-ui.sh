@@ -110,8 +110,12 @@ const check = (name, ok, detail = '') => {
     await importBtn.click();
     await page.waitForTimeout(1500);
   }
+  // Asset folders open as a file list, so the queued state shows on the
+  // detail panel's button (and on the asset card when the grid lists assets).
   const badges = await page.locator('.card .badge').allTextContents();
-  check('import job queues (queued/importing badge)', badges.some((b) => /queued|importing|imported/.test(b)), badges.join(','));
+  const btnText = (await page.locator('#detail-content .import-btn').first().textContent().catch(() => '')) || '';
+  check('import job queues (queued/importing badge)', badges.some((b) => /queued|importing|imported/.test(b)) || /queued|importing|re-import/i.test(btnText),
+    `${badges.join(',')} | ${btnText.trim()}`);
 
   const gz = apiResponses.filter((r) => r.encoding === 'gzip');
   check('library payload served gzipped', gz.length > 0, `${gz.length} of ${apiResponses.length} responses`);

@@ -229,6 +229,48 @@ function resolveInLibrary(target) {
   return inside ? real : null;
 }
 
+const insideAnyLibrary = (real) => Boolean(libraryRootOf(real));
+
+// Files of a loose asset folder for the browse view, as package-style entries
+// ({path, size}, '/'-separated, relative to the folder). Unity's .meta
+// sidecars and hidden/ignored folders are left out.
+const FOLDER_CONTENTS_MAX = 4000;
+const FOLDER_SKIP_DIRS = new Set(['.git', '.svn', '.hg', 'node_modules', '__pycache__', 'library', 'temp', 'obj']);
+function listFolderContents(dir) {
+  const out = [];
+  const walk = (abs, rel, depth) => {
+    if (out.length >= FOLDER_CONTENTS_MAX || depth > 16) return;
+    let ents;
+    try { ents = fs.readdirSync(abs, { withFileTypes: true }); } catch (_) { return; }
+    ents.sort((a, b) => a.name.localeCompare(b.name));
+    for (const e of ents) {
+      if (out.length >= FOLDER_CONTENTS_MAX) return;
+      if (e.name.startsWith('.') || e.name === 'Thumbs.db') continue;
+      const childAbs = path.join(abs, e.name);
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) {
+        if (!FOLDER_SKIP_DIRS.has(e.name.toLowerCase())) walk(childAbs, childRel, depth + 1);
+        continue;
+      }
+      if (!e.isFile() || e.name.toLowerCase().endsWith('.meta')) continue;
+      let size = null;
+      try { size = fs.statSync(childAbs).size; } catch (_) { /* vanished */ }
+      out.push({ path: childRel, size });
+    }
+  };
+  walk(dir, '', 0);
+  return out;
+}
+
+// "<folder>" + "<entry>" -> the real file inside that folder, or null.
+function folderEntryPath(folderReal, entryPath) {
+  const entry = String(entryPath || '');
+  if (!entry || entry.includes('\u0000') || entry.split('/').some((seg) => seg === '..' || seg === '')) return null;
+  let real;
+  try { real = fs.realpathSync(path.join(folderReal, ...entry.split('/'))); } catch (_) { return null; }
+  return real.startsWith(folderReal + path.sep) && insideAnyLibrary(real) ? real : null;
+}
+
 // Mesh2Motion "Save to vault" target (the one writable library).
 const riggedStore = createRiggedStore({
   dir: env.PV_RIGGED_DIR || '',
@@ -445,7 +487,8 @@ async function scanOne(lib, force = false) {
 function decoratePackages(libs) {
   for (const lib of libs) {
     for (const a of lib.assets || []) {
-      if (!a.packageFile) continue;
+      // Loose asset folders open as a file list in the UI, like packages.
+      if (!a.packageFile) { a.browsable = true; continue; }
       const mtimeMs = a.updated ? Date.parse(a.updated) : 0;
       // Ask for indexing first (no-op when already done); it uses the scan's
       // mtime/size so polling never stats the NAS again.
@@ -1102,6 +1145,18 @@ const server = http.createServer(async (req, res) => {
       real = fs.realpathSync(target);
       stat = fs.statSync(real);
     } catch (_) { sendJson(res, 404, { ok: false, error: 'not found' }); return; }
+    if (stat.isDirectory()) {
+      // Loose folder: images get the regular thumbnail; other files have no
+      // stored preview (Unity keeps those in its Library folder, not here).
+      const inner = insideAnyLibrary(real) ? folderEntryPath(real, entryPath) : null;
+      if (!inner || !/\.(png|jpe?g|webp|gif|bmp|tga|psd|tiff?)$/i.test(inner)) {
+        sendJson(res, 404, { ok: false, error: 'no preview for this file' });
+        return;
+      }
+      res.writeHead(302, { Location: `/api/thumb?path=${encodeURIComponent(inner)}&w=480`, 'Cache-Control': 'private, max-age=600' });
+      res.end();
+      return;
+    }
     if (!stat.isFile()) { sendJson(res, 400, { ok: false, error: 'not a file' }); return; }
 
     const previewFile = entryPreviewPath(real, stat, entryPath);
@@ -1193,7 +1248,6 @@ const server = http.createServer(async (req, res) => {
   if (route === '/api/package/tree') {
     const target = String(url.searchParams.get('path') || '').trim();
     if (!target) { sendJson(res, 400, { ok: false, error: 'missing path' }); return; }
-    if (!PACKAGE_INDEX_ENABLED) { sendJson(res, 503, { ok: false, error: 'package index disabled' }); return; }
 
     let real;
     let stat;
@@ -1201,11 +1255,21 @@ const server = http.createServer(async (req, res) => {
       real = fs.realpathSync(target);
       stat = fs.statSync(real);
     } catch (_) { sendJson(res, 404, { ok: false, error: 'not found' }); return; }
-    if (!stat.isFile()) { sendJson(res, 400, { ok: false, error: 'not a file' }); return; }
 
-    const entry = packageIndex.get(real, stat.mtimeMs, stat.size);
+    // A loose asset folder (e.g. a Unity project's Assets) browses like a
+    // package: its files, read from disk.
+    let entry;
+    if (stat.isDirectory()) {
+      if (!insideAnyLibrary(real)) { sendJson(res, 403, { ok: false, error: 'path outside libraries' }); return; }
+      const contents = listFolderContents(real);
+      entry = { contents, totalAssets: contents.length, partial: contents.length >= FOLDER_CONTENTS_MAX };
+    } else if (!PACKAGE_INDEX_ENABLED) {
+      sendJson(res, 503, { ok: false, error: 'package index disabled' }); return;
+    } else {
+      entry = packageIndex.get(real, stat.mtimeMs, stat.size);
+    }
     const current = packageIndex.contentsCap;
-    if (!entry || (entry.contentsCap || 0) < current) {
+    if (!stat.isDirectory() && (!entry || (entry.contentsCap || 0) < current)) {
       // Indexed before the full listing existed (or never): re-read this one
       // package on demand instead of re-reading the whole library.
       packageIndex.enqueue(real, stat.mtimeMs, stat.size, { force: true });
@@ -1218,7 +1282,7 @@ const server = http.createServer(async (req, res) => {
     const roots = [];
     const dirs = new Map();       // entry dir path -> node
     let leaves = 0;
-    const sorted = (entry.contents || []).slice().sort((a, b) => b.size - a.size);
+    const sorted = (entry.contents || []).slice().sort((a, b) => (b.size || 0) - (a.size || 0));
 
     function dirNode(dirPath) {
       if (!dirPath) return null;
@@ -1243,7 +1307,7 @@ const server = http.createServer(async (req, res) => {
         type: 'asset',
         name,
         path: item.path,
-        size: item.size || 0,
+        size: typeof item.size === 'number' ? item.size : null,
         kind: kindForPath(item.path),
       };
       (parent ? parent.children : roots).push(leaf);
@@ -1252,7 +1316,7 @@ const server = http.createServer(async (req, res) => {
 
     const sortTree = (nodes) => {
       nodes.sort((a, b) => (a.type === b.type
-        ? (a.type === 'container' ? a.name.localeCompare(b.name) : b.size - a.size)
+        ? (a.type === 'container' ? a.name.localeCompare(b.name) : (b.size || 0) - (a.size || 0) || a.name.localeCompare(b.name))
         : (a.type === 'container' ? -1 : 1)));
       for (const n of nodes) if (n.children) sortTree(n.children);
     };
@@ -1422,6 +1486,17 @@ const server = http.createServer(async (req, res) => {
     } catch (_) {
       sendJson(res, 404, { ok: false, error: 'not found' });
       return;
+    }
+
+    // One file inside a loose asset folder (the browse view addresses folder
+    // files like package entries): serve that file as a loose file.
+    if (stat.isDirectory() && entryPath) {
+      const inner = folderEntryPath(real, entryPath);
+      if (!inner) { sendJson(res, 404, { ok: false, error: 'entry not found' }); return; }
+      real = inner;
+      try { stat = fs.statSync(real); } catch (_) { sendJson(res, 404, { ok: false, error: 'not found' }); return; }
+      if (!stat.isFile()) { sendJson(res, 400, { ok: false, error: 'not a file' }); return; }
+      entryPath = '';
     }
 
     // One file *inside* a .unitypackage: extract it (cached) and stream it, so a

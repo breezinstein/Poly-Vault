@@ -335,4 +335,36 @@ async function extractEntry(filePath, entryPath, options = {}) {
   return { ok: false, error: 'entry not found in package' };
 }
 
-module.exports = { readUnityPackage, extractEntry, kindForPath };
+/**
+ * "What's inside" from a package's link map. The contents pass stops at its
+ * byte budget on big packages (a 5 GB package may list 3 files), but the link
+ * map reads every header, so it knows every path. Sizes are kept where the
+ * contents pass saw them and are null otherwise.
+ * @returns {null|{counts:Object<string,number>, totalAssets:number, contents:{path:string,size:number|null}[],
+ *          partial:false, truncated:'', contentsSource:'graph', sizesKnown:number}}
+ */
+function contentsFromGraph(entry, graph, maxContents = 4000) {
+  if (!graph || !graph.complete) return null;
+  const known = new Map(((entry && entry.contents) || []).map((c) => [c.path, c.size]));
+  const counts = {};
+  const all = [];
+  for (const p of new Set(Object.values(graph.paths || {}))) {
+    if (!p || p.endsWith('/')) continue;
+    const kind = kindForPath(p);
+    counts[kind] = (counts[kind] || 0) + 1;
+    all.push({ path: p, size: known.has(p) ? known.get(p) : null });
+  }
+  if (!all.length || all.length <= ((entry && entry.totalAssets) || 0)) return null;
+  all.sort((a, b) => (b.size === null ? -1 : b.size) - (a.size === null ? -1 : a.size) || a.path.localeCompare(b.path));
+  return {
+    counts,
+    totalAssets: all.length,
+    contents: all.slice(0, maxContents),
+    partial: false,
+    truncated: '',
+    contentsSource: 'graph',
+    sizesKnown: all.filter((c) => c.size !== null).length,
+  };
+}
+
+module.exports = { readUnityPackage, extractEntry, kindForPath, contentsFromGraph };

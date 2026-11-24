@@ -256,11 +256,49 @@ prefabs spread over ten packages. The top reasons for "approximate" are
 unchanged: models that import no materials (3003 parts), custom shaders
 (2619) and Unity 4 binary assets (2256).
 
+### Follow-up 2026-11-24: a second library (packages + a loose project folder)
+
+A second library with four large environment packages (two of them 3.5 and
+5.1 GB) and a loose Unity project folder (269 mesh `.asset` files, prefabs,
+materials) was checked end to end; it found five gaps, all fixed:
+
+- **Big packages listed a fraction of their files**: the contents pass stops
+  at its 256 MB byte budget (and skips packages over 4 GB), so the 5.1 GB
+  package listed 3 of 1194 files and the 3.5 GB one 164 of 941 — the browse
+  view could not reach most prefabs. The link map already has every path;
+  partial entries are now filled from it (`contentsFromGraph`, on graph
+  build, index pass and start-up). 83 packages across both libraries were
+  affected.
+- **Skinned mesh assets lost their vertices**: the YAML key reader rejected
+  `weight[0]:` (Unity 5 `m_Skin`), ending the document before `m_VertexData`.
+  Indexed keys are accepted now; 116/116 mesh assets in the library convert.
+- **Loose folders could not be browsed**: only `.unitypackage` cards opened a
+  file list. Folder assets are now `browsable`: `/api/package/tree`,
+  `/api/package/preview` and `/api/file` accept a folder plus `entry`, and the
+  model service roots the link map at the top folder under the library so
+  `Meshes/` finds `Materials/`.
+- **Prefabs over 64 parts** were cut at 64 model files (one vehicle prefab
+  uses 98 mesh assets, so 34 parts showed as "not in this package"). Cap is
+  256, with a note past it.
+- **`.asset` files were invisible** to the library scan (not importable), and
+  mesh assets could only be seen through a prefab; they are counted, and a
+  mesh asset opens on its own (non-mesh `.asset` files say so).
+
+The fidelity report now covers loose folders and takes `--only <path>`.
+Second library alone: 4 packages + 1 folder, models 50.2% exact / 0%
+missing, prefabs 54 exact / 62 approximate / 2 missing (both use a material
+that is not in the folder), mesh assets 116/116 converted. Most "approximate"
+is the packages' own Shader Graph shaders (about 250 materials).
+`verify-3d.sh` gained a loose-folder library (19 checks).
+
 ### Known limits
 
 - Unity mesh assets stored in binary form or with mesh compression are not
   rendered (reported per file).
 - Custom shaders are approximate (texture slots by name).
+- File sizes of big packages are shown only for the part the contents pass
+  read; the rest of the list comes from the link map without sizes.
+- Packages nested inside packages are listed but not opened.
 - Unity 4 binary prefabs/materials/scenes cannot be read (reported).
 - Overrides inside nested prefabs beyond the root transform are not applied.
 - Prefabs with a SkinnedMeshRenderer (not a nested model) show in bind pose.

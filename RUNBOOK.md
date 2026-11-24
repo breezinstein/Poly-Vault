@@ -306,8 +306,11 @@ browser; `PV_WEBGL=0` removes it for everyone.
   fails the build if new root-absolute paths appear upstream. The standalone
   Mesh2Motion stack is retired.
 - **Quality report**: `./scripts/fidelity-report.sh` (reads every package with
-  models once; run it after the link maps are complete). Settings → *3D
-  fidelity* shows the summary; `/data/reports/fidelity-latest.md` the detail.
+  models once, plus every loose asset folder; run it after the link maps are
+  complete). Settings → *3D fidelity* shows the summary;
+  `/data/reports/fidelity-latest.md` the detail. One library only (minutes, not
+  hours): `docker exec poly-vault node server/fidelityReport.js --only
+  "/libraries/Second Library"` → `/data/reports/fidelity-only-latest.md`.
 
 ## 11. Troubleshooting
 

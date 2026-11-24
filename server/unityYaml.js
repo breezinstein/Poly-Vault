@@ -114,8 +114,9 @@ function toLines(text) {
 }
 
 // "key: value" | "key:" -> [key, rest|null]; keys never contain ": ".
+// Keys may carry an index, as in skinned meshes' `m_Skin` (`weight[0]: 1`).
 function splitKey(text) {
-  const m = /^([^:{}[\]]+?):(?:\s+(.*))?$/.exec(text);
+  const m = /^((?:[^:{}[\]]|\[\d+\])+?):(?:\s+(.*))?$/.exec(text);
   if (!m) return null;
   return [m[1].trim(), m[2] === undefined ? null : m[2]];
 }

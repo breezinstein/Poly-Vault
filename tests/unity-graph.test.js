@@ -367,6 +367,23 @@ test('folder graph: loose Unity folder with .meta files', () => {
   assert.ok(!('eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' in g.paths));
 });
 
+test('contents from the link map: big package listing filled, known sizes kept', () => {
+  const { contentsFromGraph } = require('../server/unityPackage');
+  // The contents pass read 2 files before its byte budget; the link map has 4.
+  const entry = { mode: 'full', partial: true, totalAssets: 2, contents: [{ path: 'Assets/A.fbx', size: 900 }, { path: 'Assets/t.png', size: 50 }] };
+  const graph = { complete: true, paths: { [`${'1'.repeat(32)}`]: 'Assets/A.fbx', [`${'2'.repeat(32)}`]: 'Assets/t.png', [`${'3'.repeat(32)}`]: 'Assets/B.prefab', [`${'4'.repeat(32)}`]: 'Assets/C.mat' } };
+  const out = contentsFromGraph(entry, graph);
+  assert.strictEqual(out.totalAssets, 4);
+  assert.strictEqual(out.partial, false);
+  assert.strictEqual(out.contentsSource, 'graph');
+  assert.deepStrictEqual(out.counts, { mesh: 1, texture: 1, prefab: 1, material: 1 });
+  assert.deepStrictEqual(out.contents.map((c) => [c.path, c.size]),
+    [['Assets/A.fbx', 900], ['Assets/t.png', 50], ['Assets/B.prefab', null], ['Assets/C.mat', null]]);
+  assert.strictEqual(out.sizesKnown, 2);
+  assert.strictEqual(contentsFromGraph(entry, { ...graph, complete: false }), null, 'incomplete link map is not used');
+  assert.strictEqual(contentsFromGraph({ ...entry, totalAssets: 4 }, graph), null, 'nothing new to add');
+});
+
 (async () => {
   let failed = 0;
   for (const t of tests) {

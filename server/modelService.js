@@ -44,15 +44,27 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
     // Loose file in a folder library: its asset folder is the graph root.
     const root = libraryRootOf(real);
     if (!root) return { error: 404, message: 'not in a library' };
-    let assetDir = real;
-    if (stat.isFile()) {
-      const rel = path.relative(root, real).split(path.sep);
-      assetDir = rel.length > 1 ? path.join(root, rel[0]) : root;
+    let file = stat.isFile() ? real : null;
+    let fileStat = stat;
+    if (!file && entry) {
+      // Folder + entry (the browse view): the file inside that folder.
+      const parts = String(entry).split('/');
+      if (parts.some((seg) => seg === '..' || seg === '' || seg.includes('\u0000'))) return { error: 400, message: 'invalid entry path' };
+      try {
+        file = fs.realpathSync(path.join(real, ...parts));
+        fileStat = fs.statSync(file);
+      } catch (_) { return { error: 404, message: 'not found in this folder' }; }
+      if (!file.startsWith(real + path.sep) || !fileStat.isFile()) return { error: 404, message: 'not found in this folder' };
     }
+    // The graph root is the top folder under the library root, so references
+    // between sibling folders (Meshes/ -> Materials/) resolve whichever folder
+    // the request names.
+    const rel = path.relative(root, file || real).split(path.sep).filter(Boolean);
+    const assetDir = (file ? rel.length > 1 : rel.length > 0) ? path.join(root, rel[0]) : root;
     const graph = await packageIndex.folderGraph(assetDir);
     if (!graph) return { error: 500, message: 'could not read the folder' };
-    const relEntry = stat.isFile() ? path.relative(assetDir, real).split(path.sep).join('/') : String(entry || '');
-    return { kind: 'folder', real: assetDir, file: stat.isFile() ? real : null, stat, graph, entry: relEntry };
+    const relEntry = file ? path.relative(assetDir, file).split(path.sep).join('/') : String(entry || '');
+    return { kind: 'folder', real: assetDir, file, stat: fileStat, graph, entry: relEntry };
   }
 
   const cachePathFor = (src, guid) => (src.kind === 'package'
@@ -86,6 +98,7 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
   // Bump CONVERTER_VERSION when converter output changes: files from older
   // versions are no longer used (they stay until packages/converted is cleared).
   const CONVERTER_VERSION = 2;
+  const PREFAB_MODEL_CAP = 256;
   const convPath = (src, entry) => path.join(convDir, `${sha1(`${src.real}\u0000${Math.trunc(src.stat.mtimeMs)}\u0000${entry}\u0000v${CONVERTER_VERSION}`)}.glb`);
 
   function convertedGlb(src, entry, bytes) {
@@ -162,7 +175,10 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
     const g = src.graph;
     const guid = Object.entries(g.paths).find(([, p]) => p === src.entry);
     if (!guid) return { error: 404, message: 'prefab not in this package' };
-    const models = [...prefabModels(g, guid[0])].slice(0, 64);
+    // Vehicle/character prefabs built from mesh assets use one file per part
+    // (98 for one vehicle seen in practice), so the cap is generous; past it, say so.
+    const allModels = [...prefabModels(g, guid[0])];
+    const models = allModels.slice(0, PREFAB_MODEL_CAP);
     // Pass 1: every model the prefab tree uses.
     await ensureExtracted(src, models);
     const structures = new Map();
@@ -189,6 +205,9 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
       if (info.error) manifest.notes.push(`${path.basename(g.paths[m])}: could not be converted (${info.error})`);
       if (info.converted) manifest.notes.push(`${path.basename(g.paths[m])}: ${info.converted} converted for the browser (no skinning or animation)`);
     }
+    if (allModels.length > models.length) {
+      manifest.notes.push(`this prefab uses ${allModels.length} model files; only the first ${models.length} are loaded`);
+    }
     manifest.model = { guid: guid[0], path: src.entry, format: 'prefab' };
     manifest.source = { kind: src.kind, path: src.real, entry: src.entry };
     manifest.notes = [...new Set(manifest.notes)];
@@ -199,7 +218,8 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
   async function buildManifest(src) {
     const entry = src.entry;
     if (/\.prefab$/i.test(entry)) return buildPrefabManifest(src);
-    if (!MODEL_EXT.test(entry)) return { error: 400, message: 'not a model or prefab file' };
+    const meshAsset = /\.asset$/i.test(entry);
+    if (!MODEL_EXT.test(entry) && !meshAsset) return { error: 400, message: 'not a model or prefab file' };
     const byPath = new Map(Object.entries(src.graph.paths).map(([g, p]) => [p, g]));
     const guid = byPath.get(entry);
     if (!guid && src.kind === 'package') return { error: 404, message: 'entry not in package' };
@@ -213,6 +233,8 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
     const modelBytes = guid ? readSourceFile(src, guid) : fs.readFileSync(src.file);
     const format = path.extname(entry).slice(1).toLowerCase();
     const structure = modelStructure(modelBytes, format);
+    // A .asset that is not a mesh (ScriptableObject, terrain data, ...).
+    if (meshAsset && !structure.ok) return { error: 415, message: structure.error || 'not a mesh asset' };
     const manifest = resolveModel(src.graph, entry, structure);
 
     // Pass 2 (only if needed): textures the model file itself references.
@@ -240,6 +262,15 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
           manifest.notes.push(`FBX ${(v / 1000).toFixed(1)} file could not be converted: ${conv.error}`);
         }
       }
+    }
+    // Unity mesh asset: always served as a converted GLB.
+    if (meshAsset) {
+      const conv = convertedGlb(src, entry, modelBytes);
+      if (!conv.ok) return { error: 415, message: `mesh asset could not be converted: ${conv.error}` };
+      manifest.model.url = `/api/model/converted?path=${encodeURIComponent(src.real)}&entry=${encodeURIComponent(entry)}`;
+      manifest.model.format = 'glb';
+      manifest.model.converted = 'Unity mesh';
+      manifest.model.meshAsset = true;
     }
     manifest.info = { meshes: structure.meshes.length, materials: structure.materials.length, textures: structure.textures.length };
     manifest.source = { kind: src.kind, path: src.real, entry };

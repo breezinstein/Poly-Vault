@@ -12,6 +12,8 @@
 #   - a prefab of a Unity mesh asset (two material slots) and a Collada model
 #   - a Collada model with its embedded material's texture
 #   - "Rig in Mesh2Motion" opens Create with the model loaded
+#   - the same kit as a loose Unity folder (second library): browsable, its
+#     prefab and mesh asset render with materials resolved across folders
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -27,12 +29,21 @@ trap cleanup EXIT
 docker build -q --target deps -t poly-vault:ci-deps . >/dev/null
 docker run --rm --user "$(id -u):$(id -g)" -e NODE_PATH=/app/node_modules -v "$PWD":/w:ro -v "$WORK":/out -w /w poly-vault:ci-deps \
   node scripts/make-3d-fixture.js /out/assets >/dev/null
+# The same kit unpacked as a loose Unity folder (files + .meta), the way a
+# project's Assets folder sits in a second library.
+docker run --rm --user "$(id -u):$(id -g)" -v "$WORK":/out poly-vault:ci-deps sh -c '
+  set -e; mkdir -p /out/x "/out/loose/Loose Kit"; tar xzf "/out/assets/Fixture Publisher/3D ModelsProps/Crate Kit.unitypackage" -C /out/x
+  for d in /out/x/*/; do
+    [ -f "$d/pathname" ] || continue; rel=$(head -n1 "$d/pathname" | sed "s#^Assets/##"); dst="/out/loose/Loose Kit/$rel"
+    mkdir -p "$(dirname "$dst")"; [ -f "$d/asset" ] && cp "$d/asset" "$dst"; [ -f "$d/asset.meta" ] && cp "$d/asset.meta" "$dst.meta"
+  done; rm -rf /out/x'
 chmod -R a+rX "$WORK"
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 docker run -d --name "$NAME" --init --read-only --tmpfs /tmp -p "127.0.0.1:${PORT}:8080" \
   -e PV_TOKEN=verify-token -e ASSETVAULT_NO_ENRICH=1 \
-  -v "${NAME}-data":/data -v "$WORK/assets":/assets:ro "$IMAGE" >/dev/null
+  -e PV_LIBRARIES=/assets:/libraries/Loose -e PV_LIBRARY_ROOTS=/assets:/libraries \
+  -v "${NAME}-data":/data -v "$WORK/assets":/assets:ro -v "$WORK/loose":/libraries/Loose:ro "$IMAGE" >/dev/null
 for _ in $(seq 1 30); do curl -fsS "$BASE/healthz" 2>/dev/null | grep -q '"ok":true' && break; sleep 1; done
 
 cat > "$WORK/check.js" <<'JS'
@@ -53,7 +64,7 @@ const check = (name, ok, detail = '') => {
   page.on('pageerror', (e) => errors.push(e.message));
   await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });
 
-  const render = (entry) => page.evaluate(async ({ path, entry }) => {
+  const render = (entry, path = PKG) => page.evaluate(async ({ path, entry }) => {
     document.querySelector('#probe')?.remove();
     const box = document.createElement('div'); box.id = 'probe'; box.className = 'entry-webgl'; box.style.width = '600px';
     document.body.prepend(box);
@@ -75,7 +86,7 @@ const check = (name, ok, detail = '') => {
     }
     const meshes = []; v.object.traverse((n) => { if (n.isMesh) meshes.push(n.name); });
     return { fidelity: v.manifest.fidelity, kind: v.manifest.kind || 'model', meshes: meshes.length, lit, warm, cool, green, purple, red, converted: v.manifest.model.converted || '' };
-  }, { path: PKG, entry });
+  }, { path, entry });
 
   // The link map builds in the background on first start.
   let crate;
@@ -101,6 +112,22 @@ const check = (name, ok, detail = '') => {
 
   const barrel = await render('Assets/Crate/Models/Barrel.dae');
   check('Collada model renders with its texture', barrel.lit > 200 && barrel.red > 20 && barrel.fidelity === 'exact', `${barrel.fidelity}, red ${barrel.red}`);
+
+  // Loose Unity folder in a second library: listed as browsable, its files
+  // listed (no .meta), and models resolve materials from sibling folders.
+  const LOOSE = '/libraries/Loose/Loose Kit';
+  const lib = await page.evaluate(async () => (await (await fetch('/api/library')).json()).libraries.find((l) => l.name === 'Loose'));
+  const looseAssets = (lib && lib.assets) || [];
+  check('loose folder library is scanned', looseAssets.length > 0 && looseAssets.every((a) => a.browsable), `${looseAssets.length} assets: ${looseAssets.map((a) => a.relPath).join(', ')}`);
+  check('loose folder counts mesh assets', looseAssets.some((a) => (a.kindCounts || {}).asset > 0), JSON.stringify(looseAssets.map((a) => a.kindCounts)));
+  const tree = await page.evaluate(async (p) => (await fetch(`/api/package/tree?path=${encodeURIComponent(p)}`)).json(), `${LOOSE}/Crate`);
+  const names = JSON.stringify(tree.tree || []);
+  check('loose folder browses like a package', tree.ok && /CrateStack\.prefab/.test(names) && /Slab\.asset/.test(names) && !/\.meta"/.test(names), `${tree.totalAssets} files`);
+  const looseStack = await render('Prefabs/Mixed.prefab', `${LOOSE}/Crate`);
+  check('loose folder prefab renders with its materials', looseStack.meshes === 2 && looseStack.fidelity === 'exact' && looseStack.purple > 20 && looseStack.red > 20,
+    `${looseStack.meshes} meshes, ${looseStack.fidelity}, purple ${looseStack.purple}, red ${looseStack.red}`);
+  const slab = await render('Meshes/Slab.asset', `${LOOSE}/Crate`);
+  check('loose mesh asset opens on its own', slab.lit > 200 && /Unity mesh/.test(slab.converted), `${slab.lit} lit, ${slab.converted}`);
 
   await render('Assets/Crate/Models/Crate.fbx');
   const [m2m] = await Promise.all([ctx.waitForEvent('page', { timeout: 30000 }), page.click('#probe .pv3d-rig')]);
