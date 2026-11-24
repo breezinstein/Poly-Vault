@@ -19,11 +19,20 @@ ASSETS="$WORK/assets"
 RIGGED="$WORK/rigged"
 
 cleanup() {
+  local rc=$?
   if [ "${KEEP:-0}" != "1" ]; then
     docker rm -f "$NAME" >/dev/null 2>&1 || true
     docker volume rm "$VOLUME" >/dev/null 2>&1 || true
   fi
-  rm -rf "$WORK"
+  # "Save to vault" files are written by the server's own uid (10001) into
+  # folders it created, so the host user cannot delete them: remove them from
+  # a throwaway container. Cleanup never changes the suite's exit status.
+  if [ -d "$RIGGED" ]; then
+    docker run --rm --user 0 --entrypoint sh -v "$RIGGED":/r "$IMAGE" \
+      -c 'find /r -mindepth 1 -delete' >/dev/null 2>&1 || true
+  fi
+  rm -rf "$WORK" 2>/dev/null || true
+  exit "$rc"
 }
 trap cleanup EXIT
 
