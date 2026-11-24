@@ -238,6 +238,24 @@ material, textured Collada model). Real packages in headless Chromium, all
 vegetation prefab and its `.dae`, a character prefab using another FBX's
 material, an FBX 6 sports car (tyres now show the tyre texture, not the paint).
 
+Re-run of the report (2026-11-24 06:03 UTC, 7268 s, same 636 packages;
+`<data>/reports/fidelity-latest.md`):
+
+| | exact | approximate | missing | with geometry |
+|---|---|---|---|---|
+| models, 2026-11-23 | 4147 (59.2%) | 2858 | 0 | 7005 |
+| models, 2026-11-24 | 4209 (59.6%) | 2859 | 0 | 7068 (now incl. `.dae`) |
+| prefabs, 2026-11-23 | 2033 (64.1%) | 830 | 308 | 3171 |
+| prefabs, 2026-11-24 | 2184 (68.9%) | 944 | 43 | 3171 |
+
+Missing prefabs fell from 308 to 43; the rest became exact (+151) or
+approximate (+114). Unity mesh assets used by prefabs: 227 files, 225
+converted. Of the 43 still missing, 31 are in two packages (materials
+in a nested package, meshes from another package); the rest are single
+prefabs spread over ten packages. The top reasons for "approximate" are
+unchanged: models that import no materials (3003 parts), custom shaders
+(2619) and Unity 4 binary assets (2256).
+
 ### Known limits
 
 - Unity mesh assets stored in binary form or with mesh compression are not
