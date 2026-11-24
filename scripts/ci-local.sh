@@ -96,7 +96,9 @@ expect "own UI asset wins over rig" "image/png" "$(ctype -H 'Authorization: Bear
 expect "rig traversal rejected" 404 "$(code -H 'Authorization: Bearer tok-alice' "$BASE/rig/..%2f..%2fserver/server.js")"
 
 echo "==> link map (/api/package/graph)"
-PKG="$(cd "$ASSETS" && find . -name '*.unitypackage' | head -1 | sed 's#^\./#/assets/#')"
+# The real fixture package (the library also holds a placeholder .unitypackage
+# of random bytes; `find` order differs between filesystems).
+PKG="$(cd "$ASSETS" && find . -name 'Sample Kit.unitypackage' | head -1 | sed 's#^\./#/assets/#')"
 QPKG="$(printf '%s' "$PKG" | sed 's/ /%20/g')"
 graph_code=0
 for _ in $(seq 1 30); do
@@ -111,7 +113,7 @@ expect "link map needs auth" 401 "$(code "$BASE/api/package/graph?path=$QPKG")"
 expect "healthz reports link maps" 1 "$(curl -s -H 'Authorization: Bearer tok-alice' "$BASE/healthz" | grep -c '"graph":{"enabled":true')"
 
 echo "==> models (/api/model/*)"
-MODEL="$(curl -s -H 'Authorization: Bearer tok-alice' "$BASE/api/package/tree?path=$QPKG" | grep -o '"path":"[^"]*\.\(fbx\|obj\|FBX\)"' | head -1 | cut -d'"' -f4)"
+MODEL="$(curl -s -H 'Authorization: Bearer tok-alice' "$BASE/api/package/tree?path=$QPKG" | grep -o '"path":"[^"]*\.\(fbx\|obj\|FBX\)"' | head -1 | cut -d'"' -f4 || true)"
 if [ -n "$MODEL" ]; then
   QMODEL="$(printf '%s' "$MODEL" | sed 's/ /%20/g')"
   expect "model manifest" 200 "$(code -H 'Authorization: Bearer tok-alice' "$BASE/api/model/manifest?path=$QPKG&entry=$QMODEL")"

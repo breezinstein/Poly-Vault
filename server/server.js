@@ -767,7 +767,7 @@ function entryCachePath(pkgReal, stat, entryPath) {
 // single-file downloads), one folder per package version. It is a cache:
 // keep it under PV_EXTRACT_CACHE_MAX_MB by dropping the least recently used
 // package folders first.
-const EXTRACT_CACHE_MAX_BYTES = Number(env.PV_EXTRACT_CACHE_MAX_MB || 8192) * 1024 * 1024;
+const EXTRACT_CACHE_MAX_BYTES = Number(env.PV_EXTRACT_CACHE_MAX_MB || 24576) * 1024 * 1024;
 const extractPruneStats = { runs: 0, removedDirs: 0, removedBytes: 0, bytes: 0, maxBytes: EXTRACT_CACHE_MAX_BYTES, lastAt: '' };
 let extractPruneRunning = false;
 async function pruneExtractedCache() {

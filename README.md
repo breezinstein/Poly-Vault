@@ -175,7 +175,7 @@ docker volume create poly-vault-data   # then use  poly-vault-data:/data
 | `PV_TEXTURE_CACHE_MAX_FILES` | `20000` | Converted textures kept in `/data/packages/textures` (WebP, least recently used dropped first). |
 | `PV_MODEL_MAX_MB` | `256` | Largest model file the viewer reads, inspects or converts (on a worker thread). |
 | `PV_CONVERTED_CACHE_MAX_FILES` | `5000` | Converted GLBs (FBX 6, Unity mesh assets) kept in `/data/packages/converted`. |
-| `PV_EXTRACT_CACHE_MAX_MB` | `8192` | Size cap for files extracted from packages (`/data/packages/extracted`); least recently used packages are dropped first, hourly. |
+| `PV_EXTRACT_CACHE_MAX_MB` | `24576` (24 GB) | Size cap for files extracted from packages (`/data/packages/extracted`); least recently used packages are dropped first, hourly. |
 | `PV_RIGGED_DIR` | *(empty)* | Writable library for Mesh2Motion's "Save to vault"; must also be listed in `PV_LIBRARIES`. Empty disables saving. |
 | `PV_RIGGED_MAX_BYTES` | `268435456` | Largest rigged file accepted by "Save to vault" (`413` above it). |
 | `ASSETVAULT_NO_ENRICH` | `0` | `1` disables outbound Unity Asset Store lookups. |
