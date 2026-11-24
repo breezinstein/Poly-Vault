@@ -174,8 +174,33 @@ composite fall back to grey.
 - Known pre-existing failure, unchanged: `verify-ui.sh`'s two 304-polling
   checks fail on `main` too.
 
+### Library-wide fidelity report (2026-11-23, 2 h 2 min)
+
+636 packages, 492 with models or prefabs (up to 60 models / 30 prefabs each):
+
+| | exact | approximate | missing | no geometry | errors |
+|---|---|---|---|---|---|
+| models (8070) | 4147 (59.2%) | 2858 (40.8%) | 0 | 1065 | 0 |
+| prefabs (7286) | 2033 (64.1% of 3171 with geometry) | 830 | 308 | 4115 | 0 |
+
+- Most common reasons for "approximate": the model imports no materials
+  (Unity uses prefab/default materials) 2941, custom shaders 2616, Unity 4
+  binary materials 1005 + 683.
+- The 308 missing prefabs are almost all meshes Poly Vault cannot read yet:
+  Unity mesh assets (`.asset`, e.g. some environment packs) and Collada
+  (`.dae`, e.g. some vegetation packs).
+- FBX 6: 843 sampled files, 821 converted, 22 failed.
+- 43 binary FBX files report an implausible version number (e.g. 188055550);
+  not yet investigated.
+- Top custom shaders (candidates for exact translations): Shader Graph
+  shaders shared across one publisher's packs, an armour PBR shader, and a
+  few toon and vertex-colour shaders.
+
+Full detail: `<data>/reports/fidelity-2026-11-23.json`; summary in Settings.
+
 ### Known limits
 
+- Unity mesh assets (`.asset`) and Collada (`.dae`) are not rendered.
 - Custom shaders are approximate (texture slots by name).
 - Unity 4 binary prefabs/materials/scenes cannot be read (reported).
 - Overrides inside nested prefabs beyond the root transform are not applied.
