@@ -1188,7 +1188,8 @@ body.resizing * { cursor: col-resize !important; user-select: none; }
 .entry-webgl {
   width: 100%;
   max-width: 720px;
-  height: 320px;
+  min-height: 320px;
+  position: relative;
   border-radius: 8px;
   overflow: hidden;
   background: radial-gradient(circle at 50% 35%, #2b2d34 0%, #1e1f24 70%);
@@ -1196,3 +1197,37 @@ body.resizing * { cursor: col-resize !important; user-select: none; }
 }
 .entry-webgl:active { cursor: grabbing; }
 .entry-webgl canvas { display: block; }
+
+/* Unity material fidelity + animation controls under the 3D view */
+.pv3d-overlay { padding: 8px 10px 10px; font-size: 12px; color: var(--text); cursor: default; background: rgba(0, 0, 0, 0.18); }
+.pv3d-fidelity > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 6px; }
+.pv3d-fidelity > summary::-webkit-details-marker { display: none; }
+.pv3d-fidelity > summary::after { content: 'details'; margin-left: auto; color: var(--text-dim); font-size: 11px; }
+.pv3d-fidelity[open] > summary::after { content: 'hide'; }
+.pv3d-badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; line-height: 18px; }
+.pv3d-exact { background: color-mix(in srgb, var(--good) 22%, transparent); color: var(--good); }
+.pv3d-approx { background: color-mix(in srgb, var(--warn) 22%, transparent); color: var(--warn); }
+.pv3d-missing { background: color-mix(in srgb, var(--bad) 22%, transparent); color: var(--bad); }
+.pv3d-none { background: var(--bg-hover); color: var(--text-dim); }
+.pv3d-count { color: var(--text-dim); }
+.pv3d-slots { width: 100%; margin-top: 8px; border-collapse: collapse; }
+.pv3d-slots td { padding: 3px 6px 3px 0; border-top: 1px solid var(--border); vertical-align: top; overflow-wrap: anywhere; }
+.pv3d-slots td.pv3d-badge { display: table-cell; background: none; text-align: right; }
+.pv3d-why { color: var(--text-dim); }
+.pv3d-note { margin-top: 6px; color: var(--text-dim); }
+.pv3d-anim { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.pv3d-anim-label { color: var(--text-dim); }
+.pv3d-anim select, .pv3d-anim button { font: inherit; color: var(--text); background: var(--bg-panel-2); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); padding: 3px 8px; }
+.pv3d-anim select { flex: 1; min-width: 0; }
+.pv3d-anim button { cursor: pointer; }
+
+/* Mesh2Motion hand-off (viewer overlay + folder asset detail) */
+.pv3d-actions { display: flex; align-items: center; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
+.pv3d-rig, .m2m-btn {
+  padding: 7px 12px; border-radius: var(--radius-sm); border: 1px solid var(--accent);
+  background: var(--accent-soft); color: var(--text); font: inherit; font-weight: 600; cursor: pointer;
+}
+.pv3d-rig:hover, .m2m-btn:hover { background: color-mix(in srgb, var(--accent) 30%, transparent); }
+.pv3d-rig[disabled] { opacity: .6; cursor: progress; }
+.pv3d-rig-status { color: var(--text-dim); font-size: 12px; }
+.m2m-btn { display: block; width: 100%; margin-top: 8px; font-size: 13px; padding: 9px 12px; border-radius: var(--radius); }

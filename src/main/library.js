@@ -30,8 +30,8 @@ const IMPORTABLE_EXTENSIONS = new Set([
   '.mp4', '.mov', '.avi', '.webm', '.m4v', '.mpg', '.mpeg', '.asf', '.wmv',
   // animation / motion
   '.bvh', '.htr', '.anim', '.controller', '.overridecontroller',
-  // materials / masks
-  '.mat', '.spriteatlas', '.mask',
+  // materials / masks / Unity-serialised assets (meshes, ScriptableObjects)
+  '.mat', '.spriteatlas', '.mask', '.asset',
   // scripts / assemblies
   '.cs', '.dll', '.asmdef', '.asmref', '.shader', '.cginc', '.hlsl',
   // mixers / playables / fx artifacts

@@ -36,6 +36,10 @@ services:
       # (its display name is the folder name).
       PV_LIBRARIES: "${PV_LIBRARIES:-/assets}"
       PV_LIBRARY_ROOTS: "${PV_LIBRARY_ROOTS:-/assets:/libraries}"
+      # The one writable library: Mesh2Motion's "Save to vault" lands here.
+      # Must be mounted read-write and listed in PV_LIBRARIES; empty disables
+      # saving.
+      PV_RIGGED_DIR: "${PV_RIGGED_DIR:-}"
       # --- scanning / enrichment -------------------------------------------
       # Max age of a cached scan. fs.watch handles local changes immediately on
       # a local disk; inotify does NOT report changes made by other machines on
@@ -74,6 +78,10 @@ services:
       - "${PV_ASSETS:-/srv/assets}:/assets:ro"
       # A second library, e.g. a hand-curated folder next to the store cache:
       # - "${PV_ASSETS_2:-/srv/assets-2}:/libraries/Second Library:ro"
+      # Writable library for Mesh2Motion's "Save to vault" (set PV_RIGGED_DIR
+      # and add it to PV_LIBRARIES):
+      # - "${PV_RIGGED:-/srv/rigged}:/libraries/Rigged"
+      # NAS instead of local folders: see docker-compose.nas.yml.
     security_opt:
       - no-new-privileges:true
     cap_drop:

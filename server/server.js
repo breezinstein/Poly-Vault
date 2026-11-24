@@ -33,6 +33,9 @@ const { createPackageIndex } = require('./packageIndex');
 const { kindForPath } = require('./unityPackage');
 const { findAndFetchDescription } = require('../src/main/unityAssetStore');
 const { createEnrichment, mergeMetaEntry } = require('../src/main/enrichment');
+const rig = require('./rigStatic');
+const { createModelService } = require('./modelService');
+const { createRiggedStore } = require('./riggedStore');
 
 // ---------------------------------------------------------------------------
 // Configuration (all via environment; see README)
@@ -188,6 +191,123 @@ const packageIndex = createPackageIndex({
   enabled: PACKAGE_INDEX_ENABLED,
   maxPackageBytes: PACKAGE_INDEX_MAX_MB * 1024 * 1024,
   onUpdate: () => { scanGeneration += 1; }, // new preview/metadata -> new ETag
+  // Link maps (materials/prefabs/importer settings) for every package.
+  graphEnabled: env.PV_PACKAGE_GRAPH !== '0',
+  graphTimeoutMs: Number(env.PV_GRAPH_TIMEOUT_MS || 30 * 60 * 1000),
+  folderGraphBudgetMs: Number(env.PV_FOLDER_GRAPH_BUDGET_MS || 60000),
+});
+
+// A library changed on disk outside the watcher's view (NFS): rescan it.
+function markLibraryDirty(dirPath) {
+  if (!dirPath) return;
+  for (const lib of settings.get('libraries') || []) {
+    if (path.resolve(lib.path) === path.resolve(dirPath)) dirtyLibs.add(lib.id);
+  }
+  bump();
+}
+
+// The library root (real path) a real path lives under, or null.
+function libraryRootOf(real) {
+  for (const lib of getState().libraries) {
+    if (lib.missing) continue;
+    let root;
+    try { root = fs.realpathSync(lib.path); } catch (_) { root = path.resolve(lib.path); }
+    if (real === root || real.startsWith(root + path.sep)) return root;
+  }
+  return null;
+}
+
+// Resolve a client-supplied path to a real file/dir inside a library, or null.
+function resolveInLibrary(target) {
+  let real;
+  try { real = fs.realpathSync(String(target || '').trim()); } catch (_) { return null; }
+  const inside = getState().libraries.some((lib) => {
+    if (lib.missing) return false;
+    let root;
+    try { root = fs.realpathSync(lib.path); } catch (_) { root = path.resolve(lib.path); }
+    return real === root || real.startsWith(root + path.sep);
+  });
+  return inside ? real : null;
+}
+
+const insideAnyLibrary = (real) => Boolean(libraryRootOf(real));
+
+// Files of a loose asset folder for the browse view, as package-style entries
+// ({path, size}, '/'-separated, relative to the folder). Unity's .meta
+// sidecars and hidden/ignored folders are left out.
+const FOLDER_CONTENTS_MAX = 4000;
+const FOLDER_SKIP_DIRS = new Set(['.git', '.svn', '.hg', 'node_modules', '__pycache__']);
+// Generated folders of a Unity project; skipped only next to Assets/ or
+// ProjectSettings/, so a pack folder that happens to be called "Library" stays.
+const UNITY_GENERATED_DIRS = new Set(['library', 'temp', 'obj', 'logs', 'usersettings']);
+function listFolderContents(dir) {
+  const out = [];
+  const walk = (abs, rel, depth) => {
+    if (out.length >= FOLDER_CONTENTS_MAX || depth > 16) return;
+    let ents;
+    try { ents = fs.readdirSync(abs, { withFileTypes: true }); } catch (_) { return; }
+    ents.sort((a, b) => a.name.localeCompare(b.name));
+    const projectRoot = ents.some((x) => x.isDirectory() && (x.name === 'Assets' || x.name === 'ProjectSettings'));
+    for (const e of ents) {
+      if (out.length >= FOLDER_CONTENTS_MAX) return;
+      if (e.name.startsWith('.') || e.name === 'Thumbs.db') continue;
+      const childAbs = path.join(abs, e.name);
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) {
+        const lower = e.name.toLowerCase();
+        if (FOLDER_SKIP_DIRS.has(lower) || (projectRoot && UNITY_GENERATED_DIRS.has(lower))) continue;
+        walk(childAbs, childRel, depth + 1);
+        continue;
+      }
+      if (!e.isFile() || e.name.toLowerCase().endsWith('.meta')) continue;
+      let size = null;
+      try { size = fs.statSync(childAbs).size; } catch (_) { /* vanished */ }
+      out.push({ path: childRel, size });
+    }
+  };
+  walk(dir, '', 0);
+  return out;
+}
+
+// "<folder>" + "<entry>" -> the real file inside that folder, or null.
+function folderEntryPath(folderReal, entryPath) {
+  const entry = String(entryPath || '');
+  if (!entry || entry.includes('\u0000') || entry.split('/').some((seg) => seg === '..' || seg === '')) return null;
+  let real;
+  try { real = fs.realpathSync(path.join(folderReal, ...entry.split('/'))); } catch (_) { return null; }
+  return real.startsWith(folderReal + path.sep) && insideAnyLibrary(real) ? real : null;
+}
+
+// Mesh2Motion "Save to vault" target (the one writable library).
+const riggedStore = createRiggedStore({
+  dir: env.PV_RIGGED_DIR || '',
+  maxBytes: Number(env.PV_RIGGED_MAX_BYTES || 256 * 1024 * 1024),
+});
+riggedStore.cleanStaging();
+
+// "Save to vault" only makes sense into a folder the scanner shows: one of the
+// libraries (or inside one). Otherwise saves would vanish from the UI.
+function riggedStatus() {
+  if (!riggedStore.root) return { canSave: false, reason: 'PV_RIGGED_DIR is not set' };
+  let real;
+  try { real = fs.realpathSync(riggedStore.root); } catch (_) { real = riggedStore.root; }
+  if (!libraryRootOf(real)) return { canSave: false, reason: `PV_RIGGED_DIR (${riggedStore.root}) is not one of the libraries; add it to PV_LIBRARIES` };
+  if (!riggedStore.available()) return { canSave: false, reason: `PV_RIGGED_DIR (${riggedStore.root}) is not writable` };
+  return { canSave: true, reason: '' };
+}
+
+// Models with their Unity materials (manifest + converted textures).
+const modelService = createModelService({
+  packageIndex,
+  entryCachePath: (pkgReal, stat, entryPath) => entryCachePath(pkgReal, stat, entryPath),
+  dataDir: DATA_DIR,
+  resolveInLibrary,
+  libraryRootOf,
+  maxTextureFiles: Number(env.PV_TEXTURE_CACHE_MAX_FILES || 20000),
+  maxModelBytes: Number(env.PV_MODEL_MAX_MB || 256) * 1024 * 1024,
+  maxConvertedFiles: Number(env.PV_CONVERTED_CACHE_MAX_FILES || 5000),
+  workerTimeoutMs: Number(env.PV_MODEL_TIMEOUT_S || 120) * 1000,
+  prefabBudgetMs: Number(env.PV_PREFAB_BUDGET_S || 180) * 1000,
 });
 
 const enrichment = createEnrichment({
@@ -253,6 +373,7 @@ function watchLibraries(libs) {
         // Mark only the library that contains the changed path, and coalesce
         // bursts (copying 500 files must cause one rescan, not 500).
         const changed = filename ? path.join(lib.path, String(filename)) : lib.path;
+        packageIndex.invalidateFolders(changed);
         for (const l of settings.get('libraries') || []) {
           const root = path.resolve(l.path);
           if (changed === root || String(changed).startsWith(root + path.sep)) dirtyLibs.add(l.id);
@@ -389,7 +510,8 @@ async function scanOne(lib, force = false) {
 function decoratePackages(libs) {
   for (const lib of libs) {
     for (const a of lib.assets || []) {
-      if (!a.packageFile) continue;
+      // Loose asset folders open as a file list in the UI, like packages.
+      if (!a.packageFile) { a.browsable = true; continue; }
       const mtimeMs = a.updated ? Date.parse(a.updated) : 0;
       // Ask for indexing first (no-op when already done); it uses the scan's
       // mtime/size so polling never stats the NAS again.
@@ -427,6 +549,7 @@ async function currentScan(force = false) {
 }
 
 function invalidateAll() {
+  packageIndex.invalidateFolders();
   libCache.clear();
   dirtyLibs.clear();
   for (const l of settings.get('libraries') || []) dirtyLibs.add(l.id);
@@ -662,6 +785,58 @@ function entryCachePath(pkgReal, stat, entryPath) {
   return path.join(entryCacheDir(pkgReal, stat), crypto.createHash('sha1').update(entryPath).digest('hex'));
 }
 
+// packages/extracted holds files pulled out of packages (models, textures,
+// single-file downloads), one folder per package version. It is a cache:
+// keep it under PV_EXTRACT_CACHE_MAX_MB by dropping the least recently used
+// package folders first. Folders used in the last EXTRACT_PIN_MS are kept even
+// over the limit: a request may be between extracting and reading them.
+const EXTRACT_CACHE_MAX_BYTES = Number(env.PV_EXTRACT_CACHE_MAX_MB || 24576) * 1024 * 1024;
+const EXTRACT_PIN_MS = 15 * 60 * 1000;
+const extractPruneStats = { runs: 0, removedDirs: 0, removedBytes: 0, bytes: 0, maxBytes: EXTRACT_CACHE_MAX_BYTES, lastAt: '' };
+let extractPruneRunning = false;
+async function pruneExtractedCache() {
+  if (extractPruneRunning) return;
+  extractPruneRunning = true;
+  const root = path.join(packagesCacheDir, 'extracted');
+  try {
+    const dirs = [];
+    for (const name of await fs.promises.readdir(root).catch(() => [])) {
+      const dir = path.join(root, name);
+      let bytes = 0;
+      let used = 0;
+      for (const f of await fs.promises.readdir(dir).catch(() => [])) {
+        const file = path.join(dir, f);
+        const st = await fs.promises.stat(file).catch(() => null);
+        if (!st || !st.isFile()) continue;
+        // Temp files of an extraction that never finished (crash, timeout).
+        if (f.endsWith('.tmp') && Date.now() - st.mtimeMs > 3600e3) { await fs.promises.rm(file, { force: true }); continue; }
+        bytes += st.size;
+        used = Math.max(used, st.atimeMs, st.mtimeMs);
+      }
+      dirs.push({ dir, bytes, used });
+    }
+    let total = dirs.reduce((n, d) => n + d.bytes, 0);
+    dirs.sort((a, b) => a.used - b.used);
+    for (const d of dirs) {
+      if (total <= EXTRACT_CACHE_MAX_BYTES) break;
+      if (Date.now() - d.used < EXTRACT_PIN_MS) continue;
+      await fs.promises.rm(d.dir, { recursive: true, force: true });
+      total -= d.bytes;
+      extractPruneStats.removedDirs += 1;
+      extractPruneStats.removedBytes += d.bytes;
+    }
+    extractPruneStats.bytes = total;
+    extractPruneStats.runs += 1;
+    extractPruneStats.lastAt = new Date().toISOString();
+  } catch (err) {
+    console.warn(`[poly-vault] extracted-cache prune failed: ${err.message}`);
+  } finally {
+    extractPruneRunning = false;
+  }
+}
+setTimeout(pruneExtractedCache, 60e3).unref();
+setInterval(pruneExtractedCache, 3600e3).unref();
+
 function entryPreviewPath(pkgReal, stat, entryPath) {
   return `${entryCachePath(pkgReal, stat, entryPath)}.preview.png`;
 }
@@ -894,6 +1069,8 @@ const server = http.createServer(async (req, res) => {
         zipBytes: plugin.zip ? plugin.zip.size : 0,
       } : null,
       packages: packageIndex.status(),
+      extractedCache: extractPruneStats,
+      models: modelService.stats(),
       thumbs: {
         available: thumbs.isAvailable(),
         generated: thumbs.stats.generated,
@@ -921,7 +1098,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // --- web-only session/state endpoints (replace Electron IPC) --------------
-  if (route.startsWith('/api/web/') && !['/api/web/state', '/api/web/session', '/api/web/libraries'].includes(route)) {
+  if (route.startsWith('/api/web/') && !['/api/web/state', '/api/web/session', '/api/web/libraries', '/api/web/rigged', '/api/web/rigged/preview', '/api/web/report'].includes(route)) {
     sendJson(res, 404, { ok: false, error: 'not found' });
     return;
   }
@@ -952,6 +1129,11 @@ const server = http.createServer(async (req, res) => {
         // The Settings panel toggle defaults to this and is remembered per browser.
         defaultEnabled: WEBGL_AVAILABLE && WEBGL_DEFAULT,
       },
+      // Mesh2Motion at /rig/ (rig static meshes, retarget skinned ones).
+      rig: (() => {
+        const st = riggedStatus();
+        return { available: rig.available, url: '/rig/', canSave: st.canSave, cannotSave: st.reason, riggedDir: riggedStore.root || '' };
+      })(),
       plugin: plugin
         ? {
           version: plugin.version,
@@ -962,6 +1144,46 @@ const server = http.createServer(async (req, res) => {
     });
     return;
   }
+  // --- 3D fidelity report summary (scripts/fidelity-report.sh writes it) ----
+  if (route === '/api/web/report') {
+    try {
+      const summary = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'reports', 'fidelity-latest.json'), 'utf8'));
+      sendJson(res, 200, { ok: true, summary });
+    } catch (_) {
+      sendJson(res, 200, { ok: false, error: 'no report yet — run scripts/fidelity-report.sh' });
+    }
+    return;
+  }
+
+  // --- Mesh2Motion "Save to vault" -----------------------------------------
+  if ((route === '/api/web/rigged' || route === '/api/web/rigged/preview') && req.method === 'POST') {
+    const query = Object.fromEntries(url.searchParams);
+    try {
+      if (route === '/api/web/rigged/preview') {
+        const saved = await riggedStore.savePreview(req, query);
+        markLibraryDirty(riggedStore.root);
+        sendJson(res, 200, { ok: true, folder: saved.folder });
+        return;
+      }
+      const st = riggedStatus();
+      if (!st.canSave) { req.resume(); sendJson(res, 503, { ok: false, error: st.reason }); return; }
+      const saved = await riggedStore.saveModel(req, query);
+      const kind = query.kind === 'retarget' ? 'retarget' : 'create';
+      setTagsFor([{ path: saved.dir, tags: ['rigged', `rig:${kind}`, 'mesh2motion'] }]);
+      const from = [query.from, query.src ? path.basename(String(query.src)) : '', query.entry].filter(Boolean);
+      writeMetaEntry(saved.dir, {
+        description: `${kind === 'retarget' ? 'Animated' : 'Rigged'} in Mesh2Motion by ${who}${from.length ? ` from ${from.join(' \u203A ')}` : ''}.`,
+      });
+      markLibraryDirty(riggedStore.root);
+      metrics.counter('pv_rigged_saved_total');
+      audit('rigged_saved', { user: who, folder: saved.folder, bytes: saved.size, kind, source: query.src || '', entry: query.entry || '' });
+      sendJson(res, 200, { ok: true, folder: saved.folder, file: path.basename(saved.file), bytes: saved.size });
+    } catch (err) {
+      sendJson(res, err.status || 500, { ok: false, error: err.message });
+    }
+    return;
+  }
+
   if (route === '/api/web/libraries' && req.method === 'POST') {
     if (!isAdmin(req)) { sendJson(res, 403, { ok: false, error: 'admin token required' }); return; }
     let body;
@@ -1006,6 +1228,18 @@ const server = http.createServer(async (req, res) => {
       real = fs.realpathSync(target);
       stat = fs.statSync(real);
     } catch (_) { sendJson(res, 404, { ok: false, error: 'not found' }); return; }
+    if (stat.isDirectory()) {
+      // Loose folder: images get the regular thumbnail; other files have no
+      // stored preview (Unity keeps those in its Library folder, not here).
+      const inner = insideAnyLibrary(real) ? folderEntryPath(real, entryPath) : null;
+      if (!inner || !/\.(png|jpe?g|webp|gif|bmp|tga|psd|tiff?)$/i.test(inner)) {
+        sendJson(res, 404, { ok: false, error: 'no preview for this file' });
+        return;
+      }
+      res.writeHead(302, { Location: `/api/thumb?path=${encodeURIComponent(inner)}&w=480`, 'Cache-Control': 'private, max-age=600' });
+      res.end();
+      return;
+    }
     if (!stat.isFile()) { sendJson(res, 400, { ok: false, error: 'not a file' }); return; }
 
     const previewFile = entryPreviewPath(real, stat, entryPath);
@@ -1027,11 +1261,91 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // --- link map status of a package or loose Unity folder --------------------
+  // Summary only (counts, completeness, state); the map itself stays server-side.
+  if (route === '/api/package/graph') {
+    const real = resolveInLibrary(url.searchParams.get('path'));
+    if (!real) { sendJson(res, 404, { ok: false, error: 'not found in any library' }); return; }
+    let stat;
+    try { stat = fs.statSync(real); } catch (_) { sendJson(res, 404, { ok: false, error: 'not found' }); return; }
+    if (stat.isDirectory()) {
+      const graph = await packageIndex.folderGraph(real, { force: url.searchParams.get('refresh') === '1' });
+      sendJson(res, 200, { ok: Boolean(graph), path: real, state: graph ? 'ready' : 'failed', summary: packageIndex.graphSummary(graph) });
+      return;
+    }
+    const graph = packageIndex.getGraph(real, stat.mtimeMs, stat.size);
+    if (!graph) {
+      // Opening it is a signal someone wants it now: move it to the front.
+      packageIndex.enqueueGraph(real, stat.mtimeMs, stat.size, { priority: true, force: url.searchParams.get('retry') === '1' });
+      sendJson(res, 202, { ok: false, path: real, ...packageIndex.graphState(real, stat.mtimeMs, stat.size) });
+      return;
+    }
+    // A partial map is used, and rebuilt in the background when that is due.
+    if (graph.complete === false) {
+      packageIndex.enqueueGraph(real, stat.mtimeMs, stat.size, { priority: true, force: url.searchParams.get('retry') === '1' });
+    }
+    const st = packageIndex.graphState(real, stat.mtimeMs, stat.size);
+    sendJson(res, 200, {
+      ok: true, path: real, state: 'ready', summary: packageIndex.graphSummary(graph), errors: graph.errors,
+      ...(st.partial ? { partial: st.partial, attempts: st.attempts, retrying: st.retrying } : {}),
+    });
+    return;
+  }
+  if (route === '/api/package/graph-failures') {
+    sendJson(res, 200, { ok: true, failures: packageIndex.graphFailuresList() });
+    return;
+  }
+
+  // --- a model the way Unity shows it: materials, textures, fidelity ---------
+  if (route === '/api/model/manifest') {
+    const result = await modelService.manifest(url.searchParams.get('path'), url.searchParams.get('entry'), {
+      refresh: url.searchParams.get('refresh') === '1',
+    });
+    if (result.pending) {
+      metrics.counter('pv_model_manifest_pending_total');
+      sendJson(res, 202, { ok: false, pending: true, state: result.state, position: result.position || 0, error: result.error || '' });
+      return;
+    }
+    if (result.error) { sendJson(res, result.error, { ok: false, error: result.message }); return; }
+    metrics.counter('pv_model_manifest_total');
+    audit('model_manifest', { user: who, path: result.manifest.source.path, entry: result.manifest.source.entry, fidelity: result.manifest.fidelity });
+    sendJson(res, 200, result);
+    return;
+  }
+  if (route === '/api/model/converted') {
+    const result = await modelService.converted(url.searchParams.get('path'), url.searchParams.get('entry'));
+    if (result.error) { sendJson(res, result.error, { ok: false, error: result.message }); return; }
+    const st = fs.statSync(result.file);
+    // The URL names the source, not its version: revalidate every time (the
+    // ETag is the converted file, which changes when the source does).
+    const etag = `W/"c-${path.basename(result.file, '.glb').slice(0, 16)}"`;
+    if (req.headers['if-none-match'] === etag) { res.writeHead(304, { ETag: etag }); res.end(); return; }
+    res.writeHead(200, { 'Content-Type': 'model/gltf-binary', 'Content-Length': st.size, 'Cache-Control': 'private, no-cache', ETag: etag });
+    pipeline(fs.createReadStream(result.file), res, () => {});
+    return;
+  }
+  if (route === '/api/model/texture') {
+    const result = await modelService.texture(url.searchParams.get('path'), url.searchParams.get('key'), url.searchParams.get('w'));
+    if (result.error) { sendJson(res, result.error, { ok: false, error: result.message }); return; }
+    metrics.counter('pv_model_texture_total');
+    const st = fs.statSync(result.file);
+    const etag = `W/"t-${path.basename(result.file, '.webp').slice(0, 16)}"`;
+    if (req.headers['if-none-match'] === etag) { res.writeHead(304, { ETag: etag }); res.end(); return; }
+    res.writeHead(200, {
+      'Content-Type': 'image/webp',
+      'Content-Length': st.size,
+      // Same URL after the texture is re-exported: revalidate (cheap 304s).
+      'Cache-Control': 'private, no-cache',
+      ETag: etag,
+    });
+    pipeline(fs.createReadStream(result.file), res, () => {});
+    return;
+  }
+
   // --- contents tree of one package (lazy tree expansion in the UI) ---------
   if (route === '/api/package/tree') {
     const target = String(url.searchParams.get('path') || '').trim();
     if (!target) { sendJson(res, 400, { ok: false, error: 'missing path' }); return; }
-    if (!PACKAGE_INDEX_ENABLED) { sendJson(res, 503, { ok: false, error: 'package index disabled' }); return; }
 
     let real;
     let stat;
@@ -1039,11 +1353,21 @@ const server = http.createServer(async (req, res) => {
       real = fs.realpathSync(target);
       stat = fs.statSync(real);
     } catch (_) { sendJson(res, 404, { ok: false, error: 'not found' }); return; }
-    if (!stat.isFile()) { sendJson(res, 400, { ok: false, error: 'not a file' }); return; }
 
-    const entry = packageIndex.get(real, stat.mtimeMs, stat.size);
+    // A loose asset folder (e.g. a Unity project's Assets) browses like a
+    // package: its files, read from disk.
+    let entry;
+    if (stat.isDirectory()) {
+      if (!insideAnyLibrary(real)) { sendJson(res, 403, { ok: false, error: 'path outside libraries' }); return; }
+      const contents = listFolderContents(real);
+      entry = { contents, totalAssets: contents.length, partial: contents.length >= FOLDER_CONTENTS_MAX };
+    } else if (!PACKAGE_INDEX_ENABLED) {
+      sendJson(res, 503, { ok: false, error: 'package index disabled' }); return;
+    } else {
+      entry = packageIndex.get(real, stat.mtimeMs, stat.size);
+    }
     const current = packageIndex.contentsCap;
-    if (!entry || (entry.contentsCap || 0) < current) {
+    if (!stat.isDirectory() && (!entry || (entry.contentsCap || 0) < current)) {
       // Indexed before the full listing existed (or never): re-read this one
       // package on demand instead of re-reading the whole library.
       packageIndex.enqueue(real, stat.mtimeMs, stat.size, { force: true });
@@ -1056,7 +1380,7 @@ const server = http.createServer(async (req, res) => {
     const roots = [];
     const dirs = new Map();       // entry dir path -> node
     let leaves = 0;
-    const sorted = (entry.contents || []).slice().sort((a, b) => b.size - a.size);
+    const sorted = (entry.contents || []).slice().sort((a, b) => (b.size || 0) - (a.size || 0));
 
     function dirNode(dirPath) {
       if (!dirPath) return null;
@@ -1081,7 +1405,7 @@ const server = http.createServer(async (req, res) => {
         type: 'asset',
         name,
         path: item.path,
-        size: item.size || 0,
+        size: typeof item.size === 'number' ? item.size : null,
         kind: kindForPath(item.path),
       };
       (parent ? parent.children : roots).push(leaf);
@@ -1090,7 +1414,7 @@ const server = http.createServer(async (req, res) => {
 
     const sortTree = (nodes) => {
       nodes.sort((a, b) => (a.type === b.type
-        ? (a.type === 'container' ? a.name.localeCompare(b.name) : b.size - a.size)
+        ? (a.type === 'container' ? a.name.localeCompare(b.name) : (b.size || 0) - (a.size || 0) || a.name.localeCompare(b.name))
         : (a.type === 'container' ? -1 : 1)));
       for (const n of nodes) if (n.children) sortTree(n.children);
     };
@@ -1260,6 +1584,17 @@ const server = http.createServer(async (req, res) => {
     } catch (_) {
       sendJson(res, 404, { ok: false, error: 'not found' });
       return;
+    }
+
+    // One file inside a loose asset folder (the browse view addresses folder
+    // files like package entries): serve that file as a loose file.
+    if (stat.isDirectory() && entryPath) {
+      const inner = folderEntryPath(real, entryPath);
+      if (!inner) { sendJson(res, 404, { ok: false, error: 'entry not found' }); return; }
+      real = inner;
+      try { stat = fs.statSync(real); } catch (_) { sendJson(res, 404, { ok: false, error: 'not found' }); return; }
+      if (!stat.isFile()) { sendJson(res, 400, { ok: false, error: 'not a file' }); return; }
+      entryPath = '';
     }
 
     // One file *inside* a .unitypackage: extract it (cached) and stream it, so a
@@ -1458,6 +1793,9 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // --- Mesh2Motion (rigging / retargeting), same origin, same sign-in -------
+  if (rig.handleRig(req, res, route)) return;
+
   // --- static UI ------------------------------------------------------------
   let rel = route === '/' ? 'index.html' : route.slice(1);
   if (rel === 'web-shim.js') {
@@ -1468,6 +1806,8 @@ const server = http.createServer(async (req, res) => {
   }
   const file = path.join(UI_DIR, path.normalize(rel).replace(/^(\.\.[/\\])+/, ''));
   if (!file.startsWith(UI_DIR) || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
+    // Not ours: maybe a Mesh2Motion asset requested root-relative.
+    if (rig.handleRigFallback(req, res, route)) return;
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('not found');
     return;
@@ -1507,6 +1847,10 @@ bridge.listen()
   .then(() => {
     server.listen(WEB_PORT, WEB_HOST, () => {
       console.log(`[poly-vault] v${APP_VERSION} listening on http://${WEB_HOST}:${WEB_PORT}`);
+      if (riggedStore.root) {
+        const st = riggedStatus();
+        if (!st.canSave) console.warn(`[poly-vault] WARNING: "Save to vault" is off: ${st.reason}.`);
+      }
       console.log(`[poly-vault] data=${DATA_DIR} libraries=${LIBRARY_ROOTS.join(',')} auth=${TRUST_PROXY_AUTH ? 'proxy' : TOKEN ? 'token' : 'NONE (loopback only!)'}`);
       if (!TRUST_PROXY_AUTH && !TOKEN && WEB_HOST !== '127.0.0.1') {
         console.warn('[poly-vault] WARNING: listening on a non-loopback address with no auth configured.');

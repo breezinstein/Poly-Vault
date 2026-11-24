@@ -1,0 +1,289 @@
+'use strict';
+// Library-wide 3D fidelity report: how many models and prefabs Poly Vault
+// shows exactly as Unity does, approximately, or not at all — and why.
+//
+//   node server/fidelityReport.js [--data /data] [--max-models 60] [--max-prefabs 30] [--only <path prefix>]
+//
+// Covers every package's link map and every loose asset folder (top-level
+// folders of the libraries in PV_LIBRARIES that hold .meta files). `--only`
+// limits the run to sources under a path and writes fidelity-only-* instead of
+// replacing the library-wide report.
+// Reads the link maps in <data>/packages/graph, extracts each package's model
+// files once (no textures needed to resolve materials), resolves every model
+// and prefab, and writes:
+//   <data>/reports/fidelity-<date>.json   full per-package detail
+//   <data>/reports/fidelity-latest.json   summary (shown in Settings)
+//   <data>/reports/fidelity-latest.md     the same, readable
+// Safe to run beside the live server: it only reads the libraries and the
+// link maps, and writes into reports/ and a private temp folder.
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { extractMany, buildFolderGraph, GRAPH_SCHEMA } = require('./unityGraph');
+const { resolveModel, modelStructure } = require('./modelResolver');
+const { resolvePrefab } = require('./prefabResolver');
+const { fbxVersion, convertFbx6 } = require('./fbx6');
+const { convertMeshAsset } = require('./unityMesh');
+
+const MODEL_RE = /\.(fbx|obj|dae)$/i;
+const MESH_ASSET_RE = /\.asset$/i;
+
+// Loose asset folders: the top-level folders of every library (a Unity
+// project's Assets, a hand-made pack). Those without .meta files have an empty
+// link map and are skipped.
+function libraryFolders(libraries) {
+  const out = [];
+  for (const root of libraries) {
+    let ents = [];
+    try { ents = fs.readdirSync(root, { withFileTypes: true }); } catch (_) { continue; }
+    for (const e of ents) if (e.isDirectory() && !e.name.startsWith('.')) out.push(path.join(root, e.name));
+  }
+  return out;
+}
+
+function normalizeNote(n) {
+  return n
+    .replace(/^[^:]{1,120}: (?=(custom shader|material is stored|stored in binary|FBX))/, '')
+    .replace(/"[^"]*"/g, '"…"')
+    .replace(/\d+ /g, 'N ')
+    .replace(/FBX \d\.\d/g, 'FBX 6.x');
+}
+
+async function run(opts = {}) {
+  const dataDir = opts.data || '/data';
+  const graphDir = path.join(dataDir, 'packages', 'graph');
+  const reportDir = path.join(dataDir, 'reports');
+  fs.mkdirSync(reportDir, { recursive: true });
+  const maxModels = opts.maxModels || 60;
+  const maxPrefabs = opts.maxPrefabs || 30;
+  const started = Date.now();
+
+  const files = fs.readdirSync(graphDir).filter((f) => f.endsWith(`-s${GRAPH_SCHEMA}.json`));
+  const libraries = opts.libraries || String(process.env.PV_LIBRARIES || '').split(':').filter(Boolean);
+  const sources = [
+    ...files.map((f) => () => JSON.parse(fs.readFileSync(path.join(graphDir, f), 'utf8'))),
+    ...libraryFolders(libraries).map((dir) => () => buildFolderGraph(dir)),
+  ];
+  const totals = {
+    packages: 0, folders: 0, packagesWithModels: 0,
+    models: { exact: 0, approximate: 0, missing: 0, unviewable: 0, none: 0, error: 0 },
+    prefabs: { exact: 0, approximate: 0, missing: 0, unviewable: 0, none: 0, error: 0 },
+    parts: { exact: 0, approximate: 0, missing: 0 },
+    sources: {}, shaders: {}, customShaders: {}, notes: {}, fbxVersions: {},
+    fbx6: { files: 0, converted: 0, failed: 0 },
+    meshAssets: { files: 0, converted: 0, failed: 0 },
+  };
+  const packages = [];
+  const bump = (obj, k, n = 1) => { obj[k] = (obj[k] || 0) + n; };
+
+  for (const load of sources) {
+    let graph;
+    try { graph = load(); } catch (_) { continue; }
+    if (!graph || (graph.kind !== 'package' && graph.kind !== 'folder')) continue;
+    if (opts.only && !String(graph.path).startsWith(opts.only)) continue;
+    if (graph.kind === 'folder') {
+      if (!Object.keys(graph.paths || {}).length) continue;
+      totals.folders += 1;
+    } else totals.packages += 1;
+    const models = Object.entries(graph.paths).filter(([, p]) => MODEL_RE.test(p)).slice(0, maxModels).map(([g]) => g);
+    const prefabs = Object.keys(graph.prefabs).slice(0, maxPrefabs);
+    if (!models.length && !prefabs.length) continue;
+    totals.packagesWithModels += 1;
+
+    // Models used by the sampled prefabs (and the prefabs nested in them, as
+    // the viewer follows them), so prefab meshes resolve.
+    const needed = new Set(models);
+    const visit = (pg, depth) => {
+      if (depth > 4 || !graph.prefabs[pg]) return;
+      for (const o of Object.values(graph.prefabs[pg].o || {})) {
+        const ref = o.c === 33 || o.c === 137 ? o.mesh : o.c === 1001 ? o.src : null;
+        const p = ref && ref.g && graph.paths[ref.g];
+        if (!p) continue;
+        if (MODEL_RE.test(p) || (o.c !== 1001 && MESH_ASSET_RE.test(p))) needed.add(ref.g);
+        else if (/\.prefab$/i.test(p)) visit(ref.g, depth + 1);
+      }
+    };
+    for (const pg of prefabs) visit(pg, 0);
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pv-report-'));
+    const structures = new Map();
+    const unviewable = new Set();   // FBX 6 files the converter could not turn into GLB
+    try {
+      if (graph.kind === 'folder') {
+        for (const g of needed) {
+          try { fs.copyFileSync(path.join(graph.path, ...graph.paths[g].split('/')), path.join(tmp, g)); } catch (_) { /* unreadable: error below */ }
+        }
+      } else {
+        await extractMany(graph.path, [...needed].map((g) => ({ guid: g, outPath: path.join(tmp, g), maxBytes: 256 * 1024 * 1024 })));
+      }
+      for (const g of needed) {
+        const p = path.join(tmp, g);
+        if (!fs.existsSync(p)) continue;
+        const bytes = fs.readFileSync(p);
+        const fmt = path.extname(graph.paths[g]).slice(1).toLowerCase();
+        structures.set(g, modelStructure(bytes, fmt));
+        if (fmt === 'asset') {
+          totals.meshAssets.files += 1;
+          try { convertMeshAsset(bytes); totals.meshAssets.converted += 1; } catch (_) { totals.meshAssets.failed += 1; }
+        }
+        if (fmt === 'fbx' && models.includes(g)) {
+          const v = fbxVersion(bytes);
+          bump(totals.fbxVersions, v >= 7000 ? `${Math.floor(v / 100) / 10}` : v > 0 ? '6.x' : 'unknown');
+          if (v > 0 && v < 7000) {
+            totals.fbx6.files += 1;
+            try { convertFbx6(bytes); totals.fbx6.converted += 1; } catch (_) { totals.fbx6.failed += 1; unviewable.add(g); }
+          }
+        }
+      }
+    } catch (err) {
+      // extraction failure: counted as errors below
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+
+    const pkg = { name: path.basename(graph.path) + (graph.kind === 'folder' ? '/' : ''), kind: graph.kind, path: graph.path, models: {}, prefabs: {}, notes: {} };
+    const tally = (bucket, res) => {
+      bump(totals[bucket], res.fidelity);
+      bump(pkg[bucket], res.fidelity);
+      for (const r of res.rendered || []) {
+        bump(totals.parts, r.fidelity);
+        bump(totals.sources, r.source);
+      }
+      for (const spec of Object.values(res.materials || {})) {
+        bump(totals.shaders, spec.family || 'unknown');
+        if (spec.family === 'custom') bump(totals.customShaders, spec.shader);
+      }
+      for (const n of res.notes || []) { const k = normalizeNote(n); bump(totals.notes, k); bump(pkg.notes, k); }
+    };
+    for (const g of models) {
+      const s = structures.get(g);
+      if (!s) { bump(totals.models, 'error'); bump(pkg.models, 'error'); continue; }
+      try {
+        const res = resolveModel(graph, graph.paths[g], s);
+        if (unviewable.has(g) && res.fidelity !== 'none') res.fidelity = 'unviewable';
+        tally('models', res);
+      } catch (_) { bump(totals.models, 'error'); bump(pkg.models, 'error'); }
+    }
+    for (const g of prefabs) {
+      try { tally('prefabs', resolvePrefab(graph, graph.paths[g], (m) => structures.get(m) || null)); } catch (_) { bump(totals.prefabs, 'error'); bump(pkg.prefabs, 'error'); }
+    }
+    packages.push(pkg);
+    if (opts.progress) opts.progress(totals.packages + totals.folders, sources.length, pkg.name);
+  }
+
+  const top = (obj, n = 12) => Object.entries(obj).sort((a, b) => b[1] - a[1]).slice(0, n);
+  const pct = (part, all) => (all ? Math.round((part / all) * 1000) / 10 : 0);
+  const sum = (o) => Object.values(o).reduce((a, b) => a + b, 0);
+  const summary = {
+    generatedAt: new Date().toISOString(),
+    seconds: Math.round((Date.now() - started) / 1000),
+    sampling: { maxModelsPerPackage: maxModels, maxPrefabsPerPackage: maxPrefabs },
+    packages: totals.packages,
+    folders: totals.folders,
+    only: opts.only || '',
+    packagesWithModels: totals.packagesWithModels,
+    models: { ...totals.models, total: sum(totals.models) },
+    prefabs: { ...totals.prefabs, total: sum(totals.prefabs) },
+    parts: totals.parts,
+    percent: {
+      modelsExact: pct(totals.models.exact, sum(totals.models) - totals.models.none),
+      modelsApproximate: pct(totals.models.approximate, sum(totals.models) - totals.models.none),
+      modelsMissing: pct(totals.models.missing, sum(totals.models) - totals.models.none),
+      prefabsExact: pct(totals.prefabs.exact, sum(totals.prefabs) - totals.prefabs.none),
+    },
+    topReasons: top(totals.notes),
+    topCustomShaders: top(totals.customShaders, 10),
+    shaderFamilies: top(totals.shaders, 20),
+    materialSources: top(totals.sources, 20),
+    fbxVersions: top(totals.fbxVersions, 20),
+    fbx6: totals.fbx6,
+    meshAssets: totals.meshAssets,
+    worstPackages: packages
+      .map((p) => ({ name: p.name, approximate: (p.models.approximate || 0) + (p.prefabs.approximate || 0), missing: (p.models.missing || 0) + (p.prefabs.missing || 0) }))
+      .filter((p) => p.missing + p.approximate > 0)
+      .sort((a, b) => b.missing - a.missing || b.approximate - a.approximate)
+      .slice(0, 15),
+  };
+
+  const stamp = summary.generatedAt.slice(0, 10);
+  if (opts.only) {
+    // A filtered run never replaces the library-wide report.
+    fs.writeFileSync(path.join(reportDir, `fidelity-only-${stamp}.json`), JSON.stringify({ summary, packages }, null, 1));
+    fs.writeFileSync(path.join(reportDir, 'fidelity-only-latest.md'), markdown(summary));
+    return summary;
+  }
+  fs.writeFileSync(path.join(reportDir, `fidelity-${stamp}.json`), JSON.stringify({ summary, packages }, null, 1));
+  fs.writeFileSync(path.join(reportDir, 'fidelity-latest.json'), JSON.stringify(summary, null, 1));
+  fs.writeFileSync(path.join(reportDir, 'fidelity-latest.md'), markdown(summary));
+  return summary;
+}
+
+function markdown(s) {
+  const rows = (pairs) => pairs.map(([k, v]) => `| ${k} | ${v} |`).join('\n');
+  return `# 3D fidelity report — ${s.generatedAt.slice(0, 16).replace('T', ' ')} UTC
+
+${s.only ? `Only ${s.only}: ` : ''}${s.packages} packages${s.folders ? ` and ${s.folders} asset folders` : ''} scanned, ${s.packagesWithModels} with models or prefabs (up to
+${s.sampling.maxModelsPerPackage} models and ${s.sampling.maxPrefabsPerPackage} prefabs each), ${s.seconds}s.
+
+| | exact | approximate | missing | unviewable | no geometry | errors | total |
+|---|---|---|---|---|---|---|---|
+| models | ${s.models.exact} | ${s.models.approximate} | ${s.models.missing} | ${s.models.unviewable || 0} | ${s.models.none} | ${s.models.error} | ${s.models.total} |
+| prefabs | ${s.prefabs.exact} | ${s.prefabs.approximate} | ${s.prefabs.missing} | ${s.prefabs.unviewable || 0} | ${s.prefabs.none} | ${s.prefabs.error} | ${s.prefabs.total} |
+
+Models with geometry: **${s.percent.modelsExact}% exact**, ${s.percent.modelsApproximate}% approximate,
+${s.percent.modelsMissing}% missing. Prefabs: ${s.percent.prefabsExact}% exact.
+
+Percentages are of everything except "no geometry": errors (files that could not be read)
+and unviewable results (FBX 6 that could not be converted, Unity 4 binary prefabs) count against "exact" on purpose,
+since the viewer cannot show them as Unity does.
+
+## Why results are approximate or missing
+
+| reason | count |
+|---|---|
+${rows(s.topReasons)}
+
+## Custom shaders seen most (candidates for exact translations)
+
+| shader | materials |
+|---|---|
+${rows(s.topCustomShaders)}
+
+## Where materials came from (per rendered part)
+
+| source | parts |
+|---|---|
+${rows(s.materialSources)}
+
+## FBX versions (sampled model files)
+
+| version | files |
+|---|---|
+${rows(s.fbxVersions)}
+
+FBX 6.x: ${s.fbx6.files} files, ${s.fbx6.converted} converted, ${s.fbx6.failed} failed.
+Unity mesh assets used by prefabs: ${s.meshAssets ? `${s.meshAssets.files} files, ${s.meshAssets.converted} converted, ${s.meshAssets.failed} failed` : 'n/a'}.
+
+## Packages with the most approximate/missing results
+
+| package or folder | approximate | missing |
+|---|---|---|
+${s.worstPackages.map((p) => `| ${p.name} | ${p.approximate} | ${p.missing} |`).join('\n')}
+`;
+}
+
+module.exports = { run, markdown };
+
+if (require.main === module) {
+  const args = process.argv.slice(2);
+  const arg = (name, def) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : def; };
+  run({
+    data: arg('--data', '/data'),
+    maxModels: Number(arg('--max-models', 60)),
+    maxPrefabs: Number(arg('--max-prefabs', 30)),
+    only: arg('--only', ''),
+    progress: (n, total, name) => { if (n % 25 === 0) console.log(`[report] ${n}/${total} ${name}`); },
+  }).then((s) => {
+    console.log(JSON.stringify({ models: s.models, prefabs: s.prefabs, percent: s.percent, fbx6: s.fbx6, meshAssets: s.meshAssets, seconds: s.seconds }));
+  }).catch((err) => { console.error(err); process.exit(1); });
+}

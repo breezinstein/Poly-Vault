@@ -6,6 +6,39 @@ All notable changes to **Poly Vault** are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+- Mesh2Motion served at `/rig/` behind Poly Vault's sign-in: rig or animate any vault model, "Save to vault" into a writable Rigged library.
+- Link map per package and loose Unity folder; models and prefabs shown with their Unity materials and textures, with a fidelity badge that explains differences.
+- FBX 6 and Unity mesh assets (`.asset`, including skinned meshes) converted to GLB; Collada (`.dae`) support.
+- Loose asset folders browse like packages; big packages list every file (from the link map).
+- Library-wide fidelity report (`scripts/fidelity-report.sh`, Settings → 3D fidelity).
+- `docker-compose.nas.yml` for NFS-backed libraries; `THIRD-PARTY-NOTICES.md` and bundled licence texts.
+
+### Changed
+- Model reading, inspection and conversion run on a worker thread with a size cap (`PV_MODEL_MAX_MB`).
+- Caches are bounded: converted GLBs, extracted package files (`PV_EXTRACT_CACHE_MAX_MB`).
+- CI runs `scripts/ci-local.sh` (unit tests, acceptance suites, 3D browser checks).
+
+### Fixed
+- Package worker replies are routed by message id; a worker that dies fails its pending requests instead of leaving them waiting.
+- Folder link maps have a time budget, are dropped when files change under them, and a model directly in a library root no longer maps the whole library.
+- "Save to vault" folders are created race-free and removed if the save fails; saving is refused (with the reason) when `PV_RIGGED_DIR` is not a library.
+- Loose folders hide Unity's generated `Library`/`Temp`/`obj` folders only inside a Unity project.
+- Browser checks install Playwright from a committed lockfile; 3D colour checks are relative to what is on screen.
+- Oversize uploads get `413` instead of a connection reset.
+- Opening a model no longer waits when link maps are disabled or failed.
+- A corrupt or crafted FBX can no longer stall the model pipeline: the FBX readers reject node records that do not move forward, and a watchdog restarts the model worker after `PV_MODEL_TIMEOUT_S` (the file is then skipped until it changes; counts in `/healthz` → `models`).
+- Textures in loose folders refresh after being re-exported in place (cached by the texture file's own date and size); texture and converted-model responses revalidate.
+- A package whose link map could only be read in part (read error, time budget) is marked partial, listed in `/api/package/graph-failures` and `/healthz`, and rebuilt later (up to 3 attempts); the viewer notes partial maps for packages too.
+- Models that cannot be shown in the browser (FBX 6 the converter cannot read) get an "unviewable" verdict instead of "Matches Unity"; the fidelity report counts them separately and explains its percentages.
+- Folder link-map invalidation reaches maps no longer held in memory.
+- Loose folders record Unity 4 binary materials and prefabs like packages do (binary materials fall back to name matching with a note; a binary prefab says it can only be read by Unity).
+- Truncated or unreadable models are no longer reported as "No meshes" or "Matches Unity": a binary FBX cut short says so, and an unreadable structure gives "Close to Unity" with an explanation.
+- `?retry=1` on `/api/package/graph` rebuilds a partial link map at once.
+- A prefab manifest stops reading model files after `PV_PREFAB_BUDGET_S` or two timeouts; `?refresh=1` on `/api/model/manifest` clears files the model worker skipped.
+- Converted meshes of loose-folder prefabs refresh when a mesh file is re-exported.
+- Extracted package files used in the last 15 minutes are never pruned, and a request whose file was pruned extracts it again; textures are read off the event loop; two requests for the same conversion share one.
+
 ## [0.4.2] — 2026-11-07
 
 Performance optimizations and UI usability enhancements across the Electron renderer, library scanner, and bridge server.

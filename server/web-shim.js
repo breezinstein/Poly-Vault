@@ -85,6 +85,13 @@
       const mod = await viewerPromise;
       return mod.mount(container, url, name);
     },
+    // The model as Unity shows it (materials, textures, fidelity badge).
+    async mountUnity(container, source) {
+      if (!window.assetVault.webglEnabled()) throw new Error('3D preview disabled');
+      if (!viewerPromise) viewerPromise = import('/webgl/viewer.js');
+      const mod = await viewerPromise;
+      return mod.mountUnity(container, source);
+    },
   };
 
   // -------------------------------------------------------------------------
@@ -140,6 +147,8 @@
   .pv-steps { margin: 8px 0 0; padding-left: 20px; }
   .pv-steps li { margin: 6px 0; }
   .pv-hint { opacity: .65; font-size: 12px; }
+  .pv-reasons { margin: 4px 0 8px 18px; padding: 0; font-size: 12px; }
+  .pv-reasons li { margin: 2px 0; }
   .pv-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 12px; }
   .pv-kbd { border: 1px solid var(--border, #3a3c44); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; font-size: 11px; }
   .pv-sheet a { color: var(--accent, #c8734a); }
@@ -348,8 +357,31 @@
         `Package index: ${health.packages.cachedPackages || 0} packages, `
         + `${health.packages.cachedPreviews || 0} with a preview extracted from the archive`));
     }
+    if (health.packages && health.packages.graph && health.packages.graph.enabled) {
+      const g = health.packages.graph;
+      sheet.appendChild(el('p', '',
+        `Link maps (materials, prefabs): ${g.ready} packages ready${g.queued ? `, ${g.queued} queued` : ''}${g.failed ? `, ${g.failed} failed` : ''}`));
+    }
     sheet.appendChild(el('p', 'pv-hint',
-      'Tags, descriptions and import jobs live on the server; your asset files are never modified.'));
+      'Tags, descriptions and import jobs live on the server; your asset files are never modified. '
+      + 'Rigged models from Mesh2Motion are saved to the Rigged library.'));
+
+    // ---- 3D fidelity -------------------------------------------------------
+    const fidelity = el('div', 'pv-fidelity');
+    sheet.appendChild(el('h3', '', '3D fidelity'));
+    sheet.appendChild(fidelity);
+    fetch('/api/web/report', { credentials: 'same-origin' }).then((r) => r.json()).then((json) => {
+      if (!json.ok) { fidelity.appendChild(el('p', 'pv-hint', 'No report yet. An administrator can run scripts/fidelity-report.sh on the server.')); return; }
+      const s = json.summary;
+      fidelity.appendChild(el('p', '',
+        `Models: ${s.percent.modelsExact}% exactly as in Unity, ${s.percent.modelsApproximate}% close, ${s.percent.modelsMissing}% missing `
+        + `(${s.models.total} models in ${s.packagesWithModels} packages). Prefabs: ${s.percent.prefabsExact}% exact.`));
+      const reasons = el('ul', 'pv-reasons');
+      for (const [reason, n] of (s.topReasons || []).slice(0, 5)) reasons.appendChild(el('li', '', `${reason} (${n})`));
+      fidelity.appendChild(el('p', 'pv-hint', 'Most common reasons a result is only close:'));
+      fidelity.appendChild(reasons);
+      fidelity.appendChild(el('p', 'pv-hint', `Report from ${new Date(s.generatedAt).toLocaleString()}.`));
+    }).catch(() => fidelity.appendChild(el('p', 'pv-hint', 'Report unavailable.')));
 
     overlay.appendChild(sheet);
     document.body.appendChild(overlay);

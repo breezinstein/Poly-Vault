@@ -25,6 +25,9 @@ const path = require('path');
 const crypto = require('crypto');
 const { Worker } = require('worker_threads');
 
+const { GRAPH_SCHEMA, graphSummary } = require('./unityGraph');
+const { contentsFromGraph } = require('./unityPackage');
+
 const sha1 = (value) => crypto.createHash('sha1').update(value).digest('hex');
 const NOTIFY_MS = 20000;          // at most one ETag bump per 20 s while busy
 const PREVIEW_BUDGET = 64 * 1024 * 1024;
@@ -33,13 +36,21 @@ const TIMEOUT_MS = 45000;
 const MAX_CONTENTS = 4000;
 const CONTENTS_CAP = MAX_CONTENTS;
 
-function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024 * 1024, onUpdate = null, log = console }) {
+function createPackageIndex({
+  dir, enabled = true, maxPackageBytes = 4096 * 1024 * 1024, onUpdate = null, log = console,
+  graphEnabled = true, graphTimeoutMs = 30 * 60 * 1000, folderGraphBudgetMs = 60000, partialRetryMs = 10 * 60 * 1000,
+}) {
   const cacheDir = path.join(dir, 'packages');
   const previewDir = path.join(cacheDir, 'previews');
   const metaDir = path.join(cacheDir, 'meta');
+  // Link maps (guid -> path, materials, prefabs, importer settings). Named
+  // <sha1(file)>-<mtime>-<size>-s<schema>.json so freshness is a name lookup.
+  const graphDir = path.join(cacheDir, 'graph');
+  const graphFailFile = path.join(graphDir, 'failed.json');
+  const useGraph = enabled && graphEnabled;
 
   if (enabled) {
-    for (const d of [cacheDir, previewDir, metaDir]) {
+    for (const d of [cacheDir, previewDir, metaDir, ...(useGraph ? [graphDir] : [])]) {
       try { fs.mkdirSync(d, { recursive: true }); } catch (err) { log.warn(`[poly-vault] package cache unavailable: ${err.message}`); }
     }
   }
@@ -58,13 +69,24 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
   const inFlight = new Set();
   const failures = new Map();   // absPath -> consecutive failures
   let worker = null;
-  let pendingReply = null;
-  const pendingExtracts = new Map();   // message id -> resolve
+  // Every worker message carries a unique id; replies are routed by it, so
+  // index, link-map, extraction and folder requests can be in flight together.
+  const pendingReplies = new Map();   // message id -> resolve
+  let msgSeq = 0;
+  const nextId = (kind) => `${kind}:${(msgSeq += 1)}`;
+  function sendToWorker(msg, resolve) {
+    pendingReplies.set(msg.id, resolve);
+    try {
+      ensureWorker().postMessage(msg);
+    } catch (err) {
+      pendingReplies.delete(msg.id);
+      resolve({ ok: false, error: err.message });
+    }
+  }
   let extractChain = Promise.resolve();
   const extractInFlight = new Map();   // "file\u0000entry" -> promise
   let draining = false;
   let lastNotify = 0;
-  let extractSeq = 0;
   let notifyTimer = null;
   let version = 0;
 
@@ -91,6 +113,54 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
     try { stats.cachedPreviews = fs.readdirSync(previewDir).length; } catch (_) { stats.cachedPreviews = 0; }
   }
   if (enabled) refreshCachedTotals();
+
+  // --- link-map state --------------------------------------------------------
+  const graphIndex = new Map();       // sha1(file) -> { mtimeMs, size, schema, name }
+  const graphQueue = [];              // { file, size, mtimeMs }
+  const graphQueued = new Set();
+  const graphCache = new Map();       // file -> parsed graph (small LRU)
+  let graphActiveFile = '';
+  let graphFailures = {};             // file -> { mtimeMs, size, error, count, at }
+  const graphStats = { built: 0, failed: 0, partial: 0, bytesRead: 0, lastFile: '', lastMs: 0 };
+  const GRAPH_NAME = /^([0-9a-f]{40})-(\d+)-(\d+)-s(\d+)\.json$/;
+  if (useGraph) {
+    try {
+      for (const name of fs.readdirSync(graphDir)) {
+        const m = GRAPH_NAME.exec(name);
+        if (!m || Number(m[4]) !== GRAPH_SCHEMA) continue;
+        const prev = graphIndex.get(m[1]);
+        if (!prev || Number(m[2]) > prev.mtimeMs) graphIndex.set(m[1], { mtimeMs: Number(m[2]), size: Number(m[3]), schema: Number(m[4]), name });
+      }
+    } catch (_) { /* first run */ }
+    try { graphFailures = JSON.parse(fs.readFileSync(graphFailFile, 'utf8')) || {}; } catch (_) { graphFailures = {}; }
+  }
+  const graphPath = (file, mtimeMs, size) => path.join(graphDir, `${sha1(file)}-${Math.trunc(mtimeMs)}-${size}-s${GRAPH_SCHEMA}.json`);
+  const graphFresh = (file, mtimeMs, size) => {
+    const g = graphIndex.get(sha1(file));
+    return g && Math.abs(g.mtimeMs - Math.trunc(mtimeMs)) <= 2 && g.size === size ? g : null;
+  };
+  const graphFailed = (file, mtimeMs, size) => {
+    const f = graphFailures[file];
+    return f && Math.abs(f.mtimeMs - Math.trunc(mtimeMs)) <= 2 && f.size === size ? f : null;
+  };
+  // A map that was built but is incomplete because reading the archive failed
+  // or ran out of time (NFS error, file still being copied) is kept and used,
+  // but recorded here as `partial` and rebuilt later, up to 3 attempts with a
+  // growing wait. Deliberate limits (byte-budget) are not retried.
+  const RETRYABLE_PARTIAL = /^(archive-error|archive-truncated|time-budget|stopped)/;
+  const PARTIAL_RETRY_MS = partialRetryMs;
+  const graphPartial = (file, mtimeMs, size) => {
+    const f = graphFailed(file, mtimeMs, size);
+    return f && f.partial ? f : null;
+  };
+  const partialRetryDue = (file, mtimeMs, size) => {
+    const p = graphPartial(file, mtimeMs, size);
+    return Boolean(p && RETRYABLE_PARTIAL.test(p.error || '') && p.count < 3
+      && Date.now() - Date.parse(p.at || 0) >= PARTIAL_RETRY_MS * p.count);
+  };
+  const saveGraphFailures = () => {
+    try { fs.writeFileSync(graphFailFile, JSON.stringify(graphFailures)); } catch (_) { /* best effort */ }
+  };
 
   const metaPath = (file) => path.join(metaDir, `${sha1(file)}.json`);
   const previewPath = (file, mtimeMs) => path.join(previewDir, `${sha1(file)}-${Math.trunc(mtimeMs)}.png`);
@@ -148,47 +218,35 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
     worker = new Worker(path.join(__dirname, 'pkgWorker.js'));
     worker.unref();
     worker.on('message', (msg) => {
-      const isExtract = typeof msg.id === 'string' && msg.id.startsWith('extract:');
-      if (isExtract) {
-        const reply = pendingExtracts.get(msg.id);
-        pendingExtracts.delete(msg.id);
-        if (reply) reply(msg);
-        return;
-      }
-      const reply = pendingReply;
-      pendingReply = null;
+      const reply = pendingReplies.get(msg.id);
+      pendingReplies.delete(msg.id);
       if (reply) reply(msg);
     });
+    // A dead worker answers nothing: fail what was in flight (it restarts on
+    // the next request) instead of leaving callers waiting forever.
+    const failAll = (error) => {
+      const waiting = [...pendingReplies.values()];
+      pendingReplies.clear();
+      worker = null;
+      for (const reply of waiting) reply({ ok: false, error });
+    };
     worker.on('error', (err) => {
       log.warn(`[poly-vault] package worker failed: ${err.message}`);
-      const reply = pendingReply;
-      pendingReply = null;
-      for (const [, reply] of pendingExtracts) reply({ ok: false, error: err.message });
-      pendingExtracts.clear();
-      worker = null;
-      if (reply) reply({ ok: false, error: err.message });
+      failAll(err.message);
     });
-    worker.on('exit', () => { worker = null; });
+    worker.on('exit', () => failAll('package worker stopped'));
     return worker;
   }
 
   function parseInWorker(file, mode, mtimeMs) {
-    return new Promise((resolve) => {
-      pendingReply = resolve;
-      try {
-        ensureWorker().postMessage({
-          id: `${file}:${mode}`,
-          file,
-          mode,
-          previewPath: previewPath(file, mtimeMs),
-          maxUncompressedBytes: mode === 'preview' ? PREVIEW_BUDGET : FULL_BUDGET,
-          timeoutMs: TIMEOUT_MS,
-        });
-      } catch (err) {
-        pendingReply = null;
-        resolve({ ok: false, error: err.message });
-      }
-    });
+    return new Promise((resolve) => sendToWorker({
+      id: nextId('index'),
+      file,
+      mode,
+      previewPath: previewPath(file, mtimeMs),
+      maxUncompressedBytes: mode === 'preview' ? PREVIEW_BUDGET : FULL_BUDGET,
+      timeoutMs: TIMEOUT_MS,
+    }, resolve));
   }
 
   /**
@@ -204,23 +262,229 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
     const key = `${file}\u0000${entry}\u0000${outPath}`;
     if (extractInFlight.has(key)) return extractInFlight.get(key);
 
-    const job = extractChain.then(() => new Promise((resolve) => {
-      const id = `extract:${(extractSeq += 1)}`;
-      pendingExtracts.set(id, resolve);
-      try {
-        ensureWorker().postMessage({
-          id, action: 'extract', file, entry, outPath, maxBytes, previewOutPath, timeoutMs: TIMEOUT_MS,
-        });
-      } catch (err) {
-        pendingExtracts.delete(id);
-        resolve({ ok: false, error: err.message });
-      }
-    }));
+    const job = extractChain.then(() => new Promise((resolve) => sendToWorker({
+      id: nextId('extract'), action: 'extract', file, entry, outPath, maxBytes, previewOutPath, timeoutMs: TIMEOUT_MS,
+    }, resolve)));
 
     extractInFlight.set(key, job);
     extractChain = job.then(() => undefined, () => undefined);
     job.finally(() => extractInFlight.delete(key));
     return job;
+  }
+
+  /**
+   * Extracts several assets (by GUID) in one archive pass on the worker.
+   * @param {{guid:string,outPath:string,maxBytes?:number}[]} targets
+   * @returns {Promise<{ok:boolean, results?:Object, scannedBytes?:number, error?:string}>}
+   */
+  function extractMany(file, targets) {
+    if (!enabled) return Promise.resolve({ ok: false, error: 'package index disabled' });
+    if (!targets.length) return Promise.resolve({ ok: true, results: {}, scannedBytes: 0 });
+    const job = extractChain.then(() => new Promise((resolve) => sendToWorker({
+      id: nextId('extract'), action: 'extractMany', file, targets, timeoutMs: graphTimeoutMs,
+    }, resolve)));
+    extractChain = job.then(() => undefined, () => undefined);
+    return job;
+  }
+
+  // --- link maps --------------------------------------------------------------
+
+  function graphMessage(file, outPath) {
+    return new Promise((resolve) => sendToWorker({
+      id: nextId('graph'), action: 'graph', file, outPath, timeoutMs: graphTimeoutMs,
+    }, resolve));
+  }
+
+  async function processGraph(job) {
+    let stat;
+    try { stat = fs.statSync(job.file); } catch (err) {
+      graphStats.failed += 1;
+      graphFailures[job.file] = { mtimeMs: job.mtimeMs, size: job.size, error: `stat: ${err.code || err.message}`, count: 3, at: new Date().toISOString() };
+      saveGraphFailures();
+      return;
+    }
+    const mtime = Math.trunc(stat.mtimeMs);
+    if (graphFresh(job.file, mtime, stat.size) && !(job.retry && (job.force || partialRetryDue(job.file, mtime, stat.size)))) return;
+    graphActiveFile = job.file;
+    const started = Date.now();
+    const out = graphPath(job.file, mtime, stat.size);
+    const reply = await graphMessage(job.file, out);
+    graphActiveFile = '';
+    graphStats.lastMs = Date.now() - started;
+    graphStats.lastFile = path.basename(job.file);
+    if (!reply.ok) {
+      graphStats.failed += 1;
+      const prev = graphFailed(job.file, mtime, stat.size);
+      graphFailures[job.file] = { mtimeMs: mtime, size: stat.size, error: reply.error, count: (prev ? prev.count : 0) + 1, at: new Date().toISOString() };
+      saveGraphFailures();
+      log.warn(`[poly-vault] link map failed for ${path.basename(job.file)}: ${reply.error}`);
+      return;
+    }
+    const key = sha1(job.file);
+    const old = graphIndex.get(key);
+    if (old && old.name !== path.basename(out)) {
+      try { fs.unlinkSync(path.join(graphDir, old.name)); } catch (_) { /* ignore */ }
+    }
+    graphIndex.set(key, { mtimeMs: mtime, size: stat.size, schema: GRAPH_SCHEMA, name: path.basename(out) });
+    graphCache.delete(job.file);
+    const summary = reply.summary || {};
+    if (summary.complete === false) {
+      const prev = graphPartial(job.file, mtime, stat.size);
+      graphFailures[job.file] = {
+        mtimeMs: mtime, size: stat.size, error: summary.truncated || 'incomplete', partial: true,
+        count: (prev ? prev.count : 0) + 1, at: new Date().toISOString(),
+      };
+      saveGraphFailures();
+      graphStats.partial += 1;
+      log.warn(`[poly-vault] link map for ${path.basename(job.file)} is partial (${summary.truncated || 'incomplete'})`
+        + `${RETRYABLE_PARTIAL.test(summary.truncated || '') ? `; attempt ${graphFailures[job.file].count} of 3` : ''}`);
+    } else if (graphFailures[job.file]) { delete graphFailures[job.file]; saveGraphFailures(); }
+    graphStats.built += 1;
+    fillFromGraph(job.file, mtime, stat.size);
+    graphStats.bytesRead += (reply.summary && reply.summary.scannedBytes) || 0;
+    // No ETag bump: link maps are not part of the library payload, and the
+    // eager pass would otherwise make every browser refetch it every 20 s.
+  }
+
+  function enqueueGraph(file, mtimeMs, size, opts = {}) {
+    if (!useGraph || !file || !mtimeMs || !size) return false;
+    const retry = Boolean(graphFresh(file, mtimeMs, size));
+    // A partial map is rebuilt when its retry is due, or at once when forced (?retry=1).
+    if (retry && !opts.force && !partialRetryDue(file, mtimeMs, size)) return false;
+    if (graphQueued.has(file) || graphActiveFile === file) return false;
+    const failed = graphFailed(file, mtimeMs, size);
+    if (!retry && failed && failed.count >= 3 && !opts.force) return false;
+    const item = { file, size, mtimeMs: Math.trunc(mtimeMs), retry, force: Boolean(opts.force) };
+    // On-demand requests (someone opened a model) jump the background queue.
+    if (opts.priority) graphQueue.unshift(item); else graphQueue.push(item);
+    graphQueued.add(file);
+    drain().catch((err) => log.warn(`[poly-vault] package index drain failed: ${err.message}`));
+    return true;
+  }
+
+  // Loose folders (assets with .meta siblings): built on demand on the worker,
+  // cached on disk for FOLDER_TTL_MS (folders change rarely; "Update" clears).
+  const FOLDER_TTL_MS = 10 * 60 * 1000;
+  // A folder walk (one stat + read per .meta, over NFS) must not hold the
+  // worker indefinitely: past this it stops and the graph says it is partial.
+  const FOLDER_TIME_BUDGET_MS = folderGraphBudgetMs;
+  const folderInFlight = new Map();
+  // Every folder map on disk, by key: invalidation must reach maps the small
+  // graphCache LRU has evicted. Maps from before a restart are dropped at
+  // start-up (changes while the server was down went unseen).
+  const folderMaps = new Map();   // key -> { dir, shallow }
+  const FOLDER_MAPS_MAX = 5000;
+  if (useGraph) {
+    try { fs.rmSync(path.join(graphDir, 'folders'), { recursive: true, force: true }); } catch (_) { /* first run */ }
+  }
+  function noteFolderMap(key, dir, shallow) {
+    folderMaps.delete(key);
+    folderMaps.set(key, { dir, shallow });
+    while (folderMaps.size > FOLDER_MAPS_MAX) {
+      const [oldKey, old] = folderMaps.entries().next().value;
+      folderMaps.delete(oldKey);
+      graphCache.delete(oldKey);
+      fs.rmSync(folderOut(old.dir, old.shallow), { force: true });
+    }
+  }
+  // `shallow`: only the folder's own files (used when a model sits directly
+  // in a library root, so one click never maps a whole library).
+  const folderKey = (dirPath, shallow) => `dir:${dirPath}${shallow ? '\u0000shallow' : ''}`;
+  const folderOut = (dirPath, shallow) => path.join(graphDir, 'folders', `${sha1(folderKey(dirPath, shallow))}.json`);
+  function folderGraph(dirPath, opts = {}) {
+    if (!useGraph) return Promise.resolve(null);
+    const shallow = Boolean(opts.shallow);
+    const key = folderKey(dirPath, shallow);
+    const out = folderOut(dirPath, shallow);
+    const cached = graphCache.get(key);
+    if (!opts.force && cached && Date.now() - cached.at < FOLDER_TTL_MS) return Promise.resolve(cached.graph);
+    if (!opts.force) {
+      try {
+        const st = fs.statSync(out);
+        if (Date.now() - st.mtimeMs < FOLDER_TTL_MS) {
+          const graph = JSON.parse(fs.readFileSync(out, 'utf8'));
+          graphCache.set(key, { at: st.mtimeMs, graph, dir: dirPath, shallow });
+          noteFolderMap(key, dirPath, shallow);
+          return Promise.resolve(graph);
+        }
+      } catch (_) { /* build it */ }
+    }
+    if (folderInFlight.has(key)) return folderInFlight.get(key);
+    const job = new Promise((resolve) => sendToWorker({
+      id: nextId('folder'), action: 'folderGraph', dir: dirPath, outPath: out, shallow,
+      maxFiles: opts.maxFiles || 50000, timeBudgetMs: opts.timeBudgetMs || FOLDER_TIME_BUDGET_MS,
+    }, (msg) => {
+      if (!msg.ok) { log.warn(`[poly-vault] folder link map failed for ${dirPath}: ${msg.error}`); resolve(null); return; }
+      try {
+        const graph = JSON.parse(fs.readFileSync(out, 'utf8'));
+        graphCache.set(key, { at: Date.now(), graph, dir: dirPath, shallow });
+        noteFolderMap(key, dirPath, shallow);
+        if (graph.truncated) log.warn(`[poly-vault] folder link map for ${dirPath} is partial (${graph.truncated})`);
+        resolve(graph);
+      } catch (_) { resolve(null); }
+    }));
+    folderInFlight.set(key, job);
+    job.finally(() => folderInFlight.delete(key));
+    return job;
+  }
+
+  /**
+   * Drop cached folder link maps affected by a change at `changedPath` (all of
+   * them when omitted, e.g. the "Update" button): the folder itself, any folder
+   * containing it, and for a shallow map only a change directly inside it.
+   */
+  function invalidateFolders(changedPath) {
+    const changed = changedPath ? path.resolve(changedPath) : null;
+    const affected = (dir, shallow) => {
+      if (!changed) return true;
+      if (changed === dir) return true;
+      if (!changed.startsWith(dir + path.sep)) return false;
+      return !shallow || path.dirname(changed) === dir;
+    };
+    for (const [key, entry] of [...folderMaps.entries()]) {
+      if (!affected(entry.dir, entry.shallow)) continue;
+      folderMaps.delete(key);
+      graphCache.delete(key);
+      // Synchronously: the next request must not read the stale file back.
+      fs.rmSync(folderOut(entry.dir, entry.shallow), { force: true });
+    }
+    if (!changed) {
+      // Maps not in memory (evicted, or from before a restart) are on disk only.
+      let names = [];
+      try { names = fs.readdirSync(path.join(graphDir, 'folders')); } catch (_) { names = []; }
+      for (const n of names) fs.rmSync(path.join(graphDir, 'folders', n), { force: true });
+    }
+  }
+
+  /** Parsed link map of a package, or null when it is not built yet. */
+  function getGraph(file, mtimeMs, size) {
+    if (!useGraph) return null;
+    const g = graphFresh(file, mtimeMs, size);
+    if (!g) return null;
+    const cached = graphCache.get(file);
+    if (cached && cached.name === g.name) return cached.graph;
+    try {
+      const graph = JSON.parse(fs.readFileSync(path.join(graphDir, g.name), 'utf8'));
+      graphCache.set(file, { name: g.name, graph });
+      while (graphCache.size > 8) graphCache.delete(graphCache.keys().next().value);
+      return graph;
+    } catch (_) {
+      graphIndex.delete(sha1(file));
+      return null;
+    }
+  }
+
+  function graphState(file, mtimeMs, size) {
+    if (!useGraph) return { state: 'disabled' };
+    if (graphFresh(file, mtimeMs, size)) {
+      const p = graphPartial(file, mtimeMs, size);
+      return p ? { state: 'ready', partial: p.error, attempts: p.count, retrying: RETRYABLE_PARTIAL.test(p.error) && p.count < 3 } : { state: 'ready' };
+    }
+    if (graphActiveFile === file) return { state: 'building' };
+    if (graphQueued.has(file)) return { state: 'queued', position: graphQueue.findIndex((j) => j.file === file) + 1 };
+    const failed = graphFailed(file, mtimeMs, size);
+    if (failed) return { state: failed.count >= 3 ? 'failed' : 'retrying', error: failed.error, attempts: failed.count };
+    return { state: 'missing' };
   }
 
   async function processOne(job) {
@@ -276,6 +540,7 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
     stats.bytesRead += entry.scannedBytes || 0;
     if (entry.previewPath) stats.previews += 1;
     if (entry.mode === 'full') stats.fullPasses += 1;
+    fillFromGraph(job.file, stat.mtimeMs, stat.size);
 
     // Second pass: accurate contents for packages small enough to be worth it.
     if (entry.mode === 'preview' && stat.size <= maxPackageBytes) {
@@ -289,7 +554,20 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
     if (draining) return;
     draining = true;
     try {
-      while (queue.length) {
+      while (queue.length || graphQueue.length) {
+        // Previews/contents first (cards), link maps when that queue is idle.
+        if (!queue.length) {
+          const g = graphQueue.shift();
+          graphQueued.delete(g.file);
+          try {
+            await processGraph(g);
+          } catch (err) {
+            graphStats.failed += 1;
+            graphActiveFile = '';
+            log.warn(`[poly-vault] link map error: ${err.message}`);
+          }
+          continue;
+        }
         const job = queue.shift();
         queued.delete(job.file);
         if (inFlight.has(job.file)) continue;
@@ -326,6 +604,9 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
       } catch (_) { stats.skipped += 1; return false; }
     }
 
+    // Every package gets a link map, eagerly, behind previews and contents.
+    enqueueGraph(file, mtime, bytes);
+
     const existing = readEntry(file, mtime, bytes);
     // `previewTried` remembers a pass that found no preview (editor-only tools
     // often have none): without it those packages would be re-read forever.
@@ -349,6 +630,36 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
     return readEntry(file, mtimeMs, size);
   }
 
+  // Big packages: the contents pass stops at its byte budget, but the link map
+  // walks every header. Fill "what's inside" (counts, file list) from it.
+  function fillFromGraph(file, mtimeMs, size) {
+    if (!enabled || !useGraph) return false;
+    const entry = readEntry(file, mtimeMs, size);
+    if (!entry || entry.contentsSource === 'graph' || (!entry.partial && entry.mode === 'full')) return false;
+    const merged = contentsFromGraph(entry, getGraph(file, mtimeMs, size), MAX_CONTENTS);
+    if (!merged) return false;
+    saveEntry({ ...entry, ...merged });
+    notify();
+    return true;
+  }
+
+  // Once per start: entries indexed before this existed.
+  if (enabled && useGraph) {
+    const t = setTimeout(() => {
+      let filled = 0;
+      let names = [];
+      try { names = fs.readdirSync(metaDir); } catch (_) { names = []; }
+      for (const name of names) {
+        let e;
+        try { e = JSON.parse(fs.readFileSync(path.join(metaDir, name), 'utf8')); } catch (_) { continue; }
+        if (!e || !e.path || e.contentsSource === 'graph' || (!e.partial && e.mode === 'full')) continue;
+        if (fillFromGraph(e.path, e.mtimeMs, e.size)) filled += 1;
+      }
+      if (filled) log.info?.(`[poly-vault] filled contents of ${filled} large package(s) from their link maps`);
+    }, 2000);
+    t.unref?.();
+  }
+
   function status() {
     return {
       ...stats,
@@ -359,7 +670,26 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
       maxPackageBytes,
       previewBudgetBytes: PREVIEW_BUDGET,
       fullBudgetBytes: FULL_BUDGET,
+      graph: {
+        enabled: useGraph,
+        schema: GRAPH_SCHEMA,
+        ready: graphIndex.size,
+        queued: graphQueue.length,
+        building: graphActiveFile ? path.basename(graphActiveFile) : '',
+        failed: Object.values(graphFailures).filter((f) => !f.partial && f.count >= 3).length,
+        partial: Object.values(graphFailures).filter((f) => f.partial).length,
+        builtThisRun: graphStats.built,
+        failedThisRun: graphStats.failed,
+        partialThisRun: graphStats.partial,
+        bytesRead: graphStats.bytesRead,
+        lastFile: graphStats.lastFile,
+        lastMs: graphStats.lastMs,
+      },
     };
+  }
+
+  function graphFailuresList() {
+    return Object.entries(graphFailures).map(([file, f]) => ({ file, ...f }));
   }
 
   function close() {
@@ -367,7 +697,10 @@ function createPackageIndex({ dir, enabled = true, maxPackageBytes = 4096 * 1024
     if (worker) { try { worker.terminate(); } catch (_) { /* ignore */ } worker = null; }
   }
 
-  return { get, enqueue, extractTo, status, close, cacheDir, previewDir, contentsCap: CONTENTS_CAP };
+  return {
+    get, enqueue, extractTo, extractMany, status, close, cacheDir, previewDir, contentsCap: CONTENTS_CAP,
+    enqueueGraph, getGraph, graphState, graphSummary, graphFailuresList, folderGraph, invalidateFolders,
+  };
 }
 
 module.exports = { createPackageIndex };

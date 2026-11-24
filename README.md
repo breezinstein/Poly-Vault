@@ -22,17 +22,27 @@ decisions taken along the way.
 | `server/server.js` | The web front door: auth, static UI, scan cache, downloads, proxy to the untouched bridge API |
 | `server/zipStream.js` | Zero-dependency streaming ZIP writer for "Download" (no temp files, works on a read-only rootfs) |
 | `server/web-shim.js` | Replaces Electron's `preload.js` (`window.assetVault`) in the browser |
+| `server/rigStatic.js` | Serves Mesh2Motion (built into the image) at `/rig/` behind the same sign-in, with its own CSP |
 | `server/thumbs.js` | WebP thumbnail cache (sharp), keyed by file+mtime+width |
 | `server/unityPackage.js`, `server/packageIndex.js`, `server/pkgWorker.js` | Reads `.unitypackage` archives: embedded previews, real content lists, type counts |
+| `server/tarWalk.js`, `server/unityYaml.js`, `server/unityGraph.js`, `server/xxhash64.js` | Link maps: one streaming pass per package keeps `.meta`/`.mat`/`.prefab`/`.unity` text and maps GUIDs, materials, prefabs and Unity's hashed sub-asset IDs |
+| `server/modelResolver.js`, `server/prefabResolver.js`, `server/fbxScan.js`, `server/colladaScan.js` | Which material each part of a model/prefab uses, in Unity's own order, and how close the browser can show it |
+| `server/modelService.js`, `server/textureConvert.js`, `server/fbx6.js`, `server/unityMesh.js`, `server/glbWriter.js` | `/api/model/*`: manifests, textures (TGA/PSD/BMP → WebP, packed metal/gloss → ORM), FBX 6 and Unity mesh assets → GLB |
+| `server/riggedStore.js`, `rig-bridge/pv-bridge.js` | Mesh2Motion "Save to vault" (Rigged library) and the in-page bridge that loads vault models into Mesh2Motion |
+| `server/fidelityReport.js`, `scripts/fidelity-report.sh` | Library-wide report: how many models look exactly as in Unity, and why the rest do not |
 | `server/metrics.js`, `server/audit.js` | Prometheus counters + JSONL audit trail |
 | `scripts/verify-phase2.sh` | 18 checks: gzip, ETag/304, thumbnails, audit, metrics, incremental scan |
 | `scripts/verify-phase3.sh` | 25 checks: downloads + per-artist import routing |
+| `scripts/ci-local.sh` | Runs every acceptance suite against a throwaway container on :18080 (never the live one) |
+| `scripts/m2m-rebase.sh` | Re-roots the Mesh2Motion build under `/rig/` (Dockerfile stage `rig`) |
+| `docs/PLAN-3D-PIPELINE.md` | Plan for Mesh2Motion integration and model/material display |
 | `scripts/verify-ui.sh` | 12 browser checks in headless Chromium (sign-in → tag → download → 304 polling) |
 | `scripts/build-plugin.sh` | Builds `dist/PolyVault-Unity-<ver>.tgz/.zip` from the patched source |
 | `scripts/make-fixture-library.sh` | Generates a throwaway library with real PNG previews |
 | `scripts/fetch-webgl.sh` | Vendors the three.js viewers into `ui/webgl/vendor/` (also run by the Dockerfile) |
 | `scripts/backup.sh`, `scripts/restore.sh` | Metadata volume backup + rehearsable restore |
 | `RUNBOOK.md` | Day-2 operations: upgrade, rollback, rotation, troubleshooting |
+| `docs/ROADMAP.md` | Planned next work: store metadata, file metadata, search syntax, dependency graph, duplicate audit, AI captions/embeddings |
 | `deploy/Caddyfile.example` | TLS + SSO/basic-auth reverse proxy in front of the container |
 
 Upstream `src/main/index.js` (Electron main) and `src/preload.js` are **not used**.
@@ -49,34 +59,30 @@ open http://127.0.0.1:8080    # sign in with PV_TOKEN
 
 ### Asset storage: NFS (Unity Asset Store cache) or a local path
 
-The shipped `docker-compose.yml` points at the NAS export that holds the Unity
-Asset Store cache:
+`docker-compose.yml` mounts a local folder (`PV_ASSETS`, default
+`/srv/assets`) and needs no NAS settings. To mount the libraries straight
+from NFS exports, add `docker-compose.nas.yml` on top of it, in `.env`:
 
-```yaml
-volumes:
-  - ./data:/data
-  - nas_unity_assets:/assets:ro
-
-volumes:
-  nas_unity_assets:
-    driver_opts:
-      type: nfs
-      o: "addr=${PV_NFS_ADDR:?set PV_NFS_ADDR},nolock,soft,ro,actimeo=60"
-      device: ":/export/unity-assets"
+```bash
+COMPOSE_FILE=docker-compose.yml:docker-compose.nas.yml
+PV_NFS_ADDR=nas.example.internal
+PV_NFS_EXPORT=/export/unity-assets          # Asset Store cache -> /assets
+PV_NFS_EXPORT_2=/export/second-library      # -> /libraries/$PV_LIBRARY_2_NAME
+PV_NFS_EXPORT_RIGGED=/export/rigged         # writable -> /libraries/Rigged
+PV_LIBRARY_2_NAME=Second Library
 ```
+
+The NAS file replaces the `/assets` bind mount with the NFS volume and, unless
+`PV_LIBRARIES` / `PV_RIGGED_DIR` are set, registers all three libraries and
+enables "Save to vault".
 
 Why those mount options: `nolock` (no lockd needed, read-only), `soft` (a dead
 NAS returns `EIO` instead of hanging the container), `ro` (defence in depth — the
 container never writes), `actimeo=60` (the scanner stats every file; without
 attribute caching each stat is a network round trip).
 
-For a local library, comment the NFS line and use:
-
-```yaml
-volumes:
-  - ./data:/data
-  - /srv/assets:/assets:ro      # /srv/assets/<folder> becomes a library
-```
+For a local library, keep the base file and set `PV_ASSETS` (and optionally
+`PV_ASSETS_2`, `PV_RIGGED`; see the commented mounts in `docker-compose.yml`).
 
 ### Package intelligence: thumbnails and contents from the archives
 
@@ -88,6 +94,14 @@ exploits). Poly Vault reads that archive directly, so package cards get:
 - **a real thumbnail** — extracted from the archive, no Asset Store request;
 - **honest type counts** — e.g. "240 meshes, 239 prefabs, 10 animations";
 - **a "What's inside" list** — the largest files with their project paths.
+  Packages too big for the full contents pass get their complete file list and
+  counts from the link map, which reads every entry's path (sizes are shown
+  only where the contents pass saw them).
+
+Loose asset folders (a Unity project's `Assets`, a hand-made pack with `.meta`
+files) open the same way: clicking one lists its files (`.meta` sidecars
+hidden), and its models, prefabs and Unity mesh assets open in 3D with
+materials resolved across sibling folders (`Meshes/` → `Materials/`).
 
 Everything is streamed, cached per `(path, mtime, size)` under `/data/packages`,
 and parsed on a worker thread so a 12 GB package never stalls the API.
@@ -156,6 +170,17 @@ docker volume create poly-vault-data   # then use  poly-vault-data:/data
 | `PV_ENRICH_ROOTS` | *(empty)* | Only run Asset Store lookups for assets under these paths. |
 | `PV_PACKAGE_INDEX` | `1` | Read `.unitypackage` archives for previews/contents. `0` disables (cards keep letter avatars, instant). |
 | `PV_PACKAGE_INDEX_MAX_MB` | `4096` | Packages larger than this only get the fast preview pass (no full content listing). |
+| `PV_PACKAGE_GRAPH` | `1` | Build a link map (materials, textures, prefabs, importer settings) for every package in the background. `0` disables it and the material-aware viewer; opening a model then answers `503` with the reason. |
+| `PV_GRAPH_TIMEOUT_MS` | `1800000` | Per-package time limit for building a link map. |
+| `PV_FOLDER_GRAPH_BUDGET_MS` | `60000` | Time limit for mapping a loose asset folder; past it the map is partial and the viewer says so. |
+| `PV_TEXTURE_CACHE_MAX_FILES` | `20000` | Converted textures kept in `/data/packages/textures` (WebP, least recently used dropped first). |
+| `PV_MODEL_MAX_MB` | `256` | Largest model file the viewer reads, inspects or converts (on a worker thread). |
+| `PV_MODEL_TIMEOUT_S` | `120` | Longest one model may take on the model worker; past it the worker restarts, that request fails, and the file is skipped until it changes or a manifest is requested with `refresh=1` (see `/healthz` → `models`). |
+| `PV_PREFAB_BUDGET_S` | `180` | Longest a prefab's manifest spends reading its model files (it also stops after two timeouts); models not read are shown as missing, with a note. |
+| `PV_CONVERTED_CACHE_MAX_FILES` | `5000` | Converted GLBs (FBX 6, Unity mesh assets) kept in `/data/packages/converted`. |
+| `PV_EXTRACT_CACHE_MAX_MB` | `24576` (24 GB) | Size cap for files extracted from packages (`/data/packages/extracted`); least recently used packages are dropped first, hourly. |
+| `PV_RIGGED_DIR` | *(empty)* | Writable library for Mesh2Motion's "Save to vault"; must also be listed in `PV_LIBRARIES`. Empty disables saving. |
+| `PV_RIGGED_MAX_BYTES` | `268435456` | Largest rigged file accepted by "Save to vault" (`413` above it). |
 | `ASSETVAULT_NO_ENRICH` | `0` | `1` disables outbound Unity Asset Store lookups. |
 
 ## Endpoints
@@ -173,6 +198,13 @@ docker volume create poly-vault-data   # then use  poly-vault-data:/data
 | `GET /api/download?path=…` | yes | Streams a ZIP of an asset folder. Powers the "Download" button and needs no temp space. |
 | `GET /api/thumb?path=…&w=320` | yes | Resized WebP from the thumbnail cache; falls back to the original preview if sharp cannot decode it. Also serves previews extracted from packages (`/data/packages/previews`). |
 | `GET|PUT /api/library`, `/api/tags`, `/api/meta`, `/api/preview`, `/api/import-*`, `/api/unity/*`, `/api/update`, `/api/enrichment` | yes | Upstream bridge API, proxied same-origin. Identity headers (`X-PV-User`, `X-PV-Artist`) are injected by the front door and never trusted from the client. |
+| `GET /api/package/graph?path=…` | yes | Link-map status/summary of a package or loose Unity folder (`202` + queue position while it builds). |
+| `GET /api/model/manifest?path=…&entry=…` | yes | How Unity shows a model or prefab: materials per part, texture URLs, fidelity, notes. |
+| `GET /api/model/texture?path=…&key=…&w=…` | yes | One texture converted to WebP (keys are validated against the package). |
+| `GET /api/model/converted?path=…&entry=…` | yes | FBX 6 model or Unity mesh asset (`.asset`) converted to GLB. |
+| `POST /api/web/rigged?name=…` (+ `/preview?folder=…`) | yes | Mesh2Motion "Save to vault": FBX/GLB (magic-checked, size-capped) into the Rigged library. |
+| `GET /api/web/report` | yes | Latest 3D fidelity report summary. |
+| `GET /rig/…` | yes | Mesh2Motion (static build) with its own CSP. |
 | `/__diag` | — | Disabled (404). It drives the Electron renderer and has no place in a shared service. |
 
 ## Performance
@@ -238,6 +270,58 @@ nothing is loaded from a CDN, the strict CSP holds, and it works offline.
 | Server default | `PV_WEBGL=0` disables it deployment-wide (the toggle hides, models show Unity's thumbnail) |
 | Fallback | unsupported file, parse error or disabled → Unity's stored preview image |
 
+## Models with their Unity materials, and Mesh2Motion
+
+Opening a model or prefab (inside a package or a loose Unity folder) shows it
+**the way Unity does**: the server reads the package's own wiring — material
+remaps in the `.meta`, prefab and scene renderers, Unity's material search
+rules, materials embedded in the FBX — and serves the textures converted for
+the browser. A badge says how close that is:
+
+| Badge | Means |
+| --- | --- |
+| **Matches Unity** | every part's material came from Unity's own rules, with a shader we translate one-to-one (Standard, URP, HDRP, legacy built-ins) |
+| **Close to Unity** | at least one part was approximated: custom shader (texture slots matched by name), Unity 4 binary material, renamed texture, override we could not place |
+| **Materials not found** | nothing could be resolved |
+| **No meshes** | animation-only or rig-only file |
+
+`details` lists every part with its material, where it came from and why.
+
+How it works (full design and measurements: [`docs/PLAN-3D-PIPELINE.md`](docs/PLAN-3D-PIPELINE.md)):
+
+- **Link maps.** Every package is streamed once in the background; small text
+  entries (`.meta`, `.mat`, `.prefab`, `.unity`) are parsed and stored in
+  `/data/packages/graph`. Progress: Settings → *This server*, or `/healthz` →
+  `packages.graph`.
+- **One read per model.** Opening a model extracts it and the textures it is
+  likely to need in a single pass over the archive (a second only when the
+  model itself names more textures). Results are cached.
+- **Formats.** FBX 7 (binary/ASCII), OBJ, Collada (`.dae`), GLB/glTF directly;
+  FBX 6 (2006–2010, common in Unity 4-era packs) is converted to GLB on the
+  server (static: no skinning/animation). Unity mesh assets (`.asset` files
+  that prefabs use instead of FBX, e.g. some environment packs) are
+  converted to GLB too, one material slot per submesh. Textures: PNG, JPG, TGA, PSD (with a composite), TIF,
+  BMP, GIF, WebP.
+- **Prefabs** are assembled: hierarchy, transforms, meshes (Unity's hashed
+  mesh IDs, FBX/Collada/mesh assets), LOD0, Unity's built-in shapes, nested
+  prefabs (4 levels) and model instances. Materials can be `.mat` files or
+  materials embedded in another model file (found by Unity's hashed IDs).
+
+**Mesh2Motion** is built into the image and served at `/rig/` behind the same
+sign-in. In the viewer, *Rig in Mesh2Motion* (static models → Create) or
+*Animate in Mesh2Motion* (rigged models → Retarget) opens it in a new tab with
+the model — textures included — already loaded. Mesh2Motion gains a **Save to
+vault** button: the export (FBX with the Unity preset by default) lands in the
+**Rigged** library as its own card, tagged `rigged`, with a description naming
+the source package, ready for *Import to Unity* or another round in
+Mesh2Motion.
+
+Quality across the whole library: `./scripts/fidelity-report.sh`, then
+Settings → *3D fidelity* (or `/data/reports/fidelity-latest.md`). It covers
+every package and every loose asset folder; `--only "<path>"` limits it to
+one library (written to `fidelity-only-latest.md`, the library-wide report is
+left alone).
+
 ## What's inside a .unitypackage (previews + contents)
 
 Unity's Asset Store cache contains no preview images, so 600+ packages would show
@@ -256,7 +340,7 @@ How it stays cheap on a 100 GB NFS library:
 
 | Constraint | Handling |
 | --- | --- |
-| Packages from 10 KB to 12.6 GB | Pass 1 stops at the first usable preview (usually < 10 MB read); pass 2 (accurate contents) only for packages ≤ `PV_PACKAGE_INDEX_MAX_MB` |
+| Packages from 10 KB to 12.6 GB | Pass 1 stops at the first usable preview (usually < 10 MB read); pass 2 (accurate contents) only for packages ≤ `PV_PACKAGE_INDEX_MAX_MB`; when a pass stops at its byte budget, the link map (which reads every header) fills in the full list and counts |
 | Must not block the UI | Parsing runs in a worker thread (`server/pkgWorker.js`), one package at a time |
 | Must not re-read 100 GB on restart | Cached per `(path, mtime, size)` in `/data/packages` (17.8 MB for 632 packages), so a restart resumes |
 | Must not blow up the poll payload | Cards carry the 12 largest entries; the full list stays on disk |

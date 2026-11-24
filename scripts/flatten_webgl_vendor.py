@@ -52,9 +52,16 @@ def main() -> int:
     out = pathlib.Path(sys.argv[1])
     examples = pathlib.Path(sys.argv[2])
 
-    for _ in range(10):
-        if not any(rewrite(path, examples, out) for path in list(out.glob("*.js"))):
+    # Rewrite every file each round (a list, not any(): any() stops at the
+    # first file it rewrites); repeat until newly copied modules are done too.
+    for _ in range(20):
+        if not [path for path in list(out.glob("*.js")) if rewrite(path, examples, out)]:
             break
+
+    bare = sorted({path.name for path in out.glob("*.js") if re.search(r"from ['\"](three|fflate)['\"]", path.read_text())})
+    if bare:
+        print("bare imports left in:", ", ".join(bare))
+        return 1
 
     remaining = sorted({
         m.group(0)

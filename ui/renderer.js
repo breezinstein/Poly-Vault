@@ -509,7 +509,7 @@ function renderTreeRow(node, libId, parent, depth) {
 
   // A .unitypackage is browsable like a folder: its entries are read from the
   // archive index on first expand (they are far too big to ship with each poll).
-  const isPackage = node.type === 'asset' && node.asset && node.asset.packageFile;
+  const isPackage = node.type === 'asset' && isBrowsable(node.asset);
   const pkgKey = nodeKey(libId, node.rel);
 
   if (node.type === 'container') {
@@ -604,6 +604,13 @@ const IMAGE_ENTRY_EXT = /^(png|jpe?g|webp|gif|bmp|tga|psd|tiff?|exr|hdr)$/i;
 const AUDIO_ENTRY_EXT = /^(wav|mp3|ogg|aiff?|flac|xm|mod|it|s3m)$/i;
 const VIDEO_ENTRY_EXT = /^(mp4|mov|avi|webm|m4v|mpe?g)$/i;
 const MODEL_ENTRY_EXT = /^(fbx|obj|glb|gltf|blend|dae|3ds|dxf|stl|ply)$/i;
+// Unity mesh assets: shown in 3D when the .asset really holds a mesh.
+const MESH_ASSET_EXT = /^asset$/i;
+
+// Packages and loose asset folders both open as a file list in the main pane.
+function isBrowsable(a) {
+  return Boolean(a && (a.packageFile || a.browsable));
+}
 
 function entryExt(entry) {
   const m = /\.([A-Za-z0-9]+)$/.exec(entry.path || '');
@@ -635,7 +642,10 @@ function createPackageEntryCard(entry, pkgAsset, index) {
   card.style.animationDelay = `${Math.min((index % 12) * 16, 180)}ms`;
 
   const thumb = el('div', 'thumb');
-  if (IMAGE_ENTRY_EXT.test(ext) || MODEL_ENTRY_EXT.test(ext) || VIDEO_ENTRY_EXT.test(ext)) {
+  // Loose folders carry no Unity previews (those live in a project's Library
+  // folder), so only their images get a thumbnail.
+  const hasStoredPreview = pkgAsset.packageFile && (MODEL_ENTRY_EXT.test(ext) || VIDEO_ENTRY_EXT.test(ext));
+  if (IMAGE_ENTRY_EXT.test(ext) || hasStoredPreview) {
     const img = el('img');
     img.loading = 'lazy';
     img.src = entryPreviewUrl(pkgAsset, entry);
@@ -654,7 +664,7 @@ function createPackageEntryCard(entry, pkgAsset, index) {
   const body = el('div', 'card-body');
   body.appendChild(el('div', 'card-name', entry.name));
   body.appendChild(el('div', 'card-meta',
-    `${entry.dir ? entry.dir.split('/').pop() + '/' : ''}${fmtBytes(entry.size || 0)}`));
+    `${entry.dir ? entry.dir.split('/').pop() + '/' : ''}${entry.size == null ? '' : fmtBytes(entry.size)}`));
   card.appendChild(body);
 
   card.addEventListener('click', () => selectPackageEntry(pkgAsset, entry));
@@ -688,7 +698,7 @@ function buildEntryPreview(pkgAsset, entry) {
 
   const head = el('div', 'entry-preview-head');
   head.appendChild(el('span', 'entry-preview-name', entry.name));
-  head.appendChild(el('span', 'entry-preview-meta', `${fmtBytes(entry.size || 0)} \u00B7 ${entry.dir || 'package root'}`));
+  head.appendChild(el('span', 'entry-preview-meta', `${entry.size == null ? '' : `${fmtBytes(entry.size)} \u00B7 `}${entry.dir || 'package root'}`));
   box.appendChild(head);
 
   const stage = el('div', 'entry-preview-stage');
@@ -712,21 +722,44 @@ function buildEntryPreview(pkgAsset, entry) {
     video.preload = 'none';
     video.src = entryFileUrl(pkgAsset, entry);
     stage.appendChild(video);
-  } else if (MODEL_ENTRY_EXT.test(ext)) {
+  } else if (MODEL_ENTRY_EXT.test(ext)
+    || ((/^prefab$/i.test(ext) || MESH_ASSET_EXT.test(ext)) && window.pv3d && window.pv3d.mountUnity)) {
     if (webglEnabled()) {
       const canvasBox = el('div', 'entry-webgl');
       stage.appendChild(canvasBox);
-      const note = el('div', 'entry-preview-note', 'Unity\u2019s stored preview is shown while the 3D viewer loads.');
+      const note = el('div', 'entry-preview-note', 'Loading the model with its Unity materials\u2026');
       stage.appendChild(note);
       // Turn off 3D from Settings and the next render falls back to the image.
-      window.pv3d.mount(canvasBox, entryFileUrl(pkgAsset, entry), entry.name)
+      // mountUnity applies the package's materials/textures; older servers
+      // without it fall back to the bare model.
+      const unityOnly = MESH_ASSET_EXT.test(ext) || /^prefab$/i.test(ext);
+      const mountIt = window.pv3d.mountUnity
+        ? window.pv3d.mountUnity(canvasBox, { path: pkgAsset.folder, entry: entry.path, name: entry.name })
+          .catch((err) => (unityOnly ? Promise.reject(err) : window.pv3d.mount(canvasBox, entryFileUrl(pkgAsset, entry), entry.name)))
+        : window.pv3d.mount(canvasBox, entryFileUrl(pkgAsset, entry), entry.name);
+      mountIt
         .then((viewer) => {
           activeViewer = viewer;
-          note.textContent = `${viewer.triangles.toLocaleString()} triangles \u00B7 drag to orbit, scroll to zoom`;
+          if (viewer.unviewable) { note.textContent = `${viewer.unviewable}. Import the file to open it in the editor.`; return; }
+          const anim = viewer.clips ? ` \u00B7 ${viewer.clips} animation${viewer.clips > 1 ? 's' : ''}` : '';
+          note.textContent = `${viewer.triangles.toLocaleString()} triangles${anim} \u00B7 drag to orbit, scroll to zoom`;
+          document.dispatchEvent(new CustomEvent('pv:model-ready', { detail: { viewer, pkgAsset, entry } }));
         })
-        .catch(() => {
+        .catch((err) => {
           canvasBox.remove();
           note.remove();
+          if (MESH_ASSET_EXT.test(ext)) {
+            const why = String((err && err.message) || '');
+            stage.appendChild(el('div', 'entry-preview-note', /not a mesh|no meshes/i.test(why)
+              ? 'This .asset file holds other Unity data, not a mesh, so there is nothing to show in 3D.'
+              : `This mesh could not be shown${why ? `: ${why}` : '.'}`));
+            return;
+          }
+          if (!pkgAsset.packageFile) {
+            stage.appendChild(el('div', 'entry-preview-note',
+              'This model could not be previewed. Import the file to inspect it in the editor.'));
+            return;
+          }
           const img = el('img', 'entry-preview-image');
           img.src = entryPreviewUrl(pkgAsset, entry);
           img.alt = entry.name;
@@ -736,6 +769,9 @@ function buildEntryPreview(pkgAsset, entry) {
           stage.appendChild(el('div', 'entry-preview-note',
             '3D preview unavailable for this file \u2014 showing Unity\u2019s stored preview.'));
         });
+    } else if (!pkgAsset.packageFile) {
+      stage.appendChild(el('div', 'entry-preview-note',
+        'Enable 3D preview in Settings to view this model, or import the file.'));
     } else {
       // 3D preview disabled: show Unity's own render of the asset.
       const img = el('img', 'entry-preview-image');
@@ -1128,8 +1164,8 @@ function createCard(a, i) {
   card.addEventListener('click', () => {
     state.selectedAssetId = a.id;
     state.detail = { kind: 'asset', libId: a._libId, assetId: a.id };
-    if (a.packageFile) {
-      // A package opens like a folder: main pane lists what is inside.
+    if (isBrowsable(a)) {
+      // A package (or asset folder) opens like a folder: main pane lists what is inside.
       loadPackageTree(a);
       refresh();
       return;
@@ -1147,7 +1183,7 @@ function activePackageAsset() {
   if (!state.detail) return null;
   if (state.detail.kind === 'asset') {
     const a = findAssetById(state.detail.assetId);
-    return a && a.packageFile ? a : null;
+    return isBrowsable(a) ? a : null;
   }
   if (state.detail.kind === 'packageEntry' && state.detail.pkgAsset) return state.detail.pkgAsset;
   if (state.detail.kind === 'package' && state.detail.pkgAsset) return state.detail.pkgAsset;
@@ -1266,7 +1302,7 @@ function detailTarget() {
       entry: state.detail.entry,
       node: state.detail.node,
       pkgAsset: state.detail.pkgAsset,
-      label: 'Package file',
+      label: state.detail.pkgAsset && !state.detail.pkgAsset.packageFile ? 'File' : 'Package file',
     };
   }
   if (state.detail && state.detail.kind === 'container') {
@@ -1663,7 +1699,7 @@ function renderAssetDetail(content, asset) {
           const kind = (name.split('.').pop() || '').toLowerCase();
           li.appendChild(el('span', 'content-kind', kind));
           li.appendChild(el('span', 'content-path', item.path));
-          li.appendChild(el('span', 'content-size', fmtBytes(item.size || 0)));
+          li.appendChild(el('span', 'content-size', item.size == null ? '' : fmtBytes(item.size)));
           li.title = item.path;
           list.appendChild(li);
         }
@@ -1713,6 +1749,25 @@ function renderAssetDetail(content, asset) {
   btn.addEventListener('click', () => sendImportJob(asset));
   content.appendChild(btn);
 
+  // Models in a folder asset (e.g. the Rigged library) open in Mesh2Motion:
+  // rigged ones in Retarget (animate), others in Create (rig).
+  const modelFile = (asset.importables || []).find((f) => /\.(fbx|glb)$/i.test(f.name || f.path || ''));
+  if (modelFile && !asset.packageFile) {
+    const rigged = (asset.tags || []).includes('rigged');
+    const m2m = el('button', 'm2m-btn', rigged ? 'Animate in Mesh2Motion' : 'Rig in Mesh2Motion',
+      rigged ? 'Open this rigged model in Mesh2Motion to preview and retarget animations' : 'Open this model in Mesh2Motion to rig it');
+    m2m.addEventListener('click', () => {
+      const q = new URLSearchParams({
+        pv: 'url',
+        model: `/api/file?path=${encodeURIComponent(modelFile.path)}`,
+        name: modelFile.name || modelFile.path.split('/').pop(),
+        src: asset.path || '',
+      });
+      window.open(`/rig/${rigged ? 'retarget/' : 'create.html'}?${q}`, '_blank');
+    });
+    content.appendChild(m2m);
+  }
+
   if (job && (job.status === 'pending' || job.status === 'processing')) {
     const cancelBtn = el('button', 'job-cancel-btn', 'Cancel import request', 'Cancel this in-flight import request');
     cancelBtn.addEventListener('click', async () => {
@@ -1761,12 +1816,13 @@ function renderPackageEntryDetail(content, target) {
   const base = entry.split('/').pop();
 
   content.appendChild(el('h2', '', base));
-  content.appendChild(el('div', 'sub', `${entry} \u00B7 ${fmtBytes(node.size)} \u00B7 ${node.kind}`));
+  content.appendChild(el('div', 'sub', `${entry}${node.size == null ? '' : ` \u00B7 ${fmtBytes(node.size)}`} \u00B7 ${node.kind}`));
 
+  const inFolder = !pkgAsset.packageFile;
   content.appendChild(buildMetaGrid([
-    ['Package', pkgAsset.name],
+    [inFolder ? 'Folder' : 'Package', pkgAsset.name],
     ['Inside', entry.split('/').slice(0, -1).join('/') || '/'],
-    ['Size', fmtBytes(node.size || 0)],
+    ['Size', node.size == null ? 'not listed (large package)' : fmtBytes(node.size)],
     ['Type', node.kind],
   ]));
 
@@ -1779,14 +1835,17 @@ function renderPackageEntryDetail(content, target) {
   btn.addEventListener('click', () => sendPackageEntryJob(pkgAsset, entry, node));
   content.appendChild(btn);
 
-  const whole = el('button', 'job-cancel-btn', 'Import the whole package instead', 'Queue the package as one import');
+  const whole = el('button', 'job-cancel-btn', inFolder ? 'Import the whole folder instead' : 'Import the whole package instead',
+    inFolder ? 'Queue the folder as one import' : 'Queue the package as one import');
   whole.addEventListener('click', () => sendImportJob(pkgAsset));
   content.appendChild(whole);
 
   content.appendChild(el('div', 'detail-section-title', 'Notes'));
-  content.appendChild(el('div', 'contents-note',
-    'Extracted from the package on demand. Models, textures, audio, fonts and scripts import cleanly on their own; '
-    + 'prefabs/materials may need the whole package for their dependencies.'));
+  content.appendChild(el('div', 'contents-note', inFolder
+    ? 'Models, textures, audio, fonts and scripts import cleanly on their own; '
+      + 'prefabs/materials may need the whole folder for their dependencies.'
+    : 'Extracted from the package on demand. Models, textures, audio, fonts and scripts import cleanly on their own; '
+      + 'prefabs/materials may need the whole package for their dependencies.'));
 }
 
 async function sendPackageEntryJob(pkgAsset, entry, node) {
@@ -1802,8 +1861,9 @@ async function sendPackageEntryJob(pkgAsset, entry, node) {
       name: entry.split('/').pop(),
       // Older add-ons ignore `entry` and only use `path`, so the same file is
       // addressed as "<package>#<entry>" for them and via `entry` for 0.6.0+.
-      path: `${pkgAsset.folder}#${entry}`,
-      entry,
+      ...(pkgAsset.packageFile
+        ? { path: `${pkgAsset.folder}#${entry}`, entry }
+        : { path: `${pkgAsset.folder}/${entry}` }),
       rel: entry,
       kind: node.kind,
     }],

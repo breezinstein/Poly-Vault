@@ -1,0 +1,51 @@
+# NAS variant: the libraries come straight from NFS exports instead of local
+# folders. Use it on top of docker-compose.yml, e.g. in .env:
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.nas.yml
+#   PV_NFS_ADDR=nas.example.internal
+#   PV_NFS_EXPORT=/export/unity-assets          # Asset Store cache -> /assets
+#   PV_NFS_EXPORT_2=/export/second-library      # -> /libraries/$PV_LIBRARY_2_NAME
+#   PV_NFS_EXPORT_RIGGED=/export/rigged         # writable -> /libraries/Rigged
+#   PV_LIBRARY_2_NAME=Second Library            # name shown in the UI
+#
+# Values may contain spaces; no quotes needed in .env.
+services:
+  poly-vault:
+    environment:
+      PV_LIBRARIES: "${PV_LIBRARIES:-/assets:/libraries/${PV_LIBRARY_2_NAME:-Second Library}:/libraries/Rigged}"
+      PV_RIGGED_DIR: "${PV_RIGGED_DIR:-/libraries/Rigged}"
+    volumes:
+      # Same container path as the base file's bind mount, so this replaces it.
+      - nas_unity_assets:/assets:ro
+      - "nas_library_2:/libraries/${PV_LIBRARY_2_NAME:-Second Library}:ro"
+      - nas_rigged:/libraries/Rigged
+
+volumes:
+  #   o= options
+  #     nolock        no rpc.statd/lockd needed; the mounts are read-only
+  #     soft          a dead NAS returns EIO instead of hanging the container
+  #     ro            defence in depth: the volume itself cannot be written
+  #     actimeo=60    cache NFS attributes; the scanner stats every file, and
+  #                   without this each stat is a network round trip
+  #   device: ':<export path>'   (note the leading colon)
+  nas_unity_assets:
+    driver_opts:
+      type: nfs
+      o: "addr=${PV_NFS_ADDR:?set PV_NFS_ADDR in .env},nolock,soft,ro,actimeo=60"
+      device: ":${PV_NFS_EXPORT:?set PV_NFS_EXPORT in .env}"
+
+  # A second library (loose folders + .unitypackage files).
+  nas_library_2:
+    driver_opts:
+      type: nfs
+      o: "addr=${PV_NFS_ADDR:?set PV_NFS_ADDR in .env},nolock,soft,ro,actimeo=60"
+      device: ":${PV_NFS_EXPORT_2:?set PV_NFS_EXPORT_2 in .env}"
+
+  # Rigged models saved from Mesh2Motion. Read-write, and `hard` rather than
+  # `soft`: a soft mount can return EIO mid-write and leave a truncated file;
+  # hard retries until the NAS answers (writes are small and rare).
+  nas_rigged:
+    driver_opts:
+      type: nfs
+      o: "addr=${PV_NFS_ADDR:?set PV_NFS_ADDR in .env},nolock,hard,rw,actimeo=60"
+      device: ":${PV_NFS_EXPORT_RIGGED:?set PV_NFS_EXPORT_RIGGED in .env}"
