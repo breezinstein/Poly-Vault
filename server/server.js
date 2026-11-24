@@ -194,6 +194,7 @@ const packageIndex = createPackageIndex({
   // Link maps (materials/prefabs/importer settings) for every package.
   graphEnabled: env.PV_PACKAGE_GRAPH !== '0',
   graphTimeoutMs: Number(env.PV_GRAPH_TIMEOUT_MS || 30 * 60 * 1000),
+  folderGraphBudgetMs: Number(env.PV_FOLDER_GRAPH_BUDGET_MS || 60000),
 });
 
 // A library changed on disk outside the watcher's view (NFS): rescan it.
@@ -305,6 +306,7 @@ const modelService = createModelService({
   maxTextureFiles: Number(env.PV_TEXTURE_CACHE_MAX_FILES || 20000),
   maxModelBytes: Number(env.PV_MODEL_MAX_MB || 256) * 1024 * 1024,
   maxConvertedFiles: Number(env.PV_CONVERTED_CACHE_MAX_FILES || 5000),
+  workerTimeoutMs: Number(env.PV_MODEL_TIMEOUT_S || 120) * 1000,
 });
 
 const enrichment = createEnrichment({
@@ -785,8 +787,10 @@ function entryCachePath(pkgReal, stat, entryPath) {
 // packages/extracted holds files pulled out of packages (models, textures,
 // single-file downloads), one folder per package version. It is a cache:
 // keep it under PV_EXTRACT_CACHE_MAX_MB by dropping the least recently used
-// package folders first.
+// package folders first. Folders used in the last EXTRACT_PIN_MS are kept even
+// over the limit: a request may be between extracting and reading them.
 const EXTRACT_CACHE_MAX_BYTES = Number(env.PV_EXTRACT_CACHE_MAX_MB || 24576) * 1024 * 1024;
+const EXTRACT_PIN_MS = 15 * 60 * 1000;
 const extractPruneStats = { runs: 0, removedDirs: 0, removedBytes: 0, bytes: 0, maxBytes: EXTRACT_CACHE_MAX_BYTES, lastAt: '' };
 let extractPruneRunning = false;
 async function pruneExtractedCache() {
@@ -814,6 +818,7 @@ async function pruneExtractedCache() {
     dirs.sort((a, b) => a.used - b.used);
     for (const d of dirs) {
       if (total <= EXTRACT_CACHE_MAX_BYTES) break;
+      if (Date.now() - d.used < EXTRACT_PIN_MS) continue;
       await fs.promises.rm(d.dir, { recursive: true, force: true });
       total -= d.bytes;
       extractPruneStats.removedDirs += 1;
@@ -1064,6 +1069,7 @@ const server = http.createServer(async (req, res) => {
       } : null,
       packages: packageIndex.status(),
       extractedCache: extractPruneStats,
+      models: modelService.stats(),
       thumbs: {
         available: thumbs.isAvailable(),
         generated: thumbs.stats.generated,
@@ -1273,7 +1279,13 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 202, { ok: false, path: real, ...packageIndex.graphState(real, stat.mtimeMs, stat.size) });
       return;
     }
-    sendJson(res, 200, { ok: true, path: real, state: 'ready', summary: packageIndex.graphSummary(graph), errors: graph.errors });
+    // A partial map is used, and rebuilt in the background when that is due.
+    if (graph.complete === false) packageIndex.enqueueGraph(real, stat.mtimeMs, stat.size);
+    const st = packageIndex.graphState(real, stat.mtimeMs, stat.size);
+    sendJson(res, 200, {
+      ok: true, path: real, state: 'ready', summary: packageIndex.graphSummary(graph), errors: graph.errors,
+      ...(st.partial ? { partial: st.partial, attempts: st.attempts, retrying: st.retrying } : {}),
+    });
     return;
   }
   if (route === '/api/package/graph-failures') {
@@ -1299,7 +1311,11 @@ const server = http.createServer(async (req, res) => {
     const result = await modelService.converted(url.searchParams.get('path'), url.searchParams.get('entry'));
     if (result.error) { sendJson(res, result.error, { ok: false, error: result.message }); return; }
     const st = fs.statSync(result.file);
-    res.writeHead(200, { 'Content-Type': 'model/gltf-binary', 'Content-Length': st.size, 'Cache-Control': 'private, max-age=86400' });
+    // The URL names the source, not its version: revalidate every time (the
+    // ETag is the converted file, which changes when the source does).
+    const etag = `W/"c-${path.basename(result.file, '.glb').slice(0, 16)}"`;
+    if (req.headers['if-none-match'] === etag) { res.writeHead(304, { ETag: etag }); res.end(); return; }
+    res.writeHead(200, { 'Content-Type': 'model/gltf-binary', 'Content-Length': st.size, 'Cache-Control': 'private, no-cache', ETag: etag });
     pipeline(fs.createReadStream(result.file), res, () => {});
     return;
   }
@@ -1313,7 +1329,8 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, {
       'Content-Type': 'image/webp',
       'Content-Length': st.size,
-      'Cache-Control': 'private, max-age=86400',
+      // Same URL after the texture is re-exported: revalidate (cheap 304s).
+      'Cache-Control': 'private, no-cache',
       ETag: etag,
     });
     pipeline(fs.createReadStream(result.file), res, () => {});

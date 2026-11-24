@@ -47,7 +47,8 @@ echo "==> unit tests (link map, material resolution, FBX, textures)"
 # The deps stage has sharp + ag-psd, so texture tests run for real.
 docker build -q --target deps -t poly-vault:ci-deps . >/dev/null
 for t in tests/*.test.js; do
-  docker run --rm -e NODE_PATH=/app/node_modules -v "$PWD":/w:ro -w /w poly-vault:ci-deps node "$t" | tail -1 || status_unit=1
+  # timeout: a reader stuck in a loop must fail the suite, not hang CI.
+  docker run --rm -e NODE_PATH=/app/node_modules -v "$PWD":/w:ro -w /w poly-vault:ci-deps timeout 300 node "$t" | tail -1 || status_unit=1
 done
 
 echo "==> fixture library"

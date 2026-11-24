@@ -38,7 +38,7 @@ const CONTENTS_CAP = MAX_CONTENTS;
 
 function createPackageIndex({
   dir, enabled = true, maxPackageBytes = 4096 * 1024 * 1024, onUpdate = null, log = console,
-  graphEnabled = true, graphTimeoutMs = 30 * 60 * 1000,
+  graphEnabled = true, graphTimeoutMs = 30 * 60 * 1000, folderGraphBudgetMs = 60000, partialRetryMs = 10 * 60 * 1000,
 }) {
   const cacheDir = path.join(dir, 'packages');
   const previewDir = path.join(cacheDir, 'previews');
@@ -121,7 +121,7 @@ function createPackageIndex({
   const graphCache = new Map();       // file -> parsed graph (small LRU)
   let graphActiveFile = '';
   let graphFailures = {};             // file -> { mtimeMs, size, error, count, at }
-  const graphStats = { built: 0, failed: 0, bytesRead: 0, lastFile: '', lastMs: 0 };
+  const graphStats = { built: 0, failed: 0, partial: 0, bytesRead: 0, lastFile: '', lastMs: 0 };
   const GRAPH_NAME = /^([0-9a-f]{40})-(\d+)-(\d+)-s(\d+)\.json$/;
   if (useGraph) {
     try {
@@ -142,6 +142,21 @@ function createPackageIndex({
   const graphFailed = (file, mtimeMs, size) => {
     const f = graphFailures[file];
     return f && Math.abs(f.mtimeMs - Math.trunc(mtimeMs)) <= 2 && f.size === size ? f : null;
+  };
+  // A map that was built but is incomplete because reading the archive failed
+  // or ran out of time (NFS error, file still being copied) is kept and used,
+  // but recorded here as `partial` and rebuilt later, up to 3 attempts with a
+  // growing wait. Deliberate limits (byte-budget) are not retried.
+  const RETRYABLE_PARTIAL = /^(archive-error|archive-truncated|time-budget|stopped)/;
+  const PARTIAL_RETRY_MS = partialRetryMs;
+  const graphPartial = (file, mtimeMs, size) => {
+    const f = graphFailed(file, mtimeMs, size);
+    return f && f.partial ? f : null;
+  };
+  const partialRetryDue = (file, mtimeMs, size) => {
+    const p = graphPartial(file, mtimeMs, size);
+    return Boolean(p && RETRYABLE_PARTIAL.test(p.error || '') && p.count < 3
+      && Date.now() - Date.parse(p.at || 0) >= PARTIAL_RETRY_MS * p.count);
   };
   const saveGraphFailures = () => {
     try { fs.writeFileSync(graphFailFile, JSON.stringify(graphFailures)); } catch (_) { /* best effort */ }
@@ -289,7 +304,7 @@ function createPackageIndex({
       return;
     }
     const mtime = Math.trunc(stat.mtimeMs);
-    if (graphFresh(job.file, mtime, stat.size)) return;
+    if (graphFresh(job.file, mtime, stat.size) && !(job.retry && partialRetryDue(job.file, mtime, stat.size))) return;
     graphActiveFile = job.file;
     const started = Date.now();
     const out = graphPath(job.file, mtime, stat.size);
@@ -312,7 +327,18 @@ function createPackageIndex({
     }
     graphIndex.set(key, { mtimeMs: mtime, size: stat.size, schema: GRAPH_SCHEMA, name: path.basename(out) });
     graphCache.delete(job.file);
-    if (graphFailures[job.file]) { delete graphFailures[job.file]; saveGraphFailures(); }
+    const summary = reply.summary || {};
+    if (summary.complete === false) {
+      const prev = graphPartial(job.file, mtime, stat.size);
+      graphFailures[job.file] = {
+        mtimeMs: mtime, size: stat.size, error: summary.truncated || 'incomplete', partial: true,
+        count: (prev ? prev.count : 0) + 1, at: new Date().toISOString(),
+      };
+      saveGraphFailures();
+      graphStats.partial += 1;
+      log.warn(`[poly-vault] link map for ${path.basename(job.file)} is partial (${summary.truncated || 'incomplete'})`
+        + `${RETRYABLE_PARTIAL.test(summary.truncated || '') ? `; attempt ${graphFailures[job.file].count} of 3` : ''}`);
+    } else if (graphFailures[job.file]) { delete graphFailures[job.file]; saveGraphFailures(); }
     graphStats.built += 1;
     fillFromGraph(job.file, mtime, stat.size);
     graphStats.bytesRead += (reply.summary && reply.summary.scannedBytes) || 0;
@@ -322,11 +348,12 @@ function createPackageIndex({
 
   function enqueueGraph(file, mtimeMs, size, opts = {}) {
     if (!useGraph || !file || !mtimeMs || !size) return false;
-    if (graphFresh(file, mtimeMs, size)) return false;
+    const retry = Boolean(graphFresh(file, mtimeMs, size));
+    if (retry && !partialRetryDue(file, mtimeMs, size)) return false;
     if (graphQueued.has(file) || graphActiveFile === file) return false;
     const failed = graphFailed(file, mtimeMs, size);
-    if (failed && failed.count >= 3 && !opts.force) return false;
-    const item = { file, size, mtimeMs: Math.trunc(mtimeMs) };
+    if (!retry && failed && failed.count >= 3 && !opts.force) return false;
+    const item = { file, size, mtimeMs: Math.trunc(mtimeMs), retry };
     // On-demand requests (someone opened a model) jump the background queue.
     if (opts.priority) graphQueue.unshift(item); else graphQueue.push(item);
     graphQueued.add(file);
@@ -339,8 +366,26 @@ function createPackageIndex({
   const FOLDER_TTL_MS = 10 * 60 * 1000;
   // A folder walk (one stat + read per .meta, over NFS) must not hold the
   // worker indefinitely: past this it stops and the graph says it is partial.
-  const FOLDER_TIME_BUDGET_MS = Number(process.env.PV_FOLDER_GRAPH_BUDGET_MS || 60000);
+  const FOLDER_TIME_BUDGET_MS = folderGraphBudgetMs;
   const folderInFlight = new Map();
+  // Every folder map on disk, by key: invalidation must reach maps the small
+  // graphCache LRU has evicted. Maps from before a restart are dropped at
+  // start-up (changes while the server was down went unseen).
+  const folderMaps = new Map();   // key -> { dir, shallow }
+  const FOLDER_MAPS_MAX = 5000;
+  if (useGraph) {
+    try { fs.rmSync(path.join(graphDir, 'folders'), { recursive: true, force: true }); } catch (_) { /* first run */ }
+  }
+  function noteFolderMap(key, dir, shallow) {
+    folderMaps.delete(key);
+    folderMaps.set(key, { dir, shallow });
+    while (folderMaps.size > FOLDER_MAPS_MAX) {
+      const [oldKey, old] = folderMaps.entries().next().value;
+      folderMaps.delete(oldKey);
+      graphCache.delete(oldKey);
+      fs.rmSync(folderOut(old.dir, old.shallow), { force: true });
+    }
+  }
   // `shallow`: only the folder's own files (used when a model sits directly
   // in a library root, so one click never maps a whole library).
   const folderKey = (dirPath, shallow) => `dir:${dirPath}${shallow ? '\u0000shallow' : ''}`;
@@ -358,6 +403,7 @@ function createPackageIndex({
         if (Date.now() - st.mtimeMs < FOLDER_TTL_MS) {
           const graph = JSON.parse(fs.readFileSync(out, 'utf8'));
           graphCache.set(key, { at: st.mtimeMs, graph, dir: dirPath, shallow });
+          noteFolderMap(key, dirPath, shallow);
           return Promise.resolve(graph);
         }
       } catch (_) { /* build it */ }
@@ -371,6 +417,7 @@ function createPackageIndex({
       try {
         const graph = JSON.parse(fs.readFileSync(out, 'utf8'));
         graphCache.set(key, { at: Date.now(), graph, dir: dirPath, shallow });
+        noteFolderMap(key, dirPath, shallow);
         if (graph.truncated) log.warn(`[poly-vault] folder link map for ${dirPath} is partial (${graph.truncated})`);
         resolve(graph);
       } catch (_) { resolve(null); }
@@ -393,8 +440,9 @@ function createPackageIndex({
       if (!changed.startsWith(dir + path.sep)) return false;
       return !shallow || path.dirname(changed) === dir;
     };
-    for (const [key, entry] of [...graphCache.entries()]) {
-      if (!key.startsWith('dir:') || !affected(entry.dir, entry.shallow)) continue;
+    for (const [key, entry] of [...folderMaps.entries()]) {
+      if (!affected(entry.dir, entry.shallow)) continue;
+      folderMaps.delete(key);
       graphCache.delete(key);
       // Synchronously: the next request must not read the stale file back.
       fs.rmSync(folderOut(entry.dir, entry.shallow), { force: true });
@@ -427,7 +475,10 @@ function createPackageIndex({
 
   function graphState(file, mtimeMs, size) {
     if (!useGraph) return { state: 'disabled' };
-    if (graphFresh(file, mtimeMs, size)) return { state: 'ready' };
+    if (graphFresh(file, mtimeMs, size)) {
+      const p = graphPartial(file, mtimeMs, size);
+      return p ? { state: 'ready', partial: p.error, attempts: p.count, retrying: RETRYABLE_PARTIAL.test(p.error) && p.count < 3 } : { state: 'ready' };
+    }
     if (graphActiveFile === file) return { state: 'building' };
     if (graphQueued.has(file)) return { state: 'queued', position: graphQueue.findIndex((j) => j.file === file) + 1 };
     const failed = graphFailed(file, mtimeMs, size);
@@ -624,9 +675,11 @@ function createPackageIndex({
         ready: graphIndex.size,
         queued: graphQueue.length,
         building: graphActiveFile ? path.basename(graphActiveFile) : '',
-        failed: Object.values(graphFailures).filter((f) => f.count >= 3).length,
+        failed: Object.values(graphFailures).filter((f) => !f.partial && f.count >= 3).length,
+        partial: Object.values(graphFailures).filter((f) => f.partial).length,
         builtThisRun: graphStats.built,
         failedThisRun: graphStats.failed,
+        partialThisRun: graphStats.partial,
         bytesRead: graphStats.bytesRead,
         lastFile: graphStats.lastFile,
         lastMs: graphStats.lastMs,

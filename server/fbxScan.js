@@ -9,6 +9,7 @@
 // offset, never decoded.
 
 const NAME_SEP = '\u0000\u0001';
+const MAX_DEPTH = 64;   // real files nest ~6 deep
 
 function cleanName(raw) {
   // binary: "name\0\1Class"; ascii / 6.x: "Class::name"
@@ -63,9 +64,15 @@ function readBinary(buf) {
   }
 
   // Returns [node|null, nextOffset]; children only parsed when `deep`.
-  function readNode(off, deep) {
+  // Every record must end after it starts and inside its parent: a corrupt or
+  // crafted file must fail here, never loop (offsets that point backwards or
+  // at themselves would otherwise spin or allocate forever).
+  function readNode(off, deep, limit = buf.length, depth = 0) {
+    if (off + headerSize > limit) throw new Error(`FBX: node record at ${off} runs past its parent`);
     const end = wide ? Number(buf.readBigUInt64LE(off)) : buf.readUInt32LE(off);
     if (end === 0) return [null, off + headerSize];
+    if (end <= off || end > limit) throw new Error(`FBX: node record at ${off} has a bad end offset (${end})`);
+    if (depth > MAX_DEPTH) throw new Error(`FBX: nodes nested deeper than ${MAX_DEPTH}`);
     const numProps = wide ? Number(buf.readBigUInt64LE(off + 8)) : buf.readUInt32LE(off + 4);
     const propLen = wide ? Number(buf.readBigUInt64LE(off + 16)) : buf.readUInt32LE(off + 8);
     const nameLen = buf[off + (wide ? 24 : 12)];
@@ -77,10 +84,10 @@ function readBinary(buf) {
       node.props = readProps(propStart, numProps);
       let c = propStart + propLen;
       while (c < end) {
-        const [child, next] = readNode(c, deep);
+        const [child, next] = readNode(c, deep, end, depth + 1);
         if (!child) break;
         node.children.push(child);
-        c = next;
+        c = next;   // > c: readNode only returns ends past the start
       }
     }
     return [node, end];
@@ -90,7 +97,8 @@ function readBinary(buf) {
   while (off < buf.length - headerSize) {
     let end;
     try { end = wide ? Number(buf.readBigUInt64LE(off)) : buf.readUInt32LE(off); } catch (_) { break; }
-    if (end === 0 || end > buf.length) break;
+    if (end === 0 || end > buf.length) break;   // end of file, or truncated: keep what was read
+    if (end <= off) throw new Error(`FBX: node record at ${off} has a bad end offset (${end})`);
     const nameLen = buf[off + (wide ? 24 : 12)];
     const nameStart = off + (wide ? 25 : 13);
     const name = buf.toString('ascii', nameStart, nameStart + nameLen);

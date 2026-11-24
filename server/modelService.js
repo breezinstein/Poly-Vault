@@ -21,25 +21,28 @@ const TEXTURE_SIZES = [256, 512, 1024, 2048, 4096];
 
 // Unique temp name per write: concurrent requests for the same output never
 // share one (the loser would otherwise fail the rename or interleave bytes).
-function writeAtomic(out, data) {
+async function writeAtomic(out, data) {
   const tmp = `${out}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
   try {
-    fs.writeFileSync(tmp, data);
-    fs.renameSync(tmp, out);
+    await fs.promises.writeFile(tmp, data);
+    await fs.promises.rename(tmp, out);
   } finally {
-    fs.rmSync(tmp, { force: true });
+    await fs.promises.rm(tmp, { force: true });
   }
 }
 
 function createModelService({
   packageIndex, entryCachePath, dataDir, resolveInLibrary, libraryRootOf, log = console, maxTextureFiles = 20000,
-  maxModelBytes = 256 * 1024 * 1024, maxConvertedFiles = 5000,
+  maxModelBytes = 256 * 1024 * 1024, maxConvertedFiles = 5000, workerTimeoutMs = 120000,
+  workerFile = path.join(__dirname, 'modelWorker.js'),
 }) {
   const texDir = path.join(dataDir, 'packages', 'textures');
   fs.mkdirSync(texDir, { recursive: true });
   const inFlight = new Map();
   let writes = 0;
-  const stats = { manifests: 0, passes: 0, textures: 0, textureHits: 0, textureErrors: 0 };
+  const stats = {
+    manifests: 0, passes: 0, textures: 0, textureHits: 0, textureErrors: 0, workerStarts: 0, workerErrors: 0, workerTimeouts: 0,
+  };
 
   // --- sources: a package (archive) or a loose Unity folder ---------------------
 
@@ -57,6 +60,8 @@ function createModelService({
         if (st.state === 'failed') return { error: 409, message: `this package's link map could not be built${st.error ? `: ${st.error}` : ''}` };
         return { pending: true, real, ...st };
       }
+      // Partial map: use it, and rebuild it in the background when that is due.
+      if (graph.complete === false) packageIndex.enqueueGraph(real, stat.mtimeMs, stat.size);
       return { kind: 'package', real, stat, graph, entry: String(entry || '') };
     }
     // Loose file in a folder library: its asset folder is the graph root.
@@ -111,35 +116,74 @@ function createModelService({
     }
     return p;
   }
-  const readSourceFile = (src, guid) => fs.readFileSync(sourcePath(src, guid));
+  // Off the event loop: textures (PSDs) can be 100+ MB.
+  const readSourceFile = (src, guid) => fs.promises.readFile(sourcePath(src, guid));
 
   // --- model worker (read, inspect, convert: never on the HTTP thread) ------------
 
-  let worker = null;
+  // One request runs at a time. A watchdog ends a request that runs longer
+  // than workerTimeoutMs: the worker is terminated (pure-JS loops cannot be
+  // interrupted any other way), that request fails, the ones queued behind it
+  // move to a fresh worker, and the file is not tried again until it changes.
+  // Without this one bad file would stall every model and prefab request.
+  let current = null;   // { w, jobs: Map<id, {msg, done, file}>, since }
   let seq = 0;
-  const waiting = new Map();
-  function failAll(error) {
-    for (const done of waiting.values()) done({ ok: false, error });
-    waiting.clear();
-    worker = null;
+  const badFiles = new Map();   // file\0mtime\0size -> reason
+  function spawnWorker() {
+    const w = new Worker(workerFile, { resourceLimits: { maxOldGenerationSizeMb: 768 } });
+    const state = { w, jobs: new Map(), since: Date.now() };
+    w.unref();
+    w.on('message', (m) => {
+      const job = state.jobs.get(m.id);
+      if (!job) return;
+      state.jobs.delete(m.id);
+      state.since = Date.now();   // the next queued job starts now
+      job.done(m);
+    });
+    const fail = (error) => {
+      if (current === state) current = null;
+      for (const job of state.jobs.values()) job.done({ ok: false, error });
+      state.jobs.clear();
+    };
+    w.on('error', (err) => { stats.workerErrors += 1; fail(`model worker: ${err.message}`); });
+    w.on('exit', () => fail('model worker stopped'));
+    stats.workerStarts += 1;
+    return state;
   }
-  function callWorker(msg) {
-    if (!worker) {
-      // A crafted file must not take the server down: the worker has its own,
-      // smaller heap and is restarted on the next request if it dies.
-      worker = new Worker(path.join(__dirname, 'modelWorker.js'), { resourceLimits: { maxOldGenerationSizeMb: 768 } });
-      worker.unref();
-      worker.on('message', (m) => {
-        const done = waiting.get(m.id);
-        if (done) { waiting.delete(m.id); done(m); }
-      });
-      worker.on('error', (err) => failAll(`model worker: ${err.message}`));
-      worker.on('exit', () => failAll('model worker stopped'));
+  const fileKey = (file) => {
+    try { const st = fs.statSync(file); return `${file}\u0000${st.mtimeMs}\u0000${st.size}`; } catch (_) { return null; }
+  };
+  function watchdog() {
+    const state = current;
+    if (!state || !state.jobs.size || Date.now() - state.since < workerTimeoutMs) return;
+    const [[stuckId, stuck], ...rest] = [...state.jobs.entries()];
+    const reason = `model worker gave up after ${Math.round(workerTimeoutMs / 1000)} s on this file (corrupt or too complex?)`;
+    stats.workerTimeouts += 1;
+    log.warn(`[poly-vault] model worker timed out on ${stuck.msg.file}: restarting it; the file is skipped until it changes`);
+    const key = fileKey(stuck.msg.file);
+    if (key) {
+      badFiles.set(key, reason);
+      if (badFiles.size > 1000) badFiles.delete(badFiles.keys().next().value);
     }
+    state.jobs.clear();
+    current = null;
+    state.w.terminate().catch(() => {});
+    stuck.done({ ok: false, error: reason, timedOut: true, id: stuckId });
+    for (const [, job] of rest) callWorker(job.msg).then(job.done);
+  }
+  const watchdogTimer = setInterval(watchdog, Math.min(1000, workerTimeoutMs / 4));
+  watchdogTimer.unref();
+
+  function callWorker(msg) {
+    const key = msg.file ? fileKey(msg.file) : null;
+    if (key && badFiles.has(key)) return Promise.resolve({ ok: false, error: badFiles.get(key) });
+    if (!current) current = spawnWorker();
+    const state = current;
     const id = ++seq;
-    return new Promise((resolve) => {
-      waiting.set(id, resolve);
-      worker.postMessage({ ...msg, id, maxBytes: maxModelBytes });
+    return new Promise((done) => {
+      if (!state.jobs.size) state.since = Date.now();
+      state.jobs.set(id, { msg, done });
+      state.w.postMessage({ ...msg, id, maxBytes: maxModelBytes });
     });
   }
   const formatOf = (entry) => path.extname(entry).slice(1).toLowerCase();
@@ -171,12 +215,26 @@ function createModelService({
     if (fs.existsSync(out)) return { file: out };
     const guid = Object.entries(src.graph.paths).find(([, p]) => p === src.entry);
     if (!guid) return { error: 404, message: 'entry not found' };
-    await ensureExtracted(src, [guid[0]]);
-    const res = await callWorker({ action: 'convert', file: sourcePath(src, guid[0]), format: formatOf(src.entry), out });
-    if (!res.ok) return { error: 415, message: res.error };
-    noteConverted(res.converted);
-    return res.converted.ok ? { file: res.converted.file } : { error: 415, message: res.converted.error };
+    // Two tabs opening the same model share one conversion.
+    if (inFlight.has(out)) return inFlight.get(out);
+    const job = (async () => {
+      const run = async () => {
+        await ensureExtracted(src, [guid[0]]);
+        return callWorker({ action: 'convert', file: sourcePath(src, guid[0]), format: formatOf(src.entry), out });
+      };
+      let res = await run();
+      if (isGone(src, res)) res = await run();
+      if (!res.ok) return { error: 415, message: res.error };
+      noteConverted(res.converted);
+      return res.converted.ok ? { file: res.converted.file } : { error: 415, message: res.converted.error };
+    })().catch((err) => ({ error: 500, message: err.message }));
+    inFlight.set(out, job);
+    job.finally(() => inFlight.delete(out));
+    return job;
   }
+  // The extracted-cache prune removed a package's file between extracting and
+  // reading it: worth one more extraction.
+  const isGone = (src, res) => src.kind === 'package' && !res.ok && /ENOENT/.test(res.error || '');
 
   // --- manifest ----------------------------------------------------------------
 
@@ -205,7 +263,11 @@ function createModelService({
 
   // Read + inspect (+ convert when needed) one model in the worker.
   async function inspect(src, guid, entry, file) {
-    const res = await callWorker({ action: 'inspect', file, format: formatOf(entry), convertTo: convPath(src, entry) });
+    let res = await callWorker({ action: 'inspect', file, format: formatOf(entry), convertTo: convPath(src, entry) });
+    if (isGone(src, res)) {
+      await ensureExtracted(src, [guid]);
+      res = await callWorker({ action: 'inspect', file, format: formatOf(entry), convertTo: convPath(src, entry) });
+    }
     if (res.ok) noteConverted(res.converted);
     return res;
   }
@@ -319,7 +381,11 @@ function createModelService({
           manifest.model.converted = `FBX ${(v / 1000).toFixed(1)}`;
           manifest.notes.push(`FBX ${(v / 1000).toFixed(1)} file converted for the browser (shown without skinning or animation)`);
         } else {
+          // The browser cannot read it either: say so instead of a fidelity
+          // verdict about materials nobody will see.
           manifest.notes.push(`FBX ${(v / 1000).toFixed(1)} file could not be converted: ${conv.error}`);
+          manifest.fidelity = 'unviewable';
+          manifest.model.unviewable = `FBX ${(v / 1000).toFixed(1)} file could not be converted for the browser: ${conv.error}`;
         }
       }
     }
@@ -345,9 +411,9 @@ function createModelService({
     const key = `${src.real}\u0000${src.entry}\u0000${src.graph.builtAt || ''}`;
     if (inFlight.has(key)) return inFlight.get(key);
     const job = buildManifest(src).then((res) => {
-      // A partial folder link map (file or time limit) can miss materials.
-      if (res && res.ok && src.kind === 'folder' && src.graph.truncated) {
-        res.manifest.notes.push(`this folder's link map is partial (${src.graph.truncated}): some materials or textures may not be found`);
+      // A partial link map (a read error, a file, time or size limit) can miss materials.
+      if (res && res.ok && (src.graph.truncated || src.graph.complete === false)) {
+        res.manifest.notes.push(`this ${src.kind === 'folder' ? 'folder' : 'package'}'s link map is partial (${src.graph.truncated || 'incomplete'}): some materials or textures may not be found`);
       }
       return res;
     }).catch((err) => ({ error: 500, message: err.message }));
@@ -405,32 +471,54 @@ function createModelService({
     for (const guid of guids) {
       if (!/^[0-9a-f]{32}$/.test(guid) || !isTexture(guid)) return { error: 404, message: 'texture not in this package' };
     }
-    const out = path.join(texDir, `${sha1(`${src.real}\u0000${Math.trunc(src.stat.mtimeMs)}\u0000${key}\u0000${size}`)}.webp`);
+    // Cache key: a package's own version, or for a loose folder each source
+    // file's own mtime and size (editing a texture in place changes neither
+    // the folder's mtime nor anything else the key would otherwise see).
+    let stamp = String(Math.trunc(src.stat.mtimeMs));
+    if (src.kind === 'folder') {
+      try {
+        stamp = guids.map((guid) => {
+          const st = fs.statSync(sourcePath(src, guid));
+          return `${Math.trunc(st.mtimeMs)}:${st.size}`;
+        }).join(',');
+      } catch (_) { return { error: 404, message: 'texture file not found' }; }
+    }
+    const out = path.join(texDir, `${sha1(`${src.real}\u0000${stamp}\u0000${key}\u0000${size}`)}.webp`);
     if (fs.existsSync(out)) {
       stats.textureHits += 1;
       return { file: out };
     }
-    await ensureExtracted(src, guids);
+    const build = async () => {
+      await ensureExtracted(src, guids);
+      if (parsed.role !== 'orm') {
+        return tex.convertTexture(await readSourceFile(src, parsed.guid), g.paths[parsed.guid], parsed.role, size);
+      }
+      const r = parsed.recipe;
+      const [mg, ao, albedo] = await Promise.all([r.mg, r.ao, r.sa].map((guid) => (guid ? readSourceFile(src, guid) : null)));
+      return tex.buildOrm({
+        kind: r.k || 'none',
+        mg,
+        mgName: r.mg ? g.paths[r.mg] : '',
+        ao,
+        aoName: r.ao ? g.paths[r.ao] : '',
+        albedo,
+        albedoName: r.sa ? g.paths[r.sa] : '',
+        aoStrength: Math.max(0, Math.min(1, Number(r.ao_s ?? 1))),
+        smoothScale: Math.max(0, Math.min(1, Number(r.ss ?? 1))),
+        metallic: Math.max(0, Math.min(1, Number(r.m ?? 0))),
+      }, size);
+    };
     try {
       let buffer;
-      if (parsed.role === 'orm') {
-        const r = parsed.recipe;
-        buffer = await tex.buildOrm({
-          kind: r.k || 'none',
-          mg: r.mg ? readSourceFile(src, r.mg) : null,
-          mgName: r.mg ? g.paths[r.mg] : '',
-          ao: r.ao ? readSourceFile(src, r.ao) : null,
-          aoName: r.ao ? g.paths[r.ao] : '',
-          albedo: r.sa ? readSourceFile(src, r.sa) : null,
-          albedoName: r.sa ? g.paths[r.sa] : '',
-          aoStrength: Math.max(0, Math.min(1, Number(r.ao_s ?? 1))),
-          smoothScale: Math.max(0, Math.min(1, Number(r.ss ?? 1))),
-          metallic: Math.max(0, Math.min(1, Number(r.m ?? 0))),
-        }, size);
-      } else {
-        buffer = await tex.convertTexture(readSourceFile(src, parsed.guid), g.paths[parsed.guid], parsed.role, size);
+      try {
+        buffer = await build();
+      } catch (err) {
+        // The extracted-cache prune can remove a package's files between
+        // extraction and reading: extract again once.
+        if (err.code !== 'ENOENT' || src.kind !== 'package') throw err;
+        buffer = await build();
       }
-      writeAtomic(out, buffer);
+      await writeAtomic(out, buffer);
       stats.textures += 1;
       prune();
       return { file: out };
@@ -441,7 +529,14 @@ function createModelService({
     }
   }
 
-  return { manifest, texture, converted, stats: () => ({ ...stats, sharp: tex.available(), psd: tex.psdAvailable() }) };
+  return {
+    manifest,
+    texture,
+    converted,
+    callWorker,   // exported for tests
+    close: () => { clearInterval(watchdogTimer); if (current) current.w.terminate().catch(() => {}); current = null; },
+    stats: () => ({ ...stats, skippedFiles: badFiles.size, sharp: tex.available(), psd: tex.psdAvailable() }),
+  };
 }
 
 module.exports = { createModelService };

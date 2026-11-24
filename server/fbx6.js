@@ -9,6 +9,8 @@
 
 const zlib = require('zlib');
 
+const MAX_DEPTH = 64;   // real files nest ~6 deep
+
 // --- generic FBX node tree ---------------------------------------------------------
 // node: { name, props: [...], children: [node] }
 
@@ -21,8 +23,11 @@ function readBinaryTree(buf) {
     const len = buf.readUInt32LE(off);
     const enc = buf.readUInt32LE(off + 4);
     const clen = buf.readUInt32LE(off + 8);
+    const size0 = { f: 4, d: 8, l: 8, i: 4, b: 1 }[type];
+    if (off + 12 + clen > buf.length) throw new Error(`FBX: array at ${off} runs past the end of the file`);
     let data = buf.subarray(off + 12, off + 12 + clen);
-    if (enc === 1) data = zlib.inflateSync(data);
+    // Inflate no more than the declared length: a crafted header cannot ask for gigabytes.
+    if (enc === 1) data = zlib.inflateSync(data, { maxOutputLength: Math.max(1, len * size0) });
     const out = [];
     const size = { f: 4, d: 8, l: 8, i: 4, b: 1 }[type];
     for (let k = 0; k < len && k * size < data.length; k += 1) {
@@ -60,9 +65,14 @@ function readBinaryTree(buf) {
     return props;
   }
 
-  function readNode(off) {
+  // Every record must end after it starts and inside its parent, so a corrupt
+  // or crafted file fails here instead of looping or allocating forever.
+  function readNode(off, limit = buf.length, depth = 0) {
+    if (off + nullSize > limit) throw new Error(`FBX: node record at ${off} runs past its parent`);
     const end = wide ? Number(buf.readBigUInt64LE(off)) : buf.readUInt32LE(off);
     if (end === 0) return [null, off + nullSize];
+    if (end <= off || end > limit) throw new Error(`FBX: node record at ${off} has a bad end offset (${end})`);
+    if (depth > MAX_DEPTH) throw new Error(`FBX: nodes nested deeper than ${MAX_DEPTH}`);
     const numProps = wide ? Number(buf.readBigUInt64LE(off + 8)) : buf.readUInt32LE(off + 4);
     const propLen = wide ? Number(buf.readBigUInt64LE(off + 16)) : buf.readUInt32LE(off + 8);
     const nameLen = buf[off + (wide ? 24 : 12)];
@@ -72,10 +82,10 @@ function readBinaryTree(buf) {
     node.props = readProps(propStart, numProps);
     let c = propStart + propLen;
     while (c < end) {
-      const [child, next] = readNode(c);
+      const [child, next] = readNode(c, end, depth + 1);
       if (!child) { c = next; break; }
       node.children.push(child);
-      c = next;
+      c = next;   // > c: readNode only returns ends past the start
     }
     return [node, end];
   }
@@ -84,7 +94,8 @@ function readBinaryTree(buf) {
   let off = 27;
   while (off < buf.length - nullSize) {
     const end = wide ? Number(buf.readBigUInt64LE(off)) : buf.readUInt32LE(off);
-    if (end === 0 || end > buf.length) break;
+    if (end === 0 || end > buf.length) break;   // end of file, or truncated: keep what was read
+    if (end <= off) throw new Error(`FBX: node record at ${off} has a bad end offset (${end})`);
     const [node] = readNode(off);
     root.children.push(node);
     off = end;

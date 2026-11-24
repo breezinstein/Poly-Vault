@@ -740,6 +740,7 @@ function buildEntryPreview(pkgAsset, entry) {
       mountIt
         .then((viewer) => {
           activeViewer = viewer;
+          if (viewer.unviewable) { note.textContent = `${viewer.unviewable}. Import the file to open it in the editor.`; return; }
           const anim = viewer.clips ? ` \u00B7 ${viewer.clips} animation${viewer.clips > 1 ? 's' : ''}` : '';
           note.textContent = `${viewer.triangles.toLocaleString()} triangles${anim} \u00B7 drag to orbit, scroll to zoom`;
           document.dispatchEvent(new CustomEvent('pv:model-ready', { detail: { viewer, pkgAsset, entry } }));

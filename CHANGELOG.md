@@ -27,6 +27,12 @@ All notable changes to **Poly Vault** are documented here. Format follows
 - Browser checks install Playwright from a committed lockfile; 3D colour checks are relative to what is on screen.
 - Oversize uploads get `413` instead of a connection reset.
 - Opening a model no longer waits when link maps are disabled or failed.
+- A corrupt or crafted FBX can no longer stall the model pipeline: the FBX readers reject node records that do not move forward, and a watchdog restarts the model worker after `PV_MODEL_TIMEOUT_S` (the file is then skipped until it changes; counts in `/healthz` → `models`).
+- Textures in loose folders refresh after being re-exported in place (cached by the texture file's own date and size); texture and converted-model responses revalidate.
+- A package whose link map could only be read in part (read error, time budget) is marked partial, listed in `/api/package/graph-failures` and `/healthz`, and rebuilt later (up to 3 attempts); the viewer notes partial maps for packages too.
+- Models that cannot be shown in the browser (FBX 6 the converter cannot read) get an "unviewable" verdict instead of "Matches Unity"; the fidelity report counts them separately and explains its percentages.
+- Folder link-map invalidation reaches maps no longer held in memory.
+- Extracted package files used in the last 15 minutes are never pruned, and a request whose file was pruned extracts it again; textures are read off the event loop; two requests for the same conversion share one.
 
 ## [0.4.2] — 2026-11-07
 

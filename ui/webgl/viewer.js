@@ -492,6 +492,7 @@ const FIDELITY_TEXT = {
   approximate: ['approx', 'Close to Unity'],
   missing: ['missing', 'Materials not found'],
   none: ['none', 'No meshes'],
+  unviewable: ['missing', "Can't show this file"],
 };
 
 function el(tag, cls, text) {
@@ -686,6 +687,18 @@ export async function mountUnity(container, source) {
       : `package queued for indexing${state.position ? ` (position ${state.position})` : ''}…`;
   });
   if (stage.disposed) return { dispose() {}, triangles: 0, manifest, object: null, skinned: false, clips: 0 };
+  // A file the server could not convert (FBX 6): the browser cannot read it
+  // either, so explain instead of failing inside the loader.
+  if (manifest.kind !== 'prefab' && manifest.fidelity === 'unviewable') {
+    stage.note.textContent = manifest.model.unviewable || "this model can't be shown in the browser";
+    const overlay = el('div', 'pv3d-overlay');
+    overlay.appendChild(fidelityPanel(manifest));
+    container.appendChild(overlay);
+    return {
+      dispose: () => stage.dispose(), triangles: 0, manifest, object: null, skinned: false, clips: 0,
+      unviewable: stage.note.textContent,
+    };
+  }
   stage.note.textContent = 'loading model and textures…';
 
   const manager = new THREE.LoadingManager();

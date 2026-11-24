@@ -67,7 +67,7 @@ async function run(opts = {}) {
   ];
   const totals = {
     packages: 0, folders: 0, packagesWithModels: 0,
-    models: { exact: 0, approximate: 0, missing: 0, none: 0, error: 0 },
+    models: { exact: 0, approximate: 0, missing: 0, unviewable: 0, none: 0, error: 0 },
     prefabs: { exact: 0, approximate: 0, missing: 0, none: 0, error: 0 },
     parts: { exact: 0, approximate: 0, missing: 0 },
     sources: {}, shaders: {}, customShaders: {}, notes: {}, fbxVersions: {},
@@ -107,6 +107,7 @@ async function run(opts = {}) {
     for (const pg of prefabs) visit(pg, 0);
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pv-report-'));
     const structures = new Map();
+    const unviewable = new Set();   // FBX 6 files the converter could not turn into GLB
     try {
       if (graph.kind === 'folder') {
         for (const g of needed) {
@@ -130,7 +131,7 @@ async function run(opts = {}) {
           bump(totals.fbxVersions, v >= 7000 ? `${Math.floor(v / 100) / 10}` : v > 0 ? '6.x' : 'unknown');
           if (v > 0 && v < 7000) {
             totals.fbx6.files += 1;
-            try { convertFbx6(bytes); totals.fbx6.converted += 1; } catch (_) { totals.fbx6.failed += 1; }
+            try { convertFbx6(bytes); totals.fbx6.converted += 1; } catch (_) { totals.fbx6.failed += 1; unviewable.add(g); }
           }
         }
       }
@@ -157,7 +158,11 @@ async function run(opts = {}) {
     for (const g of models) {
       const s = structures.get(g);
       if (!s) { bump(totals.models, 'error'); bump(pkg.models, 'error'); continue; }
-      try { tally('models', resolveModel(graph, graph.paths[g], s)); } catch (_) { bump(totals.models, 'error'); bump(pkg.models, 'error'); }
+      try {
+        const res = resolveModel(graph, graph.paths[g], s);
+        if (unviewable.has(g) && res.fidelity !== 'none') res.fidelity = 'unviewable';
+        tally('models', res);
+      } catch (_) { bump(totals.models, 'error'); bump(pkg.models, 'error'); }
     }
     for (const g of prefabs) {
       try { tally('prefabs', resolvePrefab(graph, graph.paths[g], (m) => structures.get(m) || null)); } catch (_) { bump(totals.prefabs, 'error'); bump(pkg.prefabs, 'error'); }
@@ -220,13 +225,17 @@ function markdown(s) {
 ${s.only ? `Only ${s.only}: ` : ''}${s.packages} packages${s.folders ? ` and ${s.folders} asset folders` : ''} scanned, ${s.packagesWithModels} with models or prefabs (up to
 ${s.sampling.maxModelsPerPackage} models and ${s.sampling.maxPrefabsPerPackage} prefabs each), ${s.seconds}s.
 
-| | exact | approximate | missing | no geometry | errors | total |
-|---|---|---|---|---|---|---|
-| models | ${s.models.exact} | ${s.models.approximate} | ${s.models.missing} | ${s.models.none} | ${s.models.error} | ${s.models.total} |
-| prefabs | ${s.prefabs.exact} | ${s.prefabs.approximate} | ${s.prefabs.missing} | ${s.prefabs.none} | ${s.prefabs.error} | ${s.prefabs.total} |
+| | exact | approximate | missing | unviewable | no geometry | errors | total |
+|---|---|---|---|---|---|---|---|
+| models | ${s.models.exact} | ${s.models.approximate} | ${s.models.missing} | ${s.models.unviewable || 0} | ${s.models.none} | ${s.models.error} | ${s.models.total} |
+| prefabs | ${s.prefabs.exact} | ${s.prefabs.approximate} | ${s.prefabs.missing} | – | ${s.prefabs.none} | ${s.prefabs.error} | ${s.prefabs.total} |
 
 Models with geometry: **${s.percent.modelsExact}% exact**, ${s.percent.modelsApproximate}% approximate,
 ${s.percent.modelsMissing}% missing. Prefabs: ${s.percent.prefabsExact}% exact.
+
+Percentages are of everything except "no geometry": errors (files that could not be read)
+and unviewable models (FBX 6 that could not be converted) count against "exact" on purpose,
+since the viewer cannot show them as Unity does.
 
 ## Why results are approximate or missing
 
