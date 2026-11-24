@@ -2,7 +2,7 @@
 # Browser acceptance test for models with Unity materials, prefabs, FBX 6 and
 # the Mesh2Motion hand-off (headless Chromium in Docker, throwaway container).
 #
-#   ./scripts/verify-3d.sh [image]       (default: poly-vault:0.4.2-web)
+#   ./scripts/verify-3d.sh [image]       (default: poly-vault:0.4.2-web.1)
 #
 # Generates a fixture package (scripts/make-3d-fixture.js), starts the image on
 # :18083 with it, and checks, in a real browser with WebGL:
@@ -17,7 +17,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-IMAGE="${1:-poly-vault:0.4.2-web}"
+IMAGE="${1:-poly-vault:0.4.2-web.1}"
 PORT="${PORT:-18083}"
 NAME="pv-verify-3d"
 BASE="http://127.0.0.1:${PORT}"

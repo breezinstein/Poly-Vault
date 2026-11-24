@@ -56,7 +56,7 @@ Rules:
 ./scripts/backup.sh ./backups
 
 # 2. bump the pinned upstream version
-$EDITOR docker-compose.yml        # args: PV_VERSION: "0.4.3"
+$EDITOR docker-compose.yml        # args: APP_VERSION, image: tag
 
 # 3. rebuild (patches may need a refresh, see below)
 docker compose up -d --build
@@ -84,7 +84,7 @@ docker compose down
 docker run -d --name poly-vault --init --read-only --tmpfs /tmp \
   -p 127.0.0.1:8080:8080 --env-file .env \
   -v poly-vault-data:/data -v /srv/assets:/assets:ro \
-  poly-vault:0.4.2-web
+  poly-vault:0.4.2-web.1
 
 # metadata rollback (only if the new version wrote bad data)
 ./scripts/restore.sh ./backups/poly-vault-data-<ts>.tgz
@@ -220,7 +220,9 @@ with `PV_USERS` each artist's token makes imports land only in their editor.
 ## 8. The NAS (NFS) library
 
 The Unity Asset Store cache lives on `nas.example.internal:/export/unity-assets`
-and is mounted read-only. Specifics worth knowing:
+and is mounted read-only through `docker-compose.nas.yml` (enabled with
+`COMPOSE_FILE=docker-compose.yml:docker-compose.nas.yml` in `.env`, together
+with the `PV_NFS_*` settings listed there). Specifics worth knowing:
 
 - **New packages appear after `PV_SCAN_MAX_AGE_MS` (5 min) or immediately via the
   Update button.** inotify cannot see writes made by another machine over NFS.

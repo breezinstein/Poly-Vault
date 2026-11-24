@@ -24,6 +24,9 @@ mkdir -p "$OUT"
 
 cp "$TMP/node_modules/three/build/three.module.min.js" "$OUT/three.module.min.js"
 cp "$TMP/node_modules/fflate/esm/browser.js" "$OUT/fflate.module.js"
+# MIT requires the notice to travel with the code.
+cp "$TMP/node_modules/three/LICENSE" "$OUT/LICENSE-three.txt"
+cp "$TMP/node_modules/fflate/LICENSE" "$OUT/LICENSE-fflate.txt"
 
 for f in controls/OrbitControls.js \
          loaders/OBJLoader.js loaders/GLTFLoader.js loaders/STLLoader.js \

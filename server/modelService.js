@@ -11,16 +11,30 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { resolveModel, modelStructure, MODEL_EXT } = require('./modelResolver');
+const { Worker } = require('worker_threads');
+const { resolveModel, MODEL_EXT } = require('./modelResolver');
 const { resolvePrefab } = require('./prefabResolver');
 const tex = require('./textureConvert');
-const { convertFbx6, fbxVersion } = require('./fbx6');
-const { convertMeshAsset } = require('./unityMesh');
 
 const sha1 = (v) => crypto.createHash('sha1').update(v).digest('hex');
 const TEXTURE_SIZES = [256, 512, 1024, 2048, 4096];
 
-function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLibrary, libraryRootOf, log = console, maxTextureFiles = 20000 }) {
+// Unique temp name per write: concurrent requests for the same output never
+// share one (the loser would otherwise fail the rename or interleave bytes).
+function writeAtomic(out, data) {
+  const tmp = `${out}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(tmp, data);
+    fs.renameSync(tmp, out);
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
+}
+
+function createModelService({
+  packageIndex, entryCachePath, dataDir, resolveInLibrary, libraryRootOf, log = console, maxTextureFiles = 20000,
+  maxModelBytes = 256 * 1024 * 1024, maxConvertedFiles = 5000,
+}) {
   const texDir = path.join(dataDir, 'packages', 'textures');
   fs.mkdirSync(texDir, { recursive: true });
   const inFlight = new Map();
@@ -37,7 +51,11 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
       const graph = packageIndex.getGraph(real, stat.mtimeMs, stat.size);
       if (!graph) {
         packageIndex.enqueueGraph(real, stat.mtimeMs, stat.size, { priority: true });
-        return { pending: true, real, ...packageIndex.graphState(real, stat.mtimeMs, stat.size) };
+        const st = packageIndex.graphState(real, stat.mtimeMs, stat.size);
+        // States that waiting will not fix: answer now instead of "pending".
+        if (st.state === 'disabled') return { error: 503, message: 'link maps are turned off on this server (PV_PACKAGE_GRAPH=0)' };
+        if (st.state === 'failed') return { error: 409, message: `this package's link map could not be built${st.error ? `: ${st.error}` : ''}` };
+        return { pending: true, real, ...st };
       }
       return { kind: 'package', real, stat, graph, entry: String(entry || '') };
     }
@@ -81,15 +99,48 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
     return res.results || {};
   }
 
-  function readSourceFile(src, guid) {
+  // Path of an extracted (package) or loose (folder) file, checked to stay inside.
+  function sourcePath(src, guid) {
     const p = cachePathFor(src, guid);
     if (src.kind === 'folder') {
       const real = fs.realpathSync(p);
       if (!real.startsWith(src.real + path.sep)) throw new Error('outside asset folder');
-      return fs.readFileSync(real);
+      return real;
     }
-    return fs.readFileSync(p);
+    return p;
   }
+  const readSourceFile = (src, guid) => fs.readFileSync(sourcePath(src, guid));
+
+  // --- model worker (read, inspect, convert: never on the HTTP thread) ------------
+
+  let worker = null;
+  let seq = 0;
+  const waiting = new Map();
+  function failAll(error) {
+    for (const done of waiting.values()) done({ ok: false, error });
+    waiting.clear();
+    worker = null;
+  }
+  function callWorker(msg) {
+    if (!worker) {
+      // A crafted file must not take the server down: the worker has its own,
+      // smaller heap and is restarted on the next request if it dies.
+      worker = new Worker(path.join(__dirname, 'modelWorker.js'), { resourceLimits: { maxOldGenerationSizeMb: 768 } });
+      worker.unref();
+      worker.on('message', (m) => {
+        const done = waiting.get(m.id);
+        if (done) { waiting.delete(m.id); done(m); }
+      });
+      worker.on('error', (err) => failAll(`model worker: ${err.message}`));
+      worker.on('exit', () => failAll('model worker stopped'));
+    }
+    const id = ++seq;
+    return new Promise((resolve) => {
+      waiting.set(id, resolve);
+      worker.postMessage({ ...msg, id, maxBytes: maxModelBytes });
+    });
+  }
+  const formatOf = (entry) => path.extname(entry).slice(1).toLowerCase();
 
   // --- conversion to GLB (FBX 6, Unity mesh assets) -------------------------------
 
@@ -100,19 +151,13 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
   const CONVERTER_VERSION = 2;
   const PREFAB_MODEL_CAP = 256;
   const convPath = (src, entry) => path.join(convDir, `${sha1(`${src.real}\u0000${Math.trunc(src.stat.mtimeMs)}\u0000${entry}\u0000v${CONVERTER_VERSION}`)}.glb`);
-
-  function convertedGlb(src, entry, bytes) {
-    const out = convPath(src, entry);
-    if (fs.existsSync(out)) return { ok: true, file: out };
-    try {
-      const { glb } = /\.asset$/i.test(entry) ? convertMeshAsset(bytes) : convertFbx6(bytes);
-      fs.writeFileSync(`${out}.tmp`, glb);
-      fs.renameSync(`${out}.tmp`, out);
-      stats.converted = (stats.converted || 0) + 1;
-      return { ok: true, file: out };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
+  let convWrites = 0;
+  // Converted GLBs are a disposable cache: keep the newest maxConvertedFiles.
+  function noteConverted(conv) {
+    if (!conv || !conv.ok) return;
+    stats.converted = (stats.converted || 0) + 1;
+    convWrites += 1;
+    if (convWrites % 100 === 0) pruneDir(convDir, maxConvertedFiles);
   }
 
   /** The converted GLB of an FBX 6 model or a Unity mesh asset (built by the manifest). */
@@ -125,8 +170,10 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
     const guid = Object.entries(src.graph.paths).find(([, p]) => p === src.entry);
     if (!guid) return { error: 404, message: 'entry not found' };
     await ensureExtracted(src, [guid[0]]);
-    const conv = convertedGlb(src, src.entry, readSourceFile(src, guid[0]));
-    return conv.ok ? { file: conv.file } : { error: 415, message: conv.error };
+    const res = await callWorker({ action: 'convert', file: sourcePath(src, guid[0]), format: formatOf(src.entry), out });
+    if (!res.ok) return { error: 415, message: res.error };
+    noteConverted(res.converted);
+    return res.converted.ok ? { file: res.converted.file } : { error: 415, message: res.converted.error };
   }
 
   // --- manifest ----------------------------------------------------------------
@@ -140,22 +187,25 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
   }
 
   // URL the viewer loads for a model file; FBX 6 and Unity mesh assets are
-  // served converted to GLB.
-  function modelFileUrl(src, entry, bytes) {
-    const format = path.extname(entry).slice(1).toLowerCase();
+  // served converted to GLB (`info` is the worker's inspect reply).
+  function modelFileUrl(src, entry, info) {
+    const format = formatOf(entry);
     const convertedUrl = `/api/model/converted?path=${encodeURIComponent(src.real)}&entry=${encodeURIComponent(entry)}`;
+    const conv = info.converted;
     if (format === 'asset') {
-      const conv = convertedGlb(src, entry, bytes);
-      return conv.ok ? { url: convertedUrl, format: 'glb', meshAsset: true } : { missing: true, error: conv.error };
+      return conv && conv.ok ? { url: convertedUrl, format: 'glb', meshAsset: true } : { missing: true, error: (conv && conv.error) || 'not converted' };
     }
-    if (format === 'fbx') {
-      const v = fbxVersion(bytes);
-      if (v > 0 && v < 7000) {
-        const conv = convertedGlb(src, entry, bytes);
-        if (conv.ok) return { url: convertedUrl, format: 'glb', converted: `FBX ${(v / 1000).toFixed(1)}` };
-      }
+    if (format === 'fbx' && conv && conv.ok) {
+      return { url: convertedUrl, format: 'glb', converted: `FBX ${(info.fbxVersion / 1000).toFixed(1)}` };
     }
     return { url: modelUrl(src, entry), format };
+  }
+
+  // Read + inspect (+ convert when needed) one model in the worker.
+  async function inspect(src, guid, entry, file) {
+    const res = await callWorker({ action: 'inspect', file, format: formatOf(entry), convertTo: convPath(src, entry) });
+    if (res.ok) noteConverted(res.converted);
+    return res;
   }
 
   // Models a prefab (and its nested prefabs, to depth 4) uses.
@@ -182,13 +232,15 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
     // Pass 1: every model the prefab tree uses.
     await ensureExtracted(src, models);
     const structures = new Map();
-    const bytesOf = new Map();
+    const infoOf = new Map();
     for (const m of models) {
-      try {
-        const bytes = readSourceFile(src, m);
-        bytesOf.set(m, bytes);
-        structures.set(m, modelStructure(bytes, path.extname(g.paths[m]).slice(1).toLowerCase()));
-      } catch (_) { /* not extracted: shown as missing */ }
+      let file;
+      try { file = sourcePath(src, m); } catch (_) { continue; }   // not extracted: shown as missing
+      if (!fs.existsSync(file)) continue;
+      const info = await inspect(src, m, g.paths[m], file);
+      if (!info.ok) { infoOf.set(m, info); continue; }
+      infoOf.set(m, info);
+      structures.set(m, info.structure);
     }
     const manifest = resolvePrefab(g, src.entry, (m) => structures.get(m) || null);
     // Pass 2: textures.
@@ -199,9 +251,14 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
       if (t.role === 'orm') delete t.recipe;
     }
     for (const [m, info] of Object.entries(manifest.models)) {
-      const bytes = bytesOf.get(m);
-      if (!bytes) { info.missing = true; continue; }
-      Object.assign(info, modelFileUrl(src, g.paths[m], bytes));
+      const got = infoOf.get(m);
+      if (!got) { info.missing = true; continue; }
+      if (!got.ok) {
+        info.missing = true;
+        manifest.notes.push(`${path.basename(g.paths[m])}: could not be read (${got.error})`);
+        continue;
+      }
+      Object.assign(info, modelFileUrl(src, g.paths[m], got));
       if (info.error) manifest.notes.push(`${path.basename(g.paths[m])}: could not be converted (${info.error})`);
       if (info.converted) manifest.notes.push(`${path.basename(g.paths[m])}: ${info.converted} converted for the browser (no skinning or animation)`);
     }
@@ -230,9 +287,10 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
     const p1 = await ensureExtracted(src, firstWave);
     if (guid && p1[guid] && !p1[guid].ok) return { error: 502, message: `model: ${p1[guid].error}` };
 
-    const modelBytes = guid ? readSourceFile(src, guid) : fs.readFileSync(src.file);
-    const format = path.extname(entry).slice(1).toLowerCase();
-    const structure = modelStructure(modelBytes, format);
+    const format = formatOf(entry);
+    const info = await inspect(src, guid, entry, guid ? sourcePath(src, guid) : src.file);
+    if (!info.ok) return { error: 422, message: info.error };
+    const { structure } = info;
     // A .asset that is not a mesh (ScriptableObject, terrain data, ...).
     if (meshAsset && !structure.ok) return { error: 415, message: structure.error || 'not a mesh asset' };
     const manifest = resolveModel(src.graph, entry, structure);
@@ -246,13 +304,13 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
       if (t.role === 'orm') delete t.recipe;
     }
     manifest.model.url = modelUrl(src, entry);
-    manifest.model.bytes = modelBytes.length;
+    manifest.model.bytes = info.size;
     // FBX 6 (pre-2011): the browser loader cannot read it; serve a converted
     // static GLB instead (meshes, material groups, hierarchy).
     if (format === 'fbx') {
-      const v = fbxVersion(modelBytes);
+      const v = info.fbxVersion;
       if (v > 0 && v < 7000) {
-        const conv = convertedGlb(src, entry, modelBytes);
+        const conv = info.converted || { ok: false, error: 'not converted' };
         if (conv.ok) {
           manifest.model.url = `/api/model/converted?path=${encodeURIComponent(src.real)}&entry=${encodeURIComponent(entry)}`;
           manifest.model.format = 'glb';
@@ -265,7 +323,7 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
     }
     // Unity mesh asset: always served as a converted GLB.
     if (meshAsset) {
-      const conv = convertedGlb(src, entry, modelBytes);
+      const conv = info.converted || { ok: false, error: 'not converted' };
       if (!conv.ok) return { error: 415, message: `mesh asset could not be converted: ${conv.error}` };
       manifest.model.url = `/api/model/converted?path=${encodeURIComponent(src.real)}&entry=${encodeURIComponent(entry)}`;
       manifest.model.format = 'glb';
@@ -305,18 +363,24 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
     return out;
   }
 
-  function prune() {
-    writes += 1;
-    if (writes % 200 !== 0) return;
+  // Drop the least recently used 10% of a cache folder once it holds more
+  // than `max` files (also clears temp files left by a crash).
+  function pruneDir(dir, max) {
     try {
-      const files = fs.readdirSync(texDir).map((f) => {
-        const p = path.join(texDir, f);
-        return { p, t: fs.statSync(p).atimeMs };
-      });
-      if (files.length <= maxTextureFiles) return;
+      const files = fs.readdirSync(dir).map((f) => {
+        const p = path.join(dir, f);
+        try { return { p, t: fs.statSync(p).atimeMs, tmp: f.endsWith('.tmp') }; } catch (_) { return null; }
+      }).filter(Boolean);
+      const now = Date.now();
+      for (const f of files) if (f.tmp && now - f.t > 3600e3) fs.rmSync(f.p, { force: true });
+      if (files.length <= max) return;
       files.sort((a, b) => a.t - b.t);
       for (const f of files.slice(0, Math.ceil(files.length * 0.1))) fs.rmSync(f.p, { force: true });
     } catch (_) { /* best effort */ }
+  }
+  function prune() {
+    writes += 1;
+    if (writes % 200 === 0) pruneDir(texDir, maxTextureFiles);
   }
 
   async function texture(target, key, width) {
@@ -358,8 +422,7 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
       } else {
         buffer = await tex.convertTexture(readSourceFile(src, parsed.guid), g.paths[parsed.guid], parsed.role, size);
       }
-      fs.writeFileSync(`${out}.tmp`, buffer);
-      fs.renameSync(`${out}.tmp`, out);
+      writeAtomic(out, buffer);
       stats.textures += 1;
       prune();
       return { file: out };

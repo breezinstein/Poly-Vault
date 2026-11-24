@@ -659,6 +659,8 @@ async function fetchManifest(source, onWait) {
   for (let attempt = 0; attempt < 60; attempt += 1) {
     const res = await fetch(`/api/model/manifest?${q}`, { credentials: 'same-origin' });
     const json = await res.json().catch(() => ({}));
+    // Older servers answer 202 for these too; waiting would not help.
+    if (json.state === 'disabled' || json.state === 'failed') throw new Error(json.error || `link map ${json.state}`);
     if (res.status === 202 && json.pending) {
       onWait(json);
       await new Promise((r) => setTimeout(r, 3000));

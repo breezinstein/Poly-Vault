@@ -79,6 +79,7 @@ RUN npm run build \
  && find dist -name '*.map' -delete \
  && cp src/favicon.ico dist/favicon.ico \
  && cp /m2m-bridge/pv-bridge.js dist/pv-bridge.js \
+ && cp LICENSE-MIT.MD LICENSE-CC0.MD dist/ \
  && sh /usr/local/bin/m2m-rebase.sh dist /rig \
  && du -sh dist
 
@@ -131,6 +132,7 @@ COPY --from=deps --chown=root:root /app/node_modules ./node_modules
 COPY --from=webgl --chown=root:root /app/ui/webgl/vendor ./ui/webgl/vendor
 # Mesh2Motion static build (rigging / retargeting), served at /rig/.
 COPY --from=rig --chown=root:root /m2m/dist ./rig
+COPY --chown=root:root LICENSE THIRD-PARTY-NOTICES.md ./
 # The Unity add-on is served from the UI (Settings -> Unity) so artists always
 # get the build that matches this server.
 COPY --from=unity-plugin --chown=root:root /out ./plugin

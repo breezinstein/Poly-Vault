@@ -286,6 +286,8 @@ const modelService = createModelService({
   resolveInLibrary,
   libraryRootOf,
   maxTextureFiles: Number(env.PV_TEXTURE_CACHE_MAX_FILES || 20000),
+  maxModelBytes: Number(env.PV_MODEL_MAX_MB || 256) * 1024 * 1024,
+  maxConvertedFiles: Number(env.PV_CONVERTED_CACHE_MAX_FILES || 5000),
 });
 
 const enrichment = createEnrichment({
@@ -761,6 +763,55 @@ function entryCachePath(pkgReal, stat, entryPath) {
   return path.join(entryCacheDir(pkgReal, stat), crypto.createHash('sha1').update(entryPath).digest('hex'));
 }
 
+// packages/extracted holds files pulled out of packages (models, textures,
+// single-file downloads), one folder per package version. It is a cache:
+// keep it under PV_EXTRACT_CACHE_MAX_MB by dropping the least recently used
+// package folders first.
+const EXTRACT_CACHE_MAX_BYTES = Number(env.PV_EXTRACT_CACHE_MAX_MB || 8192) * 1024 * 1024;
+const extractPruneStats = { runs: 0, removedDirs: 0, removedBytes: 0, bytes: 0, maxBytes: EXTRACT_CACHE_MAX_BYTES, lastAt: '' };
+let extractPruneRunning = false;
+async function pruneExtractedCache() {
+  if (extractPruneRunning) return;
+  extractPruneRunning = true;
+  const root = path.join(packagesCacheDir, 'extracted');
+  try {
+    const dirs = [];
+    for (const name of await fs.promises.readdir(root).catch(() => [])) {
+      const dir = path.join(root, name);
+      let bytes = 0;
+      let used = 0;
+      for (const f of await fs.promises.readdir(dir).catch(() => [])) {
+        const file = path.join(dir, f);
+        const st = await fs.promises.stat(file).catch(() => null);
+        if (!st || !st.isFile()) continue;
+        // Temp files of an extraction that never finished (crash, timeout).
+        if (f.endsWith('.tmp') && Date.now() - st.mtimeMs > 3600e3) { await fs.promises.rm(file, { force: true }); continue; }
+        bytes += st.size;
+        used = Math.max(used, st.atimeMs, st.mtimeMs);
+      }
+      dirs.push({ dir, bytes, used });
+    }
+    let total = dirs.reduce((n, d) => n + d.bytes, 0);
+    dirs.sort((a, b) => a.used - b.used);
+    for (const d of dirs) {
+      if (total <= EXTRACT_CACHE_MAX_BYTES) break;
+      await fs.promises.rm(d.dir, { recursive: true, force: true });
+      total -= d.bytes;
+      extractPruneStats.removedDirs += 1;
+      extractPruneStats.removedBytes += d.bytes;
+    }
+    extractPruneStats.bytes = total;
+    extractPruneStats.runs += 1;
+    extractPruneStats.lastAt = new Date().toISOString();
+  } catch (err) {
+    console.warn(`[poly-vault] extracted-cache prune failed: ${err.message}`);
+  } finally {
+    extractPruneRunning = false;
+  }
+}
+setTimeout(pruneExtractedCache, 60e3).unref();
+setInterval(pruneExtractedCache, 3600e3).unref();
+
 function entryPreviewPath(pkgReal, stat, entryPath) {
   return `${entryCachePath(pkgReal, stat, entryPath)}.preview.png`;
 }
@@ -993,6 +1044,7 @@ const server = http.createServer(async (req, res) => {
         zipBytes: plugin.zip ? plugin.zip.size : 0,
       } : null,
       packages: packageIndex.status(),
+      extractedCache: extractPruneStats,
       thumbs: {
         available: thumbs.isAvailable(),
         generated: thumbs.stats.generated,

@@ -99,6 +99,15 @@ function decodeMesh(body) {
     }
   }
 
+  // m_VertexCount comes from the file: never trust it beyond what the vertex
+  // data can hold (a crafted count would otherwise allocate gigabytes below).
+  for (const st of streams) {
+    if (st && st.stride && st.offset + st.stride * count > data.length) {
+      throw new Error(`vertex count ${count} does not fit the ${data.length}-byte vertex data`);
+    }
+  }
+  if (!streams.some((st) => st && st.stride)) throw new Error('mesh has no vertex streams');
+
   const readChannel = (slot, want) => {
     const c = channels[slot];
     if (!c || !c.dim) return null;

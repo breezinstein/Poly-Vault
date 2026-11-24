@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Runs the CI acceptance suites locally against a throwaway container, never
 # against the live deployment: own name, own port, own data volume, fixture
-# library. Mirrors .github/workflows/ci.yml.
+# library. .github/workflows/ci.yml runs exactly this script.
 #
-#   ./scripts/ci-local.sh [image]          (default: poly-vault:0.4.2-web)
+#   ./scripts/ci-local.sh [image]          (default: poly-vault:0.4.2-web.1)
 #
 # Env: PORT (default 18080), KEEP=1 leaves the container running afterwards.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-IMAGE="${1:-poly-vault:0.4.2-web}"
+IMAGE="${1:-poly-vault:0.4.2-web.1}"
 PORT="${PORT:-18080}"
 NAME="pv-ci-local"
 VOLUME="pv-ci-local-data"

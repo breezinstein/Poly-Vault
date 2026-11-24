@@ -50,11 +50,27 @@ function createRiggedStore({ dir, maxBytes = 256 * 1024 * 1024, log = console })
     }
   }
 
+  const humanSize = (n) => (n >= 1048576 ? `${Number((n / 1048576).toFixed(1))} MB` : `${Math.ceil(n / 1024)} KB`);
+  const tooLarge = (limit) => Object.assign(new Error(`larger than ${humanSize(limit)}`), { status: 413 });
+
+  // Refuse the rest of an oversize body without resetting the socket, so the
+  // client gets the 413: keep reading (and discarding) for a while, then give
+  // up on a client that never stops sending.
+  function drain(req) {
+    req.removeAllListeners('data');
+    req.on('data', () => {});
+    req.resume();
+    const t = setTimeout(() => req.destroy(), 30000);
+    t.unref();
+    req.once('end', () => clearTimeout(t));
+    req.once('close', () => clearTimeout(t));
+  }
+
   // Stream the request body to a staging file, enforcing the size cap.
   function receive(req, limit) {
     return new Promise((resolve, reject) => {
       const declared = Number(req.headers['content-length'] || 0);
-      if (declared > limit) { reject(Object.assign(new Error(`larger than ${Math.round(limit / 1048576)} MB`), { status: 413 })); req.resume(); return; }
+      if (declared > limit) { reject(tooLarge(limit)); drain(req); return; }
       const tmp = path.join(staging, `${Date.now()}-${crypto.randomBytes(6).toString('hex')}.part`);
       const out = fs.createWriteStream(tmp, { flags: 'wx' });
       let size = 0;
@@ -70,7 +86,7 @@ function createRiggedStore({ dir, maxBytes = 256 * 1024 * 1024, log = console })
       req.on('data', (chunk) => {
         size += chunk.length;
         if (head.length < 4096) head = Buffer.concat([head, chunk.subarray(0, 4096 - head.length)]);
-        if (size > limit) { fail(Object.assign(new Error(`larger than ${Math.round(limit / 1048576)} MB`), { status: 413 })); req.destroy(); return; }
+        if (size > limit) { fail(tooLarge(limit)); drain(req); return; }
         if (!out.write(chunk)) { req.pause(); out.once('drain', () => req.resume()); }
       });
       req.on('end', () => { if (!failed) out.end(() => resolve({ tmp, size, head })); });

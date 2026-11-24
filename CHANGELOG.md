@@ -6,6 +6,23 @@ All notable changes to **Poly Vault** are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+- Mesh2Motion served at `/rig/` behind Poly Vault's sign-in: rig or animate any vault model, "Save to vault" into a writable Rigged library.
+- Link map per package and loose Unity folder; models and prefabs shown with their Unity materials and textures, with a fidelity badge that explains differences.
+- FBX 6 and Unity mesh assets (`.asset`, including skinned meshes) converted to GLB; Collada (`.dae`) support.
+- Loose asset folders browse like packages; big packages list every file (from the link map).
+- Library-wide fidelity report (`scripts/fidelity-report.sh`, Settings → 3D fidelity).
+- `docker-compose.nas.yml` for NFS-backed libraries; `THIRD-PARTY-NOTICES.md` and bundled licence texts.
+
+### Changed
+- Model reading, inspection and conversion run on a worker thread with a size cap (`PV_MODEL_MAX_MB`).
+- Caches are bounded: converted GLBs, extracted package files (`PV_EXTRACT_CACHE_MAX_MB`).
+- CI runs `scripts/ci-local.sh` (unit tests, acceptance suites, 3D browser checks).
+
+### Fixed
+- Oversize uploads get `413` instead of a connection reset.
+- Opening a model no longer waits when link maps are disabled or failed.
+
 ## [0.4.2] — 2026-11-07
 
 Performance optimizations and UI usability enhancements across the Electron renderer, library scanner, and bridge server.

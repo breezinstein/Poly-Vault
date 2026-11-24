@@ -162,6 +162,15 @@ ${[0, 1, 2, 3].map(() => '  - weight[0]: 1\n    weight[1]: 0\n    boneIndex[0]: 
   assert.strictEqual(convertMeshAsset(asset(yaml)).triangles, 2);
 });
 
+test('mesh asset: a vertex count larger than the vertex data is refused, not allocated', () => {
+  // A crafted file claiming 200 million vertices over 128 bytes of data must
+  // fail fast instead of allocating gigabytes.
+  const huge = modernQuad().replace('m_VertexCount: 4', 'm_VertexCount: 200000000');
+  const t0 = Date.now();
+  assert.throws(() => convertMeshAsset(asset(huge)), /does not fit/);
+  assert.ok(Date.now() - t0 < 1000, 'rejected before decoding');
+});
+
 test('mesh asset: several meshes in one file, each addressed by fileID', () => {
   const buf = asset(modernQuad({ name: 'A', fileID: '4300000' }), modernQuad({ name: 'B', fileID: '-123456789' }));
   assert.deepStrictEqual(meshAssetStructure(buf).fileIds, { 4300000: 'A', '-123456789': 'B' });

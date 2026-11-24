@@ -59,34 +59,30 @@ open http://127.0.0.1:8080    # sign in with PV_TOKEN
 
 ### Asset storage: NFS (Unity Asset Store cache) or a local path
 
-The shipped `docker-compose.yml` points at the NAS export that holds the Unity
-Asset Store cache:
+`docker-compose.yml` mounts a local folder (`PV_ASSETS`, default
+`/srv/assets`) and needs no NAS settings. To mount the libraries straight
+from NFS exports, add `docker-compose.nas.yml` on top of it, in `.env`:
 
-```yaml
-volumes:
-  - ./data:/data
-  - nas_unity_assets:/assets:ro
-
-volumes:
-  nas_unity_assets:
-    driver_opts:
-      type: nfs
-      o: "addr=${PV_NFS_ADDR:?set PV_NFS_ADDR},nolock,soft,ro,actimeo=60"
-      device: ":/export/unity-assets"
+```bash
+COMPOSE_FILE=docker-compose.yml:docker-compose.nas.yml
+PV_NFS_ADDR=nas.example.internal
+PV_NFS_EXPORT=/export/unity-assets          # Asset Store cache -> /assets
+PV_NFS_EXPORT_2=/export/second-library      # -> /libraries/$PV_LIBRARY_2_NAME
+PV_NFS_EXPORT_RIGGED=/export/rigged         # writable -> /libraries/Rigged
+PV_LIBRARY_2_NAME=Second Library
 ```
+
+The NAS file replaces the `/assets` bind mount with the NFS volume and, unless
+`PV_LIBRARIES` / `PV_RIGGED_DIR` are set, registers all three libraries and
+enables "Save to vault".
 
 Why those mount options: `nolock` (no lockd needed, read-only), `soft` (a dead
 NAS returns `EIO` instead of hanging the container), `ro` (defence in depth — the
 container never writes), `actimeo=60` (the scanner stats every file; without
 attribute caching each stat is a network round trip).
 
-For a local library, comment the NFS line and use:
-
-```yaml
-volumes:
-  - ./data:/data
-  - /srv/assets:/assets:ro      # /srv/assets/<folder> becomes a library
-```
+For a local library, keep the base file and set `PV_ASSETS` (and optionally
+`PV_ASSETS_2`, `PV_RIGGED`; see the commented mounts in `docker-compose.yml`).
 
 ### Package intelligence: thumbnails and contents from the archives
 
@@ -174,6 +170,14 @@ docker volume create poly-vault-data   # then use  poly-vault-data:/data
 | `PV_ENRICH_ROOTS` | *(empty)* | Only run Asset Store lookups for assets under these paths. |
 | `PV_PACKAGE_INDEX` | `1` | Read `.unitypackage` archives for previews/contents. `0` disables (cards keep letter avatars, instant). |
 | `PV_PACKAGE_INDEX_MAX_MB` | `4096` | Packages larger than this only get the fast preview pass (no full content listing). |
+| `PV_PACKAGE_GRAPH` | `1` | Build a link map (materials, textures, prefabs, importer settings) for every package in the background. `0` disables it and the material-aware viewer; opening a model then answers `503` with the reason. |
+| `PV_GRAPH_TIMEOUT_MS` | `1800000` | Per-package time limit for building a link map. |
+| `PV_TEXTURE_CACHE_MAX_FILES` | `20000` | Converted textures kept in `/data/packages/textures` (WebP, least recently used dropped first). |
+| `PV_MODEL_MAX_MB` | `256` | Largest model file the viewer reads, inspects or converts (on a worker thread). |
+| `PV_CONVERTED_CACHE_MAX_FILES` | `5000` | Converted GLBs (FBX 6, Unity mesh assets) kept in `/data/packages/converted`. |
+| `PV_EXTRACT_CACHE_MAX_MB` | `8192` | Size cap for files extracted from packages (`/data/packages/extracted`); least recently used packages are dropped first, hourly. |
+| `PV_RIGGED_DIR` | *(empty)* | Writable library for Mesh2Motion's "Save to vault"; must also be listed in `PV_LIBRARIES`. Empty disables saving. |
+| `PV_RIGGED_MAX_BYTES` | `268435456` | Largest rigged file accepted by "Save to vault" (`413` above it). |
 | `ASSETVAULT_NO_ENRICH` | `0` | `1` disables outbound Unity Asset Store lookups. |
 
 ## Endpoints

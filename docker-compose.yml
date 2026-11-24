@@ -1,11 +1,10 @@
-name: poly-vault-web
 services:
   poly-vault:
     build:
       context: .
       args:
-        PV_VERSION: "0.4.2"
-    image: poly-vault:0.4.2-web
+        APP_VERSION: "0.4.2-web.1"
+    image: poly-vault:0.4.2-web.1
     container_name: poly-vault
     init: true                 # reap zombies; SIGTERM reaches node
     restart: unless-stopped
@@ -33,10 +32,14 @@ services:
       # same-origin check accepts your users' Origin header.
       PV_PUBLIC_ORIGIN: "${PV_PUBLIC_ORIGIN:-}"
       # --- libraries --------------------------------------------------------
-      PV_LIBRARIES: "/assets:/libraries/${PV_LIBRARY_2_NAME:-Second Library}:/libraries/Rigged"
-      PV_LIBRARY_ROOTS: "/assets:/libraries"
+      # Colon-separated roots; each one shows up as a library in the UI
+      # (its display name is the folder name).
+      PV_LIBRARIES: "${PV_LIBRARIES:-/assets}"
+      PV_LIBRARY_ROOTS: "${PV_LIBRARY_ROOTS:-/assets:/libraries}"
       # The one writable library: Mesh2Motion's "Save to vault" lands here.
-      PV_RIGGED_DIR: "/libraries/Rigged"
+      # Must be mounted read-write and listed in PV_LIBRARIES; empty disables
+      # saving.
+      PV_RIGGED_DIR: "${PV_RIGGED_DIR:-}"
       # --- scanning / enrichment -------------------------------------------
       # Max age of a cached scan. fs.watch handles local changes immediately on
       # a local disk; inotify does NOT report changes made by other machines on
@@ -60,25 +63,25 @@ services:
       # Asset Store description scraping is outbound internet traffic; turn it
       # off on air-gapped hosts and on libraries that are already tagged.
       ASSETVAULT_NO_ENRICH: "0"
-      # Only auto-describe/auto-tag the Asset Store cache: its folder names are
-      # real product names. Hand-curated folders ("Meshes", "Models") otherwise
-      # match random store products and get misleading descriptions.
-      PV_ENRICH_ROOTS: "/assets"
+      # Only auto-describe the Asset Store cache: its folder names are real
+      # product names. Hand-curated folders ("Meshes", "Models") otherwise match
+      # random store products and get misleading descriptions.
+      PV_ENRICH_ROOTS: "${PV_ENRICH_ROOTS:-/assets}"
     volumes:
       # Metadata only (tags, descriptions, library list, import jobs).
       # A named volume is created with the right ownership (uid 10001) for you;
       # a bind mount like ./data:/data needs `chown -R 10001:10001 ./data`.
       - poly_vault_data:/data
-      # Asset libraries (read-only: Poly Vault never writes to them).
-      # 1) Unity Asset Store cache
-      - nas_unity_assets:/assets:ro
-      # 2) hand-made / other Unity assets, mounted under its own name so the
-      #    UI shows its name (PV_LIBRARY_2_NAME in .env)
-      - nas_library_2:/libraries/${PV_LIBRARY_2_NAME:-Second Library}:ro
-      # 3) rigged output from Mesh2Motion — the only writable library
-      - nas_rigged:/libraries/Rigged
-      # Local alternative (mutually exclusive with the line above):
-      # - /srv/assets:/assets:ro
+      # Asset libraries, mounted read-only (Poly Vault never writes to them).
+      # Every mounted root must also appear in PV_LIBRARIES, and inside
+      # PV_LIBRARY_ROOTS if you want to add libraries from the UI.
+      - "${PV_ASSETS:-/srv/assets}:/assets:ro"
+      # A second library, e.g. a hand-curated folder next to the store cache:
+      # - "${PV_ASSETS_2:-/srv/assets-2}:/libraries/Second Library:ro"
+      # Writable library for Mesh2Motion's "Save to vault" (set PV_RIGGED_DIR
+      # and add it to PV_LIBRARIES):
+      # - "${PV_RIGGED:-/srv/rigged}:/libraries/Rigged"
+      # NAS instead of local folders: see docker-compose.nas.yml.
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -120,36 +123,24 @@ services:
 
 volumes:
   poly_vault_data:
-  # Unity Asset Store cache on the NAS.
+
+  # Optional: mount the library straight from an NFS export (e.g. the Unity
+  # Asset Store cache on a NAS). Uncomment, set PV_NFS_ADDR / PV_NFS_EXPORT in
+  # .env, and point the service mount at it (`nas_unity_assets:/assets:ro`).
   #
   #   o= options
   #     nolock        no rpc.statd/lockd needed; the mount is read-only
-  #     soft          a dead NAS returns EIO instead of hanging the container forever
-  #     ro            belt and braces: the volume itself cannot be written
-  #     actimeo=60    cache NFS attributes for 60 s; the scanner stats every file,
-  #                   and without this each stat is a network round trip
-  #   device: ':<export path>'  (note the leading colon, and quote the space!)
-  nas_unity_assets:
-    driver_opts:
-      type: nfs
-      o: "addr=${PV_NFS_ADDR:?set PV_NFS_ADDR in .env},nolock,soft,ro,actimeo=60"
-      device: ":${PV_NFS_EXPORT:?set PV_NFS_EXPORT in .env}"
-
-  # Sibling export with other Unity assets (loose folders + .unitypackage files).
-  nas_library_2:
-    driver_opts:
-      type: nfs
-      o: "addr=${PV_NFS_ADDR:?set PV_NFS_ADDR in .env},nolock,soft,ro,actimeo=60"
-      device: ":${PV_NFS_EXPORT_2:?set PV_NFS_EXPORT_2 in .env}"
-
-  # Rigged models saved from Mesh2Motion. Read-write, and `hard` rather than
-  # `soft`: a soft mount can return EIO mid-write and leave a truncated file;
-  # hard retries until the NAS answers (writes are small and rare).
-  nas_rigged:
-    driver_opts:
-      type: nfs
-      o: "addr=${PV_NFS_ADDR:?set PV_NFS_ADDR in .env},nolock,hard,rw,actimeo=60"
-      device: ":${PV_NFS_EXPORT_RIGGED:?set PV_NFS_EXPORT_RIGGED in .env}"
+  #     soft          a dead NAS returns EIO instead of hanging the container
+  #     ro            defence in depth: the volume itself cannot be written
+  #     actimeo=60    cache NFS attributes; the scanner stats every file, and
+  #                   without this each stat is a network round trip
+  #   device: ':<export path>'   (note the leading colon)
+  #
+  # nas_unity_assets:
+  #   driver_opts:
+  #     type: nfs
+  #     o: "addr=${PV_NFS_ADDR:?set PV_NFS_ADDR},nolock,soft,ro,actimeo=60"
+  #     device: ":${PV_NFS_EXPORT:?set PV_NFS_EXPORT}"
 
 # Uncomment when using the optional Caddy service above.
 #   caddy_data:
