@@ -9,6 +9,8 @@
 #   - the FBX 7 crate renders textured and "Matches Unity" (remap -> Standard)
 #   - the prefab assembles two crates, textured, exact
 #   - the FBX 6 box is converted and shows its TGA texture
+#   - a prefab of a Unity mesh asset (two material slots) and a Collada model
+#   - a Collada model with its embedded material's texture
 #   - "Rig in Mesh2Motion" opens Create with the model loaded
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -62,15 +64,17 @@ const check = (name, ok, detail = '') => {
     const c = v.canvas; const t = document.createElement('canvas'); t.width = c.width; t.height = c.height;
     const g = t.getContext('2d'); g.drawImage(c, 0, 0);
     const d = g.getImageData(0, 0, t.width, t.height).data;
-    let lit = 0, warm = 0, cool = 0, green = 0;
+    let lit = 0, warm = 0, cool = 0, green = 0, purple = 0, red = 0;
     for (let p = 0; p < d.length; p += 16) {
       if (d[p + 3] < 10) continue; lit += 1;
       if (d[p] > d[p + 2] + 40 && d[p] > 90) warm += 1;
       if (d[p + 2] > d[p] + 40) cool += 1;
       if (d[p + 1] > d[p] + 20 && d[p + 1] > d[p + 2] + 20) green += 1;
+      if (d[p + 2] > d[p + 1] + 60 && d[p] > d[p + 1] + 40) purple += 1;
+      if (d[p] > 150 && d[p + 1] < 90 && d[p + 2] < 90) red += 1;
     }
     const meshes = []; v.object.traverse((n) => { if (n.isMesh) meshes.push(n.name); });
-    return { fidelity: v.manifest.fidelity, kind: v.manifest.kind || 'model', meshes: meshes.length, lit, warm, cool, green, converted: v.manifest.model.converted || '' };
+    return { fidelity: v.manifest.fidelity, kind: v.manifest.kind || 'model', meshes: meshes.length, lit, warm, cool, green, purple, red, converted: v.manifest.model.converted || '' };
   }, { path: PKG, entry });
 
   // The link map builds in the background on first start.
@@ -89,6 +93,14 @@ const check = (name, ok, detail = '') => {
   const old = await render('Assets/Crate/Models/OldBox.fbx');
   check('FBX 6 box converted', /FBX 6/.test(old.converted), old.converted);
   check('FBX 6 box shows its TGA texture', old.green > 20, `green ${old.green}`);
+
+  const mixed = await render('Assets/Crate/Prefabs/Mixed.prefab');
+  check('mesh asset + Collada prefab assembles', mixed.kind === 'prefab' && mixed.meshes === 2 && mixed.fidelity === 'exact', `${mixed.meshes} meshes, ${mixed.fidelity}`);
+  check('mesh asset shows both material slots (checker + purple)', mixed.purple > 20 && mixed.warm > 20, `purple ${mixed.purple}, warm ${mixed.warm}`);
+  check('prefab uses the material embedded in the Collada file', mixed.red > 20, `red ${mixed.red}`);
+
+  const barrel = await render('Assets/Crate/Models/Barrel.dae');
+  check('Collada model renders with its texture', barrel.lit > 200 && barrel.red > 20 && barrel.fidelity === 'exact', `${barrel.fidelity}, red ${barrel.red}`);
 
   await render('Assets/Crate/Models/Crate.fbx');
   const [m2m] = await Promise.all([ctx.waitForEvent('page', { timeout: 30000 }), page.click('#probe .pv3d-rig')]);

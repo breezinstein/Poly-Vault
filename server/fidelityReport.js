@@ -20,8 +20,10 @@ const { extractMany, GRAPH_SCHEMA } = require('./unityGraph');
 const { resolveModel, modelStructure } = require('./modelResolver');
 const { resolvePrefab } = require('./prefabResolver');
 const { fbxVersion, convertFbx6 } = require('./fbx6');
+const { convertMeshAsset } = require('./unityMesh');
 
-const MODEL_RE = /\.(fbx|obj)$/i;
+const MODEL_RE = /\.(fbx|obj|dae)$/i;
+const MESH_ASSET_RE = /\.asset$/i;
 
 function normalizeNote(n) {
   return n
@@ -48,6 +50,7 @@ async function run(opts = {}) {
     parts: { exact: 0, approximate: 0, missing: 0 },
     sources: {}, shaders: {}, customShaders: {}, notes: {}, fbxVersions: {},
     fbx6: { files: 0, converted: 0, failed: 0 },
+    meshAssets: { files: 0, converted: 0, failed: 0 },
   };
   const packages = [];
   const bump = (obj, k, n = 1) => { obj[k] = (obj[k] || 0) + n; };
@@ -62,12 +65,20 @@ async function run(opts = {}) {
     if (!models.length && !prefabs.length) continue;
     totals.packagesWithModels += 1;
 
-    // Models used by the sampled prefabs too, so prefab meshes resolve.
+    // Models used by the sampled prefabs (and the prefabs nested in them, as
+    // the viewer follows them), so prefab meshes resolve.
     const needed = new Set(models);
-    for (const pg of prefabs) for (const o of Object.values(graph.prefabs[pg].o || {})) {
-      const ref = o.c === 33 || o.c === 137 ? o.mesh : o.c === 1001 ? o.src : null;
-      if (ref && ref.g && graph.paths[ref.g] && MODEL_RE.test(graph.paths[ref.g])) needed.add(ref.g);
-    }
+    const visit = (pg, depth) => {
+      if (depth > 4 || !graph.prefabs[pg]) return;
+      for (const o of Object.values(graph.prefabs[pg].o || {})) {
+        const ref = o.c === 33 || o.c === 137 ? o.mesh : o.c === 1001 ? o.src : null;
+        const p = ref && ref.g && graph.paths[ref.g];
+        if (!p) continue;
+        if (MODEL_RE.test(p) || (o.c !== 1001 && MESH_ASSET_RE.test(p))) needed.add(ref.g);
+        else if (/\.prefab$/i.test(p)) visit(ref.g, depth + 1);
+      }
+    };
+    for (const pg of prefabs) visit(pg, 0);
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pv-report-'));
     const structures = new Map();
     try {
@@ -78,6 +89,10 @@ async function run(opts = {}) {
         const bytes = fs.readFileSync(p);
         const fmt = path.extname(graph.paths[g]).slice(1).toLowerCase();
         structures.set(g, modelStructure(bytes, fmt));
+        if (fmt === 'asset') {
+          totals.meshAssets.files += 1;
+          try { convertMeshAsset(bytes); totals.meshAssets.converted += 1; } catch (_) { totals.meshAssets.failed += 1; }
+        }
         if (fmt === 'fbx' && models.includes(g)) {
           const v = fbxVersion(bytes);
           bump(totals.fbxVersions, v >= 7000 ? `${Math.floor(v / 100) / 10}` : v > 0 ? '6.x' : 'unknown');
@@ -143,6 +158,7 @@ async function run(opts = {}) {
     materialSources: top(totals.sources, 20),
     fbxVersions: top(totals.fbxVersions, 20),
     fbx6: totals.fbx6,
+    meshAssets: totals.meshAssets,
     worstPackages: packages
       .map((p) => ({ name: p.name, approximate: (p.models.approximate || 0) + (p.prefabs.approximate || 0), missing: (p.models.missing || 0) + (p.prefabs.missing || 0) }))
       .filter((p) => p.missing + p.approximate > 0)
@@ -197,6 +213,7 @@ ${rows(s.materialSources)}
 ${rows(s.fbxVersions)}
 
 FBX 6.x: ${s.fbx6.files} files, ${s.fbx6.converted} converted, ${s.fbx6.failed} failed.
+Unity mesh assets used by prefabs: ${s.meshAssets ? `${s.meshAssets.files} files, ${s.meshAssets.converted} converted, ${s.meshAssets.failed} failed` : 'n/a'}.
 
 ## Packages with the most approximate/missing results
 
@@ -217,6 +234,6 @@ if (require.main === module) {
     maxPrefabs: Number(arg('--max-prefabs', 30)),
     progress: (n, total, name) => { if (n % 25 === 0) console.log(`[report] ${n}/${total} ${name}`); },
   }).then((s) => {
-    console.log(JSON.stringify({ models: s.models, prefabs: s.prefabs, percent: s.percent, fbx6: s.fbx6, seconds: s.seconds }));
+    console.log(JSON.stringify({ models: s.models, prefabs: s.prefabs, percent: s.percent, fbx6: s.fbx6, meshAssets: s.meshAssets, seconds: s.seconds }));
   }).catch((err) => { console.error(err); process.exit(1); });
 }

@@ -21,6 +21,8 @@ import { STLLoader } from './vendor/STLLoader.js';
 import { PLYLoader } from './vendor/PLYLoader.js';
 import { FBXLoader } from './vendor/FBXLoader.js';
 import { GLTFExporter } from './vendor/GLTFExporter.js';
+import { ColladaLoader } from './vendor/ColladaLoader.js';
+import { mergeGeometries } from './vendor/BufferGeometryUtils.js';
 
 const EXT = (path) => (/\.([A-Za-z0-9]+)$/.exec(path || '') || [])[1]?.toLowerCase() || '';
 const sanitize = (name) => THREE.PropertyBinding.sanitizeNodeName(String(name || ''));
@@ -47,9 +49,20 @@ function fitCamera(camera, controls, object) {
   controls.update();
 }
 
+// Collada: ColladaLoader leaves a mesh unnamed when its node also has child
+// nodes; Unity (and the manifest) name it after the node.
+function parseCollada(text, manager) {
+  const collada = new ColladaLoader(manager).parse(text, '');
+  const object = collada.scene;
+  object.traverse((n) => { if (n.isMesh && !n.name && n.parent) n.name = n.parent.name; });
+  return { object, animations: object.animations || [] };
+}
+
 async function loadModel(url, ext, manager) {
   const res = await fetch(url, { credentials: 'same-origin' });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+  if (ext === 'dae') return parseCollada(await res.text(), manager);
 
   if (ext === 'obj') {
     const text = await res.text();
@@ -366,6 +379,7 @@ async function buildPrefab(manifest, manager) {
   const parse = async (info) => {
     const buf = await fetchBuf(info.url);
     if (info.format === 'obj') return { object: new OBJLoader(manager).parse(new TextDecoder().decode(buf)), animations: [] };
+    if (info.format === 'dae') return parseCollada(new TextDecoder().decode(buf), manager);
     if (info.format === 'glb' || info.format === 'gltf') {
       const gltf = await new GLTFLoader(manager).parseAsync(buf.slice(0), '');
       return { object: gltf.scene, animations: gltf.animations || [] };
@@ -376,9 +390,23 @@ async function buildPrefab(manifest, manager) {
   const meshIndexes = new Map();
   const meshIndex = async (guid) => {
     if (!meshIndexes.has(guid)) {
-      meshIndexes.set(guid, parse(manifest.models[guid]).then(({ object }) => {
+      const info = manifest.models[guid];
+      meshIndexes.set(guid, parse(info).then(({ object }) => {
         const idx = new Map();
         object.traverse((n) => { if (n.isMesh && !idx.has(sanitize(n.name))) idx.set(sanitize(n.name), n); });
+        // glTF splits a mesh with several material slots into one child mesh
+        // per slot; a Unity renderer addresses the whole mesh, slot by slot.
+        if (info.format === 'glb' || info.format === 'gltf') {
+          object.traverse((n) => {
+            if (n.isMesh || n.children.length < 2) return;
+            if (!n.children.every((c) => c.isMesh && !c.isSkinnedMesh && c.position.lengthSq() === 0)) return;
+            const geometry = mergeGeometries(n.children.map((c) => c.geometry), true);
+            if (!geometry) return;
+            const merged = new THREE.Mesh(geometry, n.children.map((c) => c.material));
+            merged.name = n.name;
+            idx.set(sanitize(n.name), merged);
+          });
+        }
         return idx;
       }));
     }

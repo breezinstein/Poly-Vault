@@ -299,6 +299,8 @@ function translateMaterial(ctx, matGuid) {
 // --- model contents --------------------------------------------------------------
 
 const { scanFbx } = require('./fbxScan');
+const { scanCollada } = require('./colladaScan');
+const { meshAssetStructure } = require('./unityMesh');
 
 /**
  * What a model file says about itself, in one shape for every format:
@@ -311,6 +313,8 @@ function modelStructure(buffer, format) {
     if (s.ok) return s;
     return { ok: false, error: s.error, meshes: [], materials: [], textures: [], models: [], hasGeometry: true };
   }
+  if (format === 'dae') return scanCollada(buffer);
+  if (format === 'asset') return meshAssetStructure(buffer);
   if (format === 'obj') {
     const text = buffer.toString('utf8');
     const meshes = [];
@@ -332,6 +336,8 @@ function modelStructure(buffer, format) {
 
 // fileID of a mesh inside a model -> its node name (Unity naming rules).
 function meshNameFor(fileId, meta, structure) {
+  // Unity mesh assets: the prefab names the Mesh object by its own fileID.
+  if (structure && structure.fileIds) return structure.fileIds[fileId] || null;
   if (meta && meta.ids && meta.ids[fileId]) return meta.ids[fileId].n;
   const names = [...new Set([...(structure.meshes || []).map((m) => m.name), ...(structure.models || [])])];
   for (const n of names) for (let i = 0; i < 4; i += 1) if (unityFileId('Mesh', n, i) === fileId) return n;

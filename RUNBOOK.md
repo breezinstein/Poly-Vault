@@ -292,8 +292,8 @@ browser; `PV_WEBGL=0` removes it for everyone.
   `/api/package/graph-failures`; `?retry=1` on `/api/package/graph` forces one.
 - **Caches** under `/data/packages`: `graph/` (link maps, keep), `extracted/`
   (files pulled out of packages), `textures/` (converted WebP, capped by
-  `PV_TEXTURE_CACHE_MAX_FILES`), `converted/` (FBX 6 → GLB). All but `graph/`
-  are disposable.
+  `PV_TEXTURE_CACHE_MAX_FILES`), `converted/` (FBX 6 and Unity mesh assets →
+  GLB). All but `graph/` are disposable.
 - **Rigged library.** A writable NFS export, mounted read-write and `hard`
   at `/libraries/Rigged` (`PV_RIGGED_DIR`). Uploads stage in
   `/libraries/Rigged/.incoming` and are renamed into place; leftovers older

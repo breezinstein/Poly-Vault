@@ -208,7 +208,8 @@ function extractMesh(geomNode) {
         const n = layerValues(normalLayer, 'Normals', 'NormalsIndex', c.pi, c.vi, polygon, 3);
         if (n) g.nrm.push(...n);
         const uv = layerValues(uvLayer, 'UV', 'UVIndex', c.pi, c.vi, polygon, 2);
-        if (uv) g.uv.push(uv[0], 1 - uv[1]);
+        // OpenGL-style V, as FBXLoader gives: the viewer's textures use flipY.
+        if (uv) g.uv.push(uv[0], uv[1]);
       }
     }
     polyStart = i + 1;

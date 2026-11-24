@@ -20,12 +20,15 @@
 
 const path = require('path');
 const { resolveModel, translateMaterial, meshNameFor, sanitize } = require('./modelResolver');
+const { unityFileId } = require('./xxhash64');
 
 const MAX_DEPTH = 4;
 // Unity's built-in meshes (Library/unity default resources).
 const BUILTIN_MESH_GUID = '0000000000000000e000000000000000';
 const BUILTIN_MESHES = { 10202: 'cube', 10206: 'cylinder', 10207: 'sphere', 10208: 'capsule', 10209: 'plane', 10210: 'quad' };
 const MODEL_EXT = /\.(fbx|obj|dae|3ds|blend|glb|gltf)$/i;
+// Meshes a MeshFilter can point at: model files, and Unity mesh assets.
+const MESH_SOURCE = /\.(fbx|obj|dae|3ds|blend|glb|gltf|asset)$/i;
 
 // Unity writes the instance root's full transform for every PrefabInstance.
 function rootTransformMods(mods) {
@@ -80,9 +83,62 @@ function resolvePrefab(graph, entryPath, structureOf) {
     if (!out.materials[g]) out.materials[g] = translateMaterial(ctx, g);
     return g;
   };
+  // A renderer slot pointing at a material embedded in a model file (FBX
+  // "Use Embedded Materials"): find its name (name table or Unity's hashed
+  // fileID), then resolve it the way that model resolves its own materials.
+  const modelMats = new Map();
+  const modelMatKey = (ref, fallbackStructure) => {
+    const id = `${ref.g}:${ref.f}`;
+    if (modelMats.has(id)) return modelMats.get(id);
+    let key = null;
+    const own = structureOf(ref.g);
+    const meta = graph.metas[ref.g] || {};
+    const candidates = [own, fallbackStructure].filter((x) => x && x.materials && x.materials.length);
+    let name = meta.ids && meta.ids[ref.f] ? meta.ids[ref.f].n : null;
+    for (const st of candidates) {
+      for (const m of st.materials) for (let i = 0; i < 4 && !name; i += 1) if (unityFileId('Material', m.name, i) === ref.f) name = m.name;
+      if (name) break;
+    }
+    if (name) {
+      const st = candidates.find((x) => x.materials.some((m) => m.name === name))
+        || { ok: true, meshes: [], materials: [{ name, diffuse: null, normal: null }], textures: [], models: [], hasGeometry: true };
+      const res = resolveModel(graph, graph.paths[ref.g], st);
+      Object.assign(out.textures, res.textures);
+      const k = res.byName[sanitize(name)];
+      if (k && k !== 'embedded' && k !== 'default' && res.materials[k]) {
+        out.materials[k] = res.materials[k];
+        key = k;
+      } else {
+        const emb = res.embedded[sanitize(name)] || {};
+        key = `model:${ref.g}:${sanitize(name)}`;
+        out.materials[key] = {
+          name,
+          family: 'embedded',
+          shader: `embedded in ${path.basename(graph.paths[ref.g])}`,
+          exact: Boolean(emb.map),
+          color: emb.map ? [1, 1, 1, 1] : [0.8, 0.8, 0.8, 1],
+          metalness: 0,
+          roughness: 0.7,
+          alpha: 'opaque',
+          maps: { ...(emb.map ? { map: { tex: emb.map } } : {}), ...(emb.normalMap ? { normalMap: { tex: emb.normalMap, scale: 1 } } : {}) },
+        };
+      }
+    }
+    modelMats.set(id, key);
+    return key;
+  };
+  const slotKey = (m, meshStructure) => {
+    if (!m || !m.g) return null;
+    if (graph.mats[m.g]) return matKey(m.g);
+    if (graph.paths[m.g] && MODEL_EXT.test(graph.paths[m.g])) return modelMatKey(m, meshStructure);
+    return null;
+  };
   let unresolvedOverrides = 0;
   let deepOverrides = 0;
   let missingMeshes = 0;
+  const unreadable = new Set();
+  let unreadableParts = 0;
+  const absentMats = new Set();
   let seq = 0;
 
   const useModel = (guid) => {
@@ -168,20 +224,23 @@ function resolvePrefab(graph, entryPath, structureOf) {
       const renderer = rendererOf[t.go];
       if (renderer && renderer.en !== 0 && !hiddenRenderers.has(rendererId.get(renderer))) {
         const meshRef = renderer.c === 137 ? renderer.mesh : (filter && filter.mesh);
-        const mats = (renderer.mats || []).map((m) => (m && m.g ? matKey(m.g) : null));
-        if (meshRef && meshRef.g && graph.paths[meshRef.g] && MODEL_EXT.test(graph.paths[meshRef.g])) {
-          const structure = structureOf(meshRef.g);
+        const meshStructure = meshRef && meshRef.g && graph.paths[meshRef.g] ? structureOf(meshRef.g) : null;
+        const mats = (renderer.mats || []).map((m) => slotKey(m, meshStructure));
+        if (meshRef && meshRef.g && graph.paths[meshRef.g] && MESH_SOURCE.test(graph.paths[meshRef.g])) {
+          const structure = meshStructure;
           useModel(meshRef.g);
           const meshName = structure ? (meshNameFor(meshRef.f, graph.metas[meshRef.g], structure)
             || (structure.meshes.length === 1 ? structure.meshes[0].name : null)) : null;
           if (meshName) {
             node.mesh = { model: meshRef.g, name: meshName, key: sanitize(meshName), materials: mats, skinned: renderer.c === 137 };
+            (renderer.mats || []).forEach((ref, i) => { if (ref && ref.g && !mats[i]) absentMats.add(ref.g); });
             for (const m of mats) {
               const spec = m && out.materials[m];
               out.rendered.push({ mesh: node.name, slot: spec ? spec.name : null, source: 'prefab', material: m, fidelity: !m ? 'missing' : spec && spec.exact ? 'exact' : 'approximate' });
             }
           } else {
             missingMeshes += 1;
+            if (structure && structure.error) { unreadableParts += 1; unreadable.add(`${path.basename(graph.paths[meshRef.g])}: ${structure.error}`); }
             out.rendered.push({ mesh: node.name, slot: null, source: 'missing', material: null, fidelity: 'missing' });
           }
         } else if (meshRef && meshRef.g === BUILTIN_MESH_GUID && BUILTIN_MESHES[meshRef.f]) {
@@ -226,7 +285,7 @@ function resolvePrefab(graph, entryPath, structureOf) {
           const target = named && named !== '//RootNode' ? named : singleRenderer;
           if (!target) { unresolvedOverrides += 1; continue; }
           const key = sanitize(target);
-          (overrides[key] = overrides[key] || [])[Number(slot[1])] = matKey(m.r.g);
+          (overrides[key] = overrides[key] || [])[Number(slot[1])] = slotKey(m.r, structure);
         }
         const node = {
           id: `pi:${prefabGuid}:${pid}`,
@@ -266,7 +325,9 @@ function resolvePrefab(graph, entryPath, structureOf) {
 
   if (unresolvedOverrides) out.notes.push(`${unresolvedOverrides} material override(s) on nested models could not be matched to a part — their own materials are shown`);
   if (deepOverrides) out.notes.push(`${deepOverrides} override(s) inside nested prefabs are not applied (only their placement)`);
-  if (missingMeshes) out.notes.push(`${missingMeshes} part(s) use meshes that are not in this package`);
+  for (const u of [...unreadable].slice(0, 5)) out.notes.push(u);
+  if (absentMats.size) out.notes.push(`${absentMats.size} material(s) used here are not in this package`);
+  if (missingMeshes > unreadableParts) out.notes.push(`${missingMeshes - unreadableParts} part(s) use meshes that are not in this package`);
   for (const spec of Object.values(out.materials)) if (spec.note) out.notes.push(`${spec.name}: ${spec.note}`);
   out.notes = [...new Set(out.notes)];
 

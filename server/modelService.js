@@ -15,6 +15,7 @@ const { resolveModel, modelStructure, MODEL_EXT } = require('./modelResolver');
 const { resolvePrefab } = require('./prefabResolver');
 const tex = require('./textureConvert');
 const { convertFbx6, fbxVersion } = require('./fbx6');
+const { convertMeshAsset } = require('./unityMesh');
 
 const sha1 = (v) => crypto.createHash('sha1').update(v).digest('hex');
 const TEXTURE_SIZES = [256, 512, 1024, 2048, 4096];
@@ -78,17 +79,20 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
     return fs.readFileSync(p);
   }
 
-  // --- FBX 6 conversion ----------------------------------------------------------
+  // --- conversion to GLB (FBX 6, Unity mesh assets) -------------------------------
 
   const convDir = path.join(dataDir, 'packages', 'converted');
   fs.mkdirSync(convDir, { recursive: true });
-  const convPath = (src, entry) => path.join(convDir, `${sha1(`${src.real}\u0000${Math.trunc(src.stat.mtimeMs)}\u0000${entry}`)}.glb`);
+  // Bump CONVERTER_VERSION when converter output changes: files from older
+  // versions are no longer used (they stay until packages/converted is cleared).
+  const CONVERTER_VERSION = 2;
+  const convPath = (src, entry) => path.join(convDir, `${sha1(`${src.real}\u0000${Math.trunc(src.stat.mtimeMs)}\u0000${entry}\u0000v${CONVERTER_VERSION}`)}.glb`);
 
   function convertedGlb(src, entry, bytes) {
     const out = convPath(src, entry);
     if (fs.existsSync(out)) return { ok: true, file: out };
     try {
-      const { glb } = convertFbx6(bytes);
+      const { glb } = /\.asset$/i.test(entry) ? convertMeshAsset(bytes) : convertFbx6(bytes);
       fs.writeFileSync(`${out}.tmp`, glb);
       fs.renameSync(`${out}.tmp`, out);
       stats.converted = (stats.converted || 0) + 1;
@@ -98,7 +102,7 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
     }
   }
 
-  /** The converted GLB of an FBX 6 model (built by the manifest). */
+  /** The converted GLB of an FBX 6 model or a Unity mesh asset (built by the manifest). */
   async function converted(target, entry) {
     const src = await openSource(target, entry);
     if (src.error) return src;
@@ -122,14 +126,20 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
     return `/api/model/texture?path=${encodeURIComponent(src.real)}&key=${encodeURIComponent(key)}`;
   }
 
-  // URL the viewer loads for a model file; FBX 6 is served converted to GLB.
+  // URL the viewer loads for a model file; FBX 6 and Unity mesh assets are
+  // served converted to GLB.
   function modelFileUrl(src, entry, bytes) {
     const format = path.extname(entry).slice(1).toLowerCase();
+    const convertedUrl = `/api/model/converted?path=${encodeURIComponent(src.real)}&entry=${encodeURIComponent(entry)}`;
+    if (format === 'asset') {
+      const conv = convertedGlb(src, entry, bytes);
+      return conv.ok ? { url: convertedUrl, format: 'glb', meshAsset: true } : { missing: true, error: conv.error };
+    }
     if (format === 'fbx') {
       const v = fbxVersion(bytes);
       if (v > 0 && v < 7000) {
         const conv = convertedGlb(src, entry, bytes);
-        if (conv.ok) return { url: `/api/model/converted?path=${encodeURIComponent(src.real)}&entry=${encodeURIComponent(entry)}`, format: 'glb', converted: `FBX ${(v / 1000).toFixed(1)}` };
+        if (conv.ok) return { url: convertedUrl, format: 'glb', converted: `FBX ${(v / 1000).toFixed(1)}` };
       }
     }
     return { url: modelUrl(src, entry), format };
@@ -142,7 +152,7 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
     for (const o of Object.values(pf.o || {})) {
       const ref = o.c === 33 || o.c === 137 ? o.mesh : o.c === 1001 ? o.src : null;
       if (!ref || !ref.g || !graph.paths[ref.g]) continue;
-      if (MODEL_EXT.test(graph.paths[ref.g])) out.add(ref.g);
+      if (MODEL_EXT.test(graph.paths[ref.g]) || (o.c !== 1001 && /\.asset$/i.test(graph.paths[ref.g]))) out.add(ref.g);
       else if (/\.prefab$/i.test(graph.paths[ref.g])) prefabModels(graph, ref.g, depth + 1, out);
     }
     return out;
@@ -176,6 +186,7 @@ function createModelService({ packageIndex, entryCachePath, dataDir, resolveInLi
       const bytes = bytesOf.get(m);
       if (!bytes) { info.missing = true; continue; }
       Object.assign(info, modelFileUrl(src, g.paths[m], bytes));
+      if (info.error) manifest.notes.push(`${path.basename(g.paths[m])}: could not be converted (${info.error})`);
       if (info.converted) manifest.notes.push(`${path.basename(g.paths[m])}: ${info.converted} converted for the browser (no skinning or animation)`);
     }
     manifest.model = { guid: guid[0], path: src.entry, format: 'prefab' };

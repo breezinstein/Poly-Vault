@@ -198,9 +198,50 @@ composite fall back to grey.
 
 Full detail: `<data>/reports/fidelity-2026-11-23.json`; summary in Settings.
 
+### Follow-up 2026-11-24: mesh assets, Collada, embedded materials
+
+The report's 308 missing prefabs came from three gaps, now closed:
+
+- **Unity mesh assets** (`server/unityMesh.js`): `.asset` files holding
+  `!u!43` Mesh objects (text serialisation) are decoded — vertex channels for
+  Unity 4, 5–2018 and 2019+ layouts, 16/32-bit indices, triangle and quad
+  topology — mirrored into the viewer's model space and written as GLB
+  (`server/glbWriter.js`), one primitive per submesh. Compressed meshes and
+  binary assets are reported, not shown.
+- **Collada** (`server/colladaScan.js` + three.js `ColladaLoader`): node
+  meshes, materials in primitive order and their textures (sampler → surface
+  → image) feed the same resolver as FBX.
+- **Materials embedded in another model file** (character packs and similar):
+  a renderer slot pointing at an FBX's sub-asset is named by the FBX's name
+  table or Unity's hashed fileID (`xxHash64("Type:Material->" + name + i)`)
+  and resolved the way that model resolves its own materials.
+
+Found and fixed on the way:
+
+- **FBX 6 textures were upside down**: the converter wrote glTF-style V
+  (`1 - v`) but the viewer's textures use OpenGL V (flipY), like FBXLoader.
+  Converted files are versioned, so old cached GLBs are not reused.
+- **glTF meshes with several material slots** were split by GLTFLoader into
+  one mesh per slot, and prefabs only got the first; the viewer merges them
+  back (with groups) for prefab parts.
+- **Vendoring** (`scripts/flatten_webgl_vendor.py`) stopped rewriting imports
+  after ten files because `any()` short-circuits; it now rewrites all files
+  each round and fails the build if a bare `three` import is left.
+- The fidelity report now follows nested prefabs, as the viewer does
+  (earlier numbers under-counted nested parts), and prefabs that use
+  materials from outside the package say so.
+
+Verification: `tests/mesh-formats.test.js` (12), `verify-3d.sh` now 14 checks
+(mesh-asset prefab with two slots, prefab using a Collada file's embedded
+material, textured Collada model). Real packages in headless Chromium, all
+"Matches Unity": mesh-asset prefabs from two environment packs, a
+vegetation prefab and its `.dae`, a character prefab using another FBX's
+material, an FBX 6 sports car (tyres now show the tyre texture, not the paint).
+
 ### Known limits
 
-- Unity mesh assets (`.asset`) and Collada (`.dae`) are not rendered.
+- Unity mesh assets stored in binary form or with mesh compression are not
+  rendered (reported per file).
 - Custom shaders are approximate (texture slots by name).
 - Unity 4 binary prefabs/materials/scenes cannot be read (reported).
 - Overrides inside nested prefabs beyond the root transform are not applied.

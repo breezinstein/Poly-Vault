@@ -26,8 +26,8 @@ decisions taken along the way.
 | `server/thumbs.js` | WebP thumbnail cache (sharp), keyed by file+mtime+width |
 | `server/unityPackage.js`, `server/packageIndex.js`, `server/pkgWorker.js` | Reads `.unitypackage` archives: embedded previews, real content lists, type counts |
 | `server/tarWalk.js`, `server/unityYaml.js`, `server/unityGraph.js`, `server/xxhash64.js` | Link maps: one streaming pass per package keeps `.meta`/`.mat`/`.prefab`/`.unity` text and maps GUIDs, materials, prefabs and Unity's hashed sub-asset IDs |
-| `server/modelResolver.js`, `server/prefabResolver.js`, `server/fbxScan.js` | Which material each part of a model/prefab uses, in Unity's own order, and how close the browser can show it |
-| `server/modelService.js`, `server/textureConvert.js`, `server/fbx6.js` | `/api/model/*`: manifests, textures (TGA/PSD/BMP → WebP, packed metal/gloss → ORM), FBX 6 → GLB |
+| `server/modelResolver.js`, `server/prefabResolver.js`, `server/fbxScan.js`, `server/colladaScan.js` | Which material each part of a model/prefab uses, in Unity's own order, and how close the browser can show it |
+| `server/modelService.js`, `server/textureConvert.js`, `server/fbx6.js`, `server/unityMesh.js`, `server/glbWriter.js` | `/api/model/*`: manifests, textures (TGA/PSD/BMP → WebP, packed metal/gloss → ORM), FBX 6 and Unity mesh assets → GLB |
 | `server/riggedStore.js`, `rig-bridge/pv-bridge.js` | Mesh2Motion "Save to vault" (Rigged library) and the in-page bridge that loads vault models into Mesh2Motion |
 | `server/fidelityReport.js`, `scripts/fidelity-report.sh` | Library-wide report: how many models look exactly as in Unity, and why the rest do not |
 | `server/metrics.js`, `server/audit.js` | Prometheus counters + JSONL audit trail |
@@ -186,7 +186,7 @@ docker volume create poly-vault-data   # then use  poly-vault-data:/data
 | `GET /api/package/graph?path=…` | yes | Link-map status/summary of a package or loose Unity folder (`202` + queue position while it builds). |
 | `GET /api/model/manifest?path=…&entry=…` | yes | How Unity shows a model or prefab: materials per part, texture URLs, fidelity, notes. |
 | `GET /api/model/texture?path=…&key=…&w=…` | yes | One texture converted to WebP (keys are validated against the package). |
-| `GET /api/model/converted?path=…&entry=…` | yes | FBX 6 model converted to GLB. |
+| `GET /api/model/converted?path=…&entry=…` | yes | FBX 6 model or Unity mesh asset (`.asset`) converted to GLB. |
 | `POST /api/web/rigged?name=…` (+ `/preview?folder=…`) | yes | Mesh2Motion "Save to vault": FBX/GLB (magic-checked, size-capped) into the Rigged library. |
 | `GET /api/web/report` | yes | Latest 3D fidelity report summary. |
 | `GET /rig/…` | yes | Mesh2Motion (static build) with its own CSP. |
@@ -281,13 +281,16 @@ How it works (full design and measurements: [`docs/PLAN-3D-PIPELINE.md`](docs/PL
 - **One read per model.** Opening a model extracts it and the textures it is
   likely to need in a single pass over the archive (a second only when the
   model itself names more textures). Results are cached.
-- **Formats.** FBX 7 (binary/ASCII), OBJ, GLB/glTF directly; FBX 6 (2006–2010,
-  common in Unity 4-era packs) is converted to GLB on the server (static: no
-  skinning/animation). Textures: PNG, JPG, TGA, PSD (with a composite), TIF,
+- **Formats.** FBX 7 (binary/ASCII), OBJ, Collada (`.dae`), GLB/glTF directly;
+  FBX 6 (2006–2010, common in Unity 4-era packs) is converted to GLB on the
+  server (static: no skinning/animation). Unity mesh assets (`.asset` files
+  that prefabs use instead of FBX, e.g. some environment packs) are
+  converted to GLB too, one material slot per submesh. Textures: PNG, JPG, TGA, PSD (with a composite), TIF,
   BMP, GIF, WebP.
 - **Prefabs** are assembled: hierarchy, transforms, meshes (Unity's hashed
-  mesh IDs), LOD0, Unity's built-in shapes, nested prefabs (4 levels) and model
-  instances.
+  mesh IDs, FBX/Collada/mesh assets), LOD0, Unity's built-in shapes, nested
+  prefabs (4 levels) and model instances. Materials can be `.mat` files or
+  materials embedded in another model file (found by Unity's hashed IDs).
 
 **Mesh2Motion** is built into the image and served at `/rig/` behind the same
 sign-in. In the viewer, *Rig in Mesh2Motion* (static models → Create) or

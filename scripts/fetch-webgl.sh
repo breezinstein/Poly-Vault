@@ -27,7 +27,8 @@ cp "$TMP/node_modules/fflate/esm/browser.js" "$OUT/fflate.module.js"
 
 for f in controls/OrbitControls.js \
          loaders/OBJLoader.js loaders/GLTFLoader.js loaders/STLLoader.js \
-         loaders/PLYLoader.js loaders/FBXLoader.js exporters/GLTFExporter.js \
+         loaders/PLYLoader.js loaders/FBXLoader.js loaders/ColladaLoader.js \
+         exporters/GLTFExporter.js \
          utils/BufferGeometryUtils.js; do
   cp "$TMP/node_modules/three/examples/jsm/$f" "$OUT/$(basename "$f")"
 done
