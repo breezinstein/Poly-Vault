@@ -369,6 +369,105 @@ test('folder map: a change invalidates the map even after package graphs pushed 
   }
 });
 
+// --- third review -------------------------------------------------------------------
+
+test('link map: ?retry=1 (force) rebuilds a partial map before its retry is due', async () => {
+  const dataDir = fs.mkdtempSync(path.join(work, 'data-'));
+  const pkg = path.join(work, 'CorruptForce.unitypackage');
+  const good = unityPackage([{ guid: guid(80), path: 'Assets/a.txt', asset: 'a' }]);
+  fs.writeFileSync(pkg, Buffer.concat([good.subarray(0, 10), Buffer.alloc(5000, 7)]));
+  const st = fs.statSync(pkg);
+  const idx = createPackageIndex({ dir: dataDir, log: quiet });   // default wait: 10 min
+  try {
+    idx.enqueueGraph(pkg, st.mtimeMs, st.size, { priority: true });
+    await until(() => idx.graphState(pkg, st.mtimeMs, st.size).attempts === 1);
+    assert.strictEqual(idx.enqueueGraph(pkg, st.mtimeMs, st.size), false, 'not due yet');
+    assert.strictEqual(idx.enqueueGraph(pkg, st.mtimeMs, st.size, { force: true }), true, 'forced');
+    await until(() => idx.graphState(pkg, st.mtimeMs, st.size).attempts === 2);
+  } finally {
+    idx.close();
+  }
+});
+
+function prefabPart(n, meshGuid) {
+  const go = n * 10;
+  return `--- !u!1 &${go}
+GameObject:
+  m_Component:
+  - component: {fileID: ${go + 1}}
+  - component: {fileID: ${go + 2}}
+  m_Name: Part${n}
+--- !u!4 &${go + 1}
+Transform:
+  m_GameObject: {fileID: ${go}}
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: ${n}, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_Children: []
+  m_Father: {fileID: 0}
+--- !u!33 &${go + 2}
+MeshFilter:
+  m_GameObject: {fileID: ${go}}
+  m_Mesh: {fileID: 4300000, guid: ${meshGuid}, type: 3}
+`;
+}
+
+test('prefab manifest: stops after two model timeouts, says so; refresh=1 reads skipped files again', async () => {
+  const lib = path.join(work, 'PrefabLib');
+  const kit = path.join(lib, 'Kit');
+  const names = ['hang1.fbx', 'hang2.fbx', 'ok1.fbx', 'ok2.fbx'];
+  names.forEach((n, i) => looseAsset(kit, n, 90 + i, 'not really an fbx'));
+  looseAsset(kit, 'Machine.prefab', 99, `%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n${names.map((n, i) => prefabPart(i + 1, guid(90 + i))).join('')}`);
+  const idx = createPackageIndex({ dir: fs.mkdtempSync(path.join(work, 'data-')), log: quiet });
+  const svc = createModelService({
+    packageIndex: idx, entryCachePath: () => '', dataDir: fs.mkdtempSync(path.join(work, 'svc-')),
+    resolveInLibrary: (p) => p, libraryRootOf: () => lib, log: quiet,
+    workerTimeoutMs: 300, workerFile: path.join(__dirname, 'fixtures', 'hang-worker.js'),
+  });
+  try {
+    const prefab = path.join(kit, 'Machine.prefab');
+    const res = await withTimeout(svc.manifest(prefab, ''), 15000, 'prefab manifest');
+    assert.ok(res.ok, res.message);
+    const notes = res.manifest.notes.join('\n');
+    assert.match(notes, /stopped reading model files after 2 of 4: two model files timed out/);
+    assert.strictEqual(svc.stats().prefabsStopped, 1);
+    assert.strictEqual(svc.stats().skippedFiles, 2);
+    // Without refresh the skipped files are answered from the skip list...
+    await svc.manifest(prefab, '');
+    assert.strictEqual(svc.stats().workerTimeouts, 2);
+    // ...with refresh=1 they are read again (and time out again here).
+    await withTimeout(svc.manifest(prefab, '', { refresh: true }), 15000, 'refresh');
+    assert.strictEqual(svc.stats().refreshes, 1);
+    assert.strictEqual(svc.stats().workerTimeouts, 4);
+  } finally {
+    svc.close();
+    idx.close();
+  }
+});
+
+test('prefab manifest: an exhausted time budget leaves the remaining models missing, with a note', async () => {
+  const lib = path.join(work, 'BudgetLib');
+  const kit = path.join(lib, 'Kit');
+  looseAsset(kit, 'a.fbx', 110, 'x');
+  looseAsset(kit, 'b.fbx', 111, 'x');
+  looseAsset(kit, 'Pair.prefab', 112, `%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n${prefabPart(1, guid(110))}${prefabPart(2, guid(111))}`);
+  const idx = createPackageIndex({ dir: fs.mkdtempSync(path.join(work, 'data-')), log: quiet });
+  const svc = createModelService({
+    packageIndex: idx, entryCachePath: () => '', dataDir: fs.mkdtempSync(path.join(work, 'svc-')),
+    resolveInLibrary: (p) => p, libraryRootOf: () => lib, log: quiet,
+    prefabBudgetMs: -1, workerFile: path.join(__dirname, 'fixtures', 'hang-worker.js'),
+  });
+  try {
+    const res = await svc.manifest(path.join(kit, 'Pair.prefab'), '');
+    assert.ok(res.ok, res.message);
+    assert.ok(res.manifest.notes.some((n) => /after 0 of 2: the 0 s time budget ran out/.test(n)), res.manifest.notes.join(' | '));
+    assert.ok(Object.values(res.manifest.models).every((m) => m.missing));
+  } finally {
+    svc.close();
+    idx.close();
+  }
+});
+
 (async () => {
   let failed = 0;
   let passed = 0;

@@ -689,8 +689,8 @@ export async function mountUnity(container, source) {
   if (stage.disposed) return { dispose() {}, triangles: 0, manifest, object: null, skinned: false, clips: 0 };
   // A file the server could not convert (FBX 6): the browser cannot read it
   // either, so explain instead of failing inside the loader.
-  if (manifest.kind !== 'prefab' && manifest.fidelity === 'unviewable') {
-    stage.note.textContent = manifest.model.unviewable || "this model can't be shown in the browser";
+  if (manifest.fidelity === 'unviewable') {
+    stage.note.textContent = manifest.unviewable || (manifest.model && manifest.model.unviewable) || "this can't be shown in the browser";
     const overlay = el('div', 'pv3d-overlay');
     overlay.appendChild(fidelityPanel(manifest));
     container.appendChild(overlay);

@@ -207,7 +207,9 @@ function buildFolderGraph(dir, opts = {}) {
       let isDir = false;
       try { isDir = fs.statSync(target).isDirectory(); } catch (_) { continue; }
       if (isDir) continue;
-      const group = { pathname: targetRel, meta: metaText };
+      // The asset file exists: lets finishGuid record Unity 4 binary .mat /
+      // .prefab files the way it does inside packages.
+      const group = { pathname: targetRel, meta: metaText, hasAsset: true };
       const ext = extOf(targetRel);
       if (ext === '.mat' || ext === '.prefab' || ext === '.unity') {
         try {
@@ -218,7 +220,7 @@ function buildFolderGraph(dir, opts = {}) {
             if (text.startsWith('%YAML')) group.yaml = text;
           } else group.yamlTruncated = true;
           if (!group.yaml && !group.yamlTruncated) group.yaml = '';
-        } catch (_) { /* unreadable: skip body */ }
+        } catch (_) { group.hasAsset = false; /* unreadable: not "binary", just skip the body */ }
       }
       finishGuid(graph, guid, group);
     }

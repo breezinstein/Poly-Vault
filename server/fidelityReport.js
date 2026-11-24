@@ -68,7 +68,7 @@ async function run(opts = {}) {
   const totals = {
     packages: 0, folders: 0, packagesWithModels: 0,
     models: { exact: 0, approximate: 0, missing: 0, unviewable: 0, none: 0, error: 0 },
-    prefabs: { exact: 0, approximate: 0, missing: 0, none: 0, error: 0 },
+    prefabs: { exact: 0, approximate: 0, missing: 0, unviewable: 0, none: 0, error: 0 },
     parts: { exact: 0, approximate: 0, missing: 0 },
     sources: {}, shaders: {}, customShaders: {}, notes: {}, fbxVersions: {},
     fbx6: { files: 0, converted: 0, failed: 0 },
@@ -228,13 +228,13 @@ ${s.sampling.maxModelsPerPackage} models and ${s.sampling.maxPrefabsPerPackage} 
 | | exact | approximate | missing | unviewable | no geometry | errors | total |
 |---|---|---|---|---|---|---|---|
 | models | ${s.models.exact} | ${s.models.approximate} | ${s.models.missing} | ${s.models.unviewable || 0} | ${s.models.none} | ${s.models.error} | ${s.models.total} |
-| prefabs | ${s.prefabs.exact} | ${s.prefabs.approximate} | ${s.prefabs.missing} | – | ${s.prefabs.none} | ${s.prefabs.error} | ${s.prefabs.total} |
+| prefabs | ${s.prefabs.exact} | ${s.prefabs.approximate} | ${s.prefabs.missing} | ${s.prefabs.unviewable || 0} | ${s.prefabs.none} | ${s.prefabs.error} | ${s.prefabs.total} |
 
 Models with geometry: **${s.percent.modelsExact}% exact**, ${s.percent.modelsApproximate}% approximate,
 ${s.percent.modelsMissing}% missing. Prefabs: ${s.percent.prefabsExact}% exact.
 
 Percentages are of everything except "no geometry": errors (files that could not be read)
-and unviewable models (FBX 6 that could not be converted) count against "exact" on purpose,
+and unviewable results (FBX 6 that could not be converted, Unity 4 binary prefabs) count against "exact" on purpose,
 since the viewer cannot show them as Unity does.
 
 ## Why results are approximate or missing

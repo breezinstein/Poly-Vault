@@ -304,7 +304,7 @@ function createPackageIndex({
       return;
     }
     const mtime = Math.trunc(stat.mtimeMs);
-    if (graphFresh(job.file, mtime, stat.size) && !(job.retry && partialRetryDue(job.file, mtime, stat.size))) return;
+    if (graphFresh(job.file, mtime, stat.size) && !(job.retry && (job.force || partialRetryDue(job.file, mtime, stat.size)))) return;
     graphActiveFile = job.file;
     const started = Date.now();
     const out = graphPath(job.file, mtime, stat.size);
@@ -349,11 +349,12 @@ function createPackageIndex({
   function enqueueGraph(file, mtimeMs, size, opts = {}) {
     if (!useGraph || !file || !mtimeMs || !size) return false;
     const retry = Boolean(graphFresh(file, mtimeMs, size));
-    if (retry && !partialRetryDue(file, mtimeMs, size)) return false;
+    // A partial map is rebuilt when its retry is due, or at once when forced (?retry=1).
+    if (retry && !opts.force && !partialRetryDue(file, mtimeMs, size)) return false;
     if (graphQueued.has(file) || graphActiveFile === file) return false;
     const failed = graphFailed(file, mtimeMs, size);
     if (!retry && failed && failed.count >= 3 && !opts.force) return false;
-    const item = { file, size, mtimeMs: Math.trunc(mtimeMs), retry };
+    const item = { file, size, mtimeMs: Math.trunc(mtimeMs), retry, force: Boolean(opts.force) };
     // On-demand requests (someone opened a model) jump the background queue.
     if (opts.priority) graphQueue.unshift(item); else graphQueue.push(item);
     graphQueued.add(file);

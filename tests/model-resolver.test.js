@@ -269,10 +269,11 @@ test('prefab: built-in Unity meshes (Plane) and stripped transforms', () => {
   assert.strictEqual(m.fidelity, 'exact');
 });
 
-test('prefab: binary (Unity 4) prefab is reported, not shown', () => {
+test('prefab: binary (Unity 4) prefab is reported as unviewable, with the reason', () => {
   const gr = graph({ paths: { [g(1)]: 'Assets/Old.prefab' }, prefabs: { [g(1)]: { o: {}, bin: 1 } } });
   const m = resolvePrefab(gr, 'Assets/Old.prefab', () => null);
-  assert.strictEqual(m.fidelity, 'none');
+  assert.strictEqual(m.fidelity, 'unviewable');
+  assert.match(m.unviewable, /binary form/);
   assert.ok(m.notes.some((n) => /binary/.test(n)));
 });
 
@@ -436,6 +437,30 @@ function binaryFbx6() {
   const conBuf = conns(27 + objBuf.length);
   return Buffer.concat([header, objBuf, conBuf, NULL]);
 }
+
+test('FBX: a truncated or junk binary file is an error, not "no meshes"', () => {
+  const good = binaryFbx6();
+  assert.strictEqual(scanFbx(good).ok, true);
+  const cut = scanFbx(good.subarray(0, 100));
+  assert.strictEqual(cut.ok, false);
+  assert.match(cut.error, /truncated/);
+  const junk = scanFbx(Buffer.concat([good.subarray(0, 27), Buffer.alloc(80, 0xab)]));
+  assert.strictEqual(junk.ok, false);
+  assert.match(junk.error, /no records/);
+  // No closing null record, footer bytes instead: still a good file.
+  const footer = Buffer.concat([good.subarray(0, good.length - 13), Buffer.from([0xfa, 0xbc, 0xab, 0x09, 0xd0, 0xc8, 0xd4, 0x66, 0xb1, 0x76, 0xfb, 0x83, 0x1c, 0xf7, 0x26, 0x7e])]);
+  assert.strictEqual(scanFbx(footer).ok, true);
+  assert.throws(() => convertFbx6(good.subarray(0, 100)), /truncated/);
+});
+
+test('fidelity: an unreadable structure is approximate with a reason, never exact or "no meshes"', () => {
+  const gr = graph({ paths: { [g(1)]: 'Assets/K/Broken.fbx' }, metas: { [g(1)]: { imp: 'ModelImporter', mat: { mode: 1, name: 0, search: 1, location: 1 } } } });
+  const broken = { ok: false, error: 'FBX: the file is truncated', meshes: [], materials: [], textures: [], models: [], hasGeometry: false };
+  const m = resolveModel(gr, 'Assets/K/Broken.fbx', broken);
+  assert.strictEqual(m.fidelity, 'approximate');
+  assert.ok(m.notes.some((n) => /could not read the model's structure \(FBX: the file is truncated\)/.test(n)));
+  assert.ok(!m.notes.some((n) => /no meshes/.test(n)));
+});
 
 test('FBX 6 binary (zlib arrays) -> GLB', () => {
   const buf = binaryFbx6();

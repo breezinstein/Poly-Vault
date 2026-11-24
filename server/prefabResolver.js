@@ -321,6 +321,13 @@ function resolvePrefab(graph, entryPath, structureOf) {
     out.notes.push('prefab not found in the link map');
     return out;
   }
+  if (graph.prefabs[rootGuid].bin) {
+    // Unity 4 "force binary" prefab: only Unity can read it.
+    out.fidelity = 'unviewable';
+    out.unviewable = 'this prefab is stored in Unity 4 binary form, which only Unity can read';
+    out.notes.push(out.unviewable);
+    return out;
+  }
   expand(rootGuid, null, 0, null);
 
   if (unresolvedOverrides) out.notes.push(`${unresolvedOverrides} material override(s) on nested models could not be matched to a part — their own materials are shown`);

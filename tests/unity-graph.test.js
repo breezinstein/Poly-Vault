@@ -367,6 +367,25 @@ test('folder graph: loose Unity folder with .meta files', () => {
   assert.ok(!('eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' in g.paths));
 });
 
+test('folder graph: Unity 4 binary materials and prefabs are recorded as binary', () => {
+  const dir = path.join(work, 'LooseBinary');
+  fs.mkdirSync(path.join(dir, 'M'), { recursive: true });
+  const binary = Buffer.from([0, 0, 0, 0x10, 0, 0, 0, 0x22, 0xff, 0xfe, 1, 2, 3]);
+  fs.writeFileSync(path.join(dir, 'M', 'Bin.mat'), binary);
+  fs.writeFileSync(path.join(dir, 'M', 'Bin.mat.meta'), `fileFormatVersion: 2\nguid: ${G.binmat}\n`);
+  fs.writeFileSync(path.join(dir, 'M', 'Text.mat'), URP_MAT);
+  fs.writeFileSync(path.join(dir, 'M', 'Text.mat.meta'), `fileFormatVersion: 2\nguid: ${G.mat}\n`);
+  fs.writeFileSync(path.join(dir, 'M', 'Binary.prefab'), binary);
+  fs.writeFileSync(path.join(dir, 'M', 'Binary.prefab.meta'), `fileFormatVersion: 2\nguid: ${G.prefab}\n`);
+  // A .meta whose asset is gone records nothing.
+  fs.writeFileSync(path.join(dir, 'M', 'Gone.mat.meta'), `fileFormatVersion: 2\nguid: ${G.nested}\n`);
+  const g = buildFolderGraph(dir);
+  assert.deepStrictEqual(g.mats[G.binmat], { n: 'Bin', bin: 1 });
+  assert.strictEqual(g.mats[G.mat].n, 'BladeMat');
+  assert.deepStrictEqual(g.prefabs[G.prefab], { o: {}, bin: 1 });
+  assert.ok(!(G.nested in g.paths) && !(G.nested in g.mats));
+});
+
 test('contents from the link map: big package listing filled, known sizes kept', () => {
   const { contentsFromGraph } = require('../server/unityPackage');
   // The contents pass read 2 files before its byte budget; the link map has 4.

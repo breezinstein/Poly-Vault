@@ -33,7 +33,7 @@ async function writeAtomic(out, data) {
 
 function createModelService({
   packageIndex, entryCachePath, dataDir, resolveInLibrary, libraryRootOf, log = console, maxTextureFiles = 20000,
-  maxModelBytes = 256 * 1024 * 1024, maxConvertedFiles = 5000, workerTimeoutMs = 120000,
+  maxModelBytes = 256 * 1024 * 1024, maxConvertedFiles = 5000, workerTimeoutMs = 120000, prefabBudgetMs = 180000,
   workerFile = path.join(__dirname, 'modelWorker.js'),
 }) {
   const texDir = path.join(dataDir, 'packages', 'textures');
@@ -42,6 +42,7 @@ function createModelService({
   let writes = 0;
   const stats = {
     manifests: 0, passes: 0, textures: 0, textureHits: 0, textureErrors: 0, workerStarts: 0, workerErrors: 0, workerTimeouts: 0,
+    prefabsStopped: 0, refreshes: 0,
   };
 
   // --- sources: a package (archive) or a loose Unity folder ---------------------
@@ -157,7 +158,8 @@ function createModelService({
     const state = current;
     if (!state || !state.jobs.size || Date.now() - state.since < workerTimeoutMs) return;
     const [[stuckId, stuck], ...rest] = [...state.jobs.entries()];
-    const reason = `model worker gave up after ${Math.round(workerTimeoutMs / 1000)} s on this file (corrupt or too complex?)`;
+    const reason = `model worker gave up after ${Math.round(workerTimeoutMs / 1000)} s on this file (corrupt or too complex?);`
+      + ' it is skipped until it changes or the manifest is requested with refresh=1';
     stats.workerTimeouts += 1;
     log.warn(`[poly-vault] model worker timed out on ${stuck.msg.file}: restarting it; the file is skipped until it changes`);
     const key = fileKey(stuck.msg.file);
@@ -196,7 +198,18 @@ function createModelService({
   // versions are no longer used (they stay until packages/converted is cleared).
   const CONVERTER_VERSION = 2;
   const PREFAB_MODEL_CAP = 256;
-  const convPath = (src, entry) => path.join(convDir, `${sha1(`${src.real}\u0000${Math.trunc(src.stat.mtimeMs)}\u0000${entry}\u0000v${CONVERTER_VERSION}`)}.glb`);
+  // Keyed on the source's version: the package's, or in a loose folder the
+  // model file's own date and size (a prefab's meshes are separate files).
+  const convPath = (src, entry) => {
+    let stamp = String(Math.trunc(src.stat.mtimeMs));
+    if (src.kind === 'folder') {
+      try {
+        const st = fs.statSync(path.join(src.real, ...entry.split('/')));
+        stamp = `${Math.trunc(st.mtimeMs)}:${st.size}`;
+      } catch (_) { /* missing: the read fails later and says so */ }
+    }
+    return path.join(convDir, `${sha1(`${src.real}\u0000${stamp}\u0000${entry}\u0000v${CONVERTER_VERSION}`)}.glb`);
+  };
   let convWrites = 0;
   // Converted GLBs are a disposable cache: keep the newest maxConvertedFiles.
   function noteConverted(conv) {
@@ -297,11 +310,22 @@ function createModelService({
     await ensureExtracted(src, models);
     const structures = new Map();
     const infoOf = new Map();
+    // One request must not run for hours: each model may take up to the
+    // worker timeout, so the whole prefab gets a budget and stops after a few
+    // timeouts; the models not read are shown as missing, with a note.
+    const deadline = Date.now() + prefabBudgetMs;
+    let timeouts = 0;
+    let read = 0;
+    let stopped = '';
     for (const m of models) {
+      if (Date.now() > deadline) { stopped = `the ${Math.round(prefabBudgetMs / 1000)} s time budget ran out`; break; }
+      if (timeouts >= 2) { stopped = 'two model files timed out'; break; }
+      read += 1;
       let file;
       try { file = sourcePath(src, m); } catch (_) { continue; }   // not extracted: shown as missing
       if (!fs.existsSync(file)) continue;
       const info = await inspect(src, m, g.paths[m], file);
+      if (info.timedOut) timeouts += 1;
       if (!info.ok) { infoOf.set(m, info); continue; }
       infoOf.set(m, info);
       structures.set(m, info.structure);
@@ -328,6 +352,10 @@ function createModelService({
     }
     if (allModels.length > models.length) {
       manifest.notes.push(`this prefab uses ${allModels.length} model files; only the first ${models.length} are loaded`);
+    }
+    if (stopped) {
+      manifest.notes.push(`stopped reading model files after ${read} of ${models.length}: ${stopped}; the rest are shown as missing`);
+      stats.prefabsStopped += 1;
     }
     manifest.model = { guid: guid[0], path: src.entry, format: 'prefab' };
     manifest.source = { kind: src.kind, path: src.real, entry: src.entry };
@@ -404,10 +432,27 @@ function createModelService({
     return { ok: true, manifest };
   }
 
-  async function manifest(target, entry) {
+  // ?refresh=1: forget files the watchdog gave up on under this source, and
+  // the converted GLBs of this model (or of every model a prefab uses), so the
+  // next read starts over.
+  function forget(src) {
+    const under = src.kind === 'package'
+      ? path.dirname(entryCachePath(src.real, src.stat, 'x')) + path.sep
+      : src.real + path.sep;
+    for (const key of [...badFiles.keys()]) if (key.startsWith(under)) badFiles.delete(key);
+    const guid = Object.entries(src.graph.paths).find(([, p]) => p === src.entry);
+    const entries = /\.prefab$/i.test(src.entry) && guid
+      ? [...prefabModels(src.graph, guid[0])].map((m) => src.graph.paths[m])
+      : [src.entry];
+    for (const e of entries) fs.rmSync(convPath(src, e), { force: true });
+    stats.refreshes += 1;
+  }
+
+  async function manifest(target, entry, opts = {}) {
     const src = await openSource(target, entry);
     if (src.error) return src;
     if (src.pending) return { pending: true, state: src.state, position: src.position, error: src.error };
+    if (opts.refresh) forget(src);
     const key = `${src.real}\u0000${src.entry}\u0000${src.graph.builtAt || ''}`;
     if (inFlight.has(key)) return inFlight.get(key);
     const job = buildManifest(src).then((res) => {

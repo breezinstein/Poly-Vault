@@ -578,14 +578,18 @@ function resolveModel(graph, entryPath, structure) {
   for (const r of rendered) r.fidelity = fidelityOf(r);
 
   let fidelity;
-  if (!structure.hasGeometry) fidelity = 'none';
+  // Unreadable structure (truncated, corrupt): never "exact", never "no meshes".
+  // The browser loader may still read it, so this is approximate, with a note.
+  if (structure.ok === false) fidelity = 'approximate';
+  else if (!structure.hasGeometry) fidelity = 'none';
   else if (!rendered.length) fidelity = structure.opaque ? 'approximate' : 'exact';
   else if (rendered.every((r) => r.fidelity === 'exact')) fidelity = 'exact';
   else if (rendered.every((r) => r.fidelity === 'missing')) fidelity = 'missing';
   else fidelity = 'approximate';
 
-  if (!structure.hasGeometry) notes.push('no meshes in this file (animation or rig only)');
-  if (structure.ok === false) notes.push(`could not read the model's structure: ${structure.error}`);
+  if (structure.ok === false) {
+    notes.push(`could not read the model's structure (${structure.error}): only Unity's material-search rules were applied`);
+  } else if (!structure.hasGeometry) notes.push('no meshes in this file (animation or rig only)');
   if (rules.mode === 0) notes.push('the model imports no materials ("None"): Unity shows prefab materials or its default material');
   if (fileTexturesMissing) notes.push(`${fileTexturesMissing} texture file(s) referenced by the model are not in the package`);
   if (fileTexturesRenamed) notes.push(`${fileTexturesRenamed} texture file(s) referenced by the model were matched to differently named files`);

@@ -290,8 +290,17 @@ browser; `PV_WEBGL=0` removes it for everyone.
   that bumps their schema (currently 2): roughly one full read of the library
   (~110 GB, 30–60 min on 1 GbE), behind thumbnails, one package at a time.
   Watch `/healthz` → `packages.graph` (`ready`, `queued`, `building`,
-  `failed`). Packages that failed three times are listed at
+  `failed`, `partial`). Packages that failed three times are listed at
   `/api/package/graph-failures`; `?retry=1` on `/api/package/graph` forces one.
+  That list also holds *partial* maps (`"partial": true`: the archive could
+  only be read in part, e.g. a read error or a file still being copied). They
+  are used as they are and rebuilt on their own after 10 min × attempt, up to
+  3 attempts; `?retry=1` rebuilds one now.
+- **Model worker.** A model that takes longer than `PV_MODEL_TIMEOUT_S`
+  restarts the worker and is then skipped until the file changes (count in
+  `/healthz` → `models.skippedFiles`). `?refresh=1` on `/api/model/manifest`
+  forgets skipped files under that package or folder and its converted GLBs,
+  so the next request reads them again.
 - **Caches** under `/data/packages`: `graph/` (link maps, keep), `extracted/`
   (files pulled out of packages), `textures/` (converted WebP, capped by
   `PV_TEXTURE_CACHE_MAX_FILES`), `converted/` (FBX 6 and Unity mesh assets →

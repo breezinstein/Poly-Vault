@@ -11,6 +11,14 @@ const zlib = require('zlib');
 
 const MAX_DEPTH = 64;   // real files nest ~6 deep
 
+// Does the record header at `off` carry a plausible node name ("Objects", "C", ...)?
+function looksLikeRecord(buf, off, wide) {
+  const nameLen = buf[off + (wide ? 24 : 12)];
+  const start = off + (wide ? 25 : 13);
+  if (!nameLen || start + nameLen > buf.length) return false;
+  return /^[A-Za-z][A-Za-z0-9_]*$/.test(buf.toString('latin1', start, start + nameLen));
+}
+
 // --- generic FBX node tree ---------------------------------------------------------
 // node: { name, props: [...], children: [node] }
 
@@ -94,7 +102,13 @@ function readBinaryTree(buf) {
   let off = 27;
   while (off < buf.length - nullSize) {
     const end = wide ? Number(buf.readBigUInt64LE(off)) : buf.readUInt32LE(off);
-    if (end === 0 || end > buf.length) break;   // end of file, or truncated: keep what was read
+    if (end === 0) break;   // the null record that ends the top level
+    if (end > buf.length) {
+      // A writer that skips the closing null record leaves the footer here:
+      // only a record with a real node name means the file was cut short.
+      if (!looksLikeRecord(buf, off, wide)) break;
+      throw new Error(`FBX: the file is truncated (record at ${off} ends past its ${buf.length} bytes)`);
+    }
     if (end <= off) throw new Error(`FBX: node record at ${off} has a bad end offset (${end})`);
     const [node] = readNode(off);
     root.children.push(node);

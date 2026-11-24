@@ -175,7 +175,8 @@ docker volume create poly-vault-data   # then use  poly-vault-data:/data
 | `PV_FOLDER_GRAPH_BUDGET_MS` | `60000` | Time limit for mapping a loose asset folder; past it the map is partial and the viewer says so. |
 | `PV_TEXTURE_CACHE_MAX_FILES` | `20000` | Converted textures kept in `/data/packages/textures` (WebP, least recently used dropped first). |
 | `PV_MODEL_MAX_MB` | `256` | Largest model file the viewer reads, inspects or converts (on a worker thread). |
-| `PV_MODEL_TIMEOUT_S` | `120` | Longest one model may take on the model worker; past it the worker restarts, that request fails, and the file is skipped until it changes (see `/healthz` → `models`). |
+| `PV_MODEL_TIMEOUT_S` | `120` | Longest one model may take on the model worker; past it the worker restarts, that request fails, and the file is skipped until it changes or a manifest is requested with `refresh=1` (see `/healthz` → `models`). |
+| `PV_PREFAB_BUDGET_S` | `180` | Longest a prefab's manifest spends reading its model files (it also stops after two timeouts); models not read are shown as missing, with a note. |
 | `PV_CONVERTED_CACHE_MAX_FILES` | `5000` | Converted GLBs (FBX 6, Unity mesh assets) kept in `/data/packages/converted`. |
 | `PV_EXTRACT_CACHE_MAX_MB` | `24576` (24 GB) | Size cap for files extracted from packages (`/data/packages/extracted`); least recently used packages are dropped first, hourly. |
 | `PV_RIGGED_DIR` | *(empty)* | Writable library for Mesh2Motion's "Save to vault"; must also be listed in `PV_LIBRARIES`. Empty disables saving. |

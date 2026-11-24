@@ -32,6 +32,11 @@ All notable changes to **Poly Vault** are documented here. Format follows
 - A package whose link map could only be read in part (read error, time budget) is marked partial, listed in `/api/package/graph-failures` and `/healthz`, and rebuilt later (up to 3 attempts); the viewer notes partial maps for packages too.
 - Models that cannot be shown in the browser (FBX 6 the converter cannot read) get an "unviewable" verdict instead of "Matches Unity"; the fidelity report counts them separately and explains its percentages.
 - Folder link-map invalidation reaches maps no longer held in memory.
+- Loose folders record Unity 4 binary materials and prefabs like packages do (binary materials fall back to name matching with a note; a binary prefab says it can only be read by Unity).
+- Truncated or unreadable models are no longer reported as "No meshes" or "Matches Unity": a binary FBX cut short says so, and an unreadable structure gives "Close to Unity" with an explanation.
+- `?retry=1` on `/api/package/graph` rebuilds a partial link map at once.
+- A prefab manifest stops reading model files after `PV_PREFAB_BUDGET_S` or two timeouts; `?refresh=1` on `/api/model/manifest` clears files the model worker skipped.
+- Converted meshes of loose-folder prefabs refresh when a mesh file is re-exported.
 - Extracted package files used in the last 15 minutes are never pruned, and a request whose file was pruned extracts it again; textures are read off the event loop; two requests for the same conversion share one.
 
 ## [0.4.2] — 2026-11-07

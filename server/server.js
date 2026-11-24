@@ -307,6 +307,7 @@ const modelService = createModelService({
   maxModelBytes: Number(env.PV_MODEL_MAX_MB || 256) * 1024 * 1024,
   maxConvertedFiles: Number(env.PV_CONVERTED_CACHE_MAX_FILES || 5000),
   workerTimeoutMs: Number(env.PV_MODEL_TIMEOUT_S || 120) * 1000,
+  prefabBudgetMs: Number(env.PV_PREFAB_BUDGET_S || 180) * 1000,
 });
 
 const enrichment = createEnrichment({
@@ -1280,7 +1281,9 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     // A partial map is used, and rebuilt in the background when that is due.
-    if (graph.complete === false) packageIndex.enqueueGraph(real, stat.mtimeMs, stat.size);
+    if (graph.complete === false) {
+      packageIndex.enqueueGraph(real, stat.mtimeMs, stat.size, { priority: true, force: url.searchParams.get('retry') === '1' });
+    }
     const st = packageIndex.graphState(real, stat.mtimeMs, stat.size);
     sendJson(res, 200, {
       ok: true, path: real, state: 'ready', summary: packageIndex.graphSummary(graph), errors: graph.errors,
@@ -1295,7 +1298,9 @@ const server = http.createServer(async (req, res) => {
 
   // --- a model the way Unity shows it: materials, textures, fidelity ---------
   if (route === '/api/model/manifest') {
-    const result = await modelService.manifest(url.searchParams.get('path'), url.searchParams.get('entry'));
+    const result = await modelService.manifest(url.searchParams.get('path'), url.searchParams.get('entry'), {
+      refresh: url.searchParams.get('refresh') === '1',
+    });
     if (result.pending) {
       metrics.counter('pv_model_manifest_pending_total');
       sendJson(res, 202, { ok: false, pending: true, state: result.state, position: result.position || 0, error: result.error || '' });
