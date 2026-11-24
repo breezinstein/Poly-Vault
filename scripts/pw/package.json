@@ -1,0 +1,8 @@
+{
+  "name": "poly-vault-browser-checks",
+  "private": true,
+  "description": "Pinned test runner for scripts/verify-ui.sh and scripts/verify-3d.sh (installed with npm ci).",
+  "dependencies": {
+    "playwright": "1.65.0"
+  }
+}

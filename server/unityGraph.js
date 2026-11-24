@@ -177,6 +177,7 @@ async function buildPackageGraph(file, opts = {}) {
 function buildFolderGraph(dir, opts = {}) {
   const started = Date.now();
   const maxFiles = opts.maxFiles || 50000;
+  const deadline = opts.timeBudgetMs ? started + opts.timeBudgetMs : Infinity;
   const graph = emptyGraph('folder', dir, null);
   let seen = 0;
   let newest = 0;
@@ -185,9 +186,10 @@ function buildFolderGraph(dir, opts = {}) {
     try { entries = fs.readdirSync(abs, { withFileTypes: true }); } catch (_) { return; }
     for (const e of entries) {
       if (seen >= maxFiles) { graph.truncated = 'file-limit'; return; }
+      if (Date.now() > deadline) { graph.truncated = 'time-limit'; return; }
       const childAbs = path.join(abs, e.name);
       const childRel = rel ? `${rel}/${e.name}` : e.name;
-      if (e.isDirectory()) { walk(childAbs, childRel); continue; }
+      if (e.isDirectory()) { if (!opts.shallow) walk(childAbs, childRel); continue; }
       if (!e.name.endsWith('.meta')) continue;
       seen += 1;
       const target = childAbs.slice(0, -'.meta'.length);

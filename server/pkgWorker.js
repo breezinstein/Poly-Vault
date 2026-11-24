@@ -31,7 +31,7 @@ parentPort.on('message', (msg) => {
   if (msg.action === 'folderGraph') {
     // Loose Unity folders: walking .meta files on NFS must not block HTTP.
     try {
-      const graph = buildFolderGraph(msg.dir, { maxFiles: msg.maxFiles });
+      const graph = buildFolderGraph(msg.dir, { maxFiles: msg.maxFiles, timeBudgetMs: msg.timeBudgetMs, shallow: msg.shallow });
       fs.mkdirSync(path.dirname(msg.outPath), { recursive: true });
       fs.writeFileSync(`${msg.outPath}.tmp`, JSON.stringify(graph));
       fs.renameSync(`${msg.outPath}.tmp`, msg.outPath);

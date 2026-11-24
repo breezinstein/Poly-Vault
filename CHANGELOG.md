@@ -20,6 +20,11 @@ All notable changes to **Poly Vault** are documented here. Format follows
 - CI runs `scripts/ci-local.sh` (unit tests, acceptance suites, 3D browser checks).
 
 ### Fixed
+- Package worker replies are routed by message id; a worker that dies fails its pending requests instead of leaving them waiting.
+- Folder link maps have a time budget, are dropped when files change under them, and a model directly in a library root no longer maps the whole library.
+- "Save to vault" folders are created race-free and removed if the save fails; saving is refused (with the reason) when `PV_RIGGED_DIR` is not a library.
+- Loose folders hide Unity's generated `Library`/`Temp`/`obj` folders only inside a Unity project.
+- Browser checks install Playwright from a committed lockfile; 3D colour checks are relative to what is on screen.
 - Oversize uploads get `413` instead of a connection reset.
 - Opening a model no longer waits when link maps are disabled or failed.
 

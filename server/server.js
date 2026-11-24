@@ -235,7 +235,10 @@ const insideAnyLibrary = (real) => Boolean(libraryRootOf(real));
 // ({path, size}, '/'-separated, relative to the folder). Unity's .meta
 // sidecars and hidden/ignored folders are left out.
 const FOLDER_CONTENTS_MAX = 4000;
-const FOLDER_SKIP_DIRS = new Set(['.git', '.svn', '.hg', 'node_modules', '__pycache__', 'library', 'temp', 'obj']);
+const FOLDER_SKIP_DIRS = new Set(['.git', '.svn', '.hg', 'node_modules', '__pycache__']);
+// Generated folders of a Unity project; skipped only next to Assets/ or
+// ProjectSettings/, so a pack folder that happens to be called "Library" stays.
+const UNITY_GENERATED_DIRS = new Set(['library', 'temp', 'obj', 'logs', 'usersettings']);
 function listFolderContents(dir) {
   const out = [];
   const walk = (abs, rel, depth) => {
@@ -243,13 +246,16 @@ function listFolderContents(dir) {
     let ents;
     try { ents = fs.readdirSync(abs, { withFileTypes: true }); } catch (_) { return; }
     ents.sort((a, b) => a.name.localeCompare(b.name));
+    const projectRoot = ents.some((x) => x.isDirectory() && (x.name === 'Assets' || x.name === 'ProjectSettings'));
     for (const e of ents) {
       if (out.length >= FOLDER_CONTENTS_MAX) return;
       if (e.name.startsWith('.') || e.name === 'Thumbs.db') continue;
       const childAbs = path.join(abs, e.name);
       const childRel = rel ? `${rel}/${e.name}` : e.name;
       if (e.isDirectory()) {
-        if (!FOLDER_SKIP_DIRS.has(e.name.toLowerCase())) walk(childAbs, childRel, depth + 1);
+        const lower = e.name.toLowerCase();
+        if (FOLDER_SKIP_DIRS.has(lower) || (projectRoot && UNITY_GENERATED_DIRS.has(lower))) continue;
+        walk(childAbs, childRel, depth + 1);
         continue;
       }
       if (!e.isFile() || e.name.toLowerCase().endsWith('.meta')) continue;
@@ -277,6 +283,17 @@ const riggedStore = createRiggedStore({
   maxBytes: Number(env.PV_RIGGED_MAX_BYTES || 256 * 1024 * 1024),
 });
 riggedStore.cleanStaging();
+
+// "Save to vault" only makes sense into a folder the scanner shows: one of the
+// libraries (or inside one). Otherwise saves would vanish from the UI.
+function riggedStatus() {
+  if (!riggedStore.root) return { canSave: false, reason: 'PV_RIGGED_DIR is not set' };
+  let real;
+  try { real = fs.realpathSync(riggedStore.root); } catch (_) { real = riggedStore.root; }
+  if (!libraryRootOf(real)) return { canSave: false, reason: `PV_RIGGED_DIR (${riggedStore.root}) is not one of the libraries; add it to PV_LIBRARIES` };
+  if (!riggedStore.available()) return { canSave: false, reason: `PV_RIGGED_DIR (${riggedStore.root}) is not writable` };
+  return { canSave: true, reason: '' };
+}
 
 // Models with their Unity materials (manifest + converted textures).
 const modelService = createModelService({
@@ -353,6 +370,7 @@ function watchLibraries(libs) {
         // Mark only the library that contains the changed path, and coalesce
         // bursts (copying 500 files must cause one rescan, not 500).
         const changed = filename ? path.join(lib.path, String(filename)) : lib.path;
+        packageIndex.invalidateFolders(changed);
         for (const l of settings.get('libraries') || []) {
           const root = path.resolve(l.path);
           if (changed === root || String(changed).startsWith(root + path.sep)) dirtyLibs.add(l.id);
@@ -528,6 +546,7 @@ async function currentScan(force = false) {
 }
 
 function invalidateAll() {
+  packageIndex.invalidateFolders();
   libCache.clear();
   dirtyLibs.clear();
   for (const l of settings.get('libraries') || []) dirtyLibs.add(l.id);
@@ -1104,7 +1123,10 @@ const server = http.createServer(async (req, res) => {
         defaultEnabled: WEBGL_AVAILABLE && WEBGL_DEFAULT,
       },
       // Mesh2Motion at /rig/ (rig static meshes, retarget skinned ones).
-      rig: { available: rig.available, url: '/rig/', canSave: riggedStore.available(), riggedDir: riggedStore.root || '' },
+      rig: (() => {
+        const st = riggedStatus();
+        return { available: rig.available, url: '/rig/', canSave: st.canSave, cannotSave: st.reason, riggedDir: riggedStore.root || '' };
+      })(),
       plugin: plugin
         ? {
           version: plugin.version,
@@ -1136,6 +1158,8 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 200, { ok: true, folder: saved.folder });
         return;
       }
+      const st = riggedStatus();
+      if (!st.canSave) { req.resume(); sendJson(res, 503, { ok: false, error: st.reason }); return; }
       const saved = await riggedStore.saveModel(req, query);
       const kind = query.kind === 'retarget' ? 'retarget' : 'create';
       setTagsFor([{ path: saved.dir, tags: ['rigged', `rig:${kind}`, 'mesh2motion'] }]);
@@ -1801,6 +1825,10 @@ bridge.listen()
   .then(() => {
     server.listen(WEB_PORT, WEB_HOST, () => {
       console.log(`[poly-vault] v${APP_VERSION} listening on http://${WEB_HOST}:${WEB_PORT}`);
+      if (riggedStore.root) {
+        const st = riggedStatus();
+        if (!st.canSave) console.warn(`[poly-vault] WARNING: "Save to vault" is off: ${st.reason}.`);
+      }
       console.log(`[poly-vault] data=${DATA_DIR} libraries=${LIBRARY_ROOTS.join(',')} auth=${TRUST_PROXY_AUTH ? 'proxy' : TOKEN ? 'token' : 'NONE (loopback only!)'}`);
       if (!TRUST_PROXY_AUTH && !TOKEN && WEB_HOST !== '127.0.0.1') {
         console.warn('[poly-vault] WARNING: listening on a non-loopback address with no auth configured.');

@@ -69,13 +69,24 @@ function createPackageIndex({
   const inFlight = new Set();
   const failures = new Map();   // absPath -> consecutive failures
   let worker = null;
-  let pendingReply = null;
-  const pendingExtracts = new Map();   // message id -> resolve
+  // Every worker message carries a unique id; replies are routed by it, so
+  // index, link-map, extraction and folder requests can be in flight together.
+  const pendingReplies = new Map();   // message id -> resolve
+  let msgSeq = 0;
+  const nextId = (kind) => `${kind}:${(msgSeq += 1)}`;
+  function sendToWorker(msg, resolve) {
+    pendingReplies.set(msg.id, resolve);
+    try {
+      ensureWorker().postMessage(msg);
+    } catch (err) {
+      pendingReplies.delete(msg.id);
+      resolve({ ok: false, error: err.message });
+    }
+  }
   let extractChain = Promise.resolve();
   const extractInFlight = new Map();   // "file\u0000entry" -> promise
   let draining = false;
   let lastNotify = 0;
-  let extractSeq = 0;
   let notifyTimer = null;
   let version = 0;
 
@@ -192,47 +203,35 @@ function createPackageIndex({
     worker = new Worker(path.join(__dirname, 'pkgWorker.js'));
     worker.unref();
     worker.on('message', (msg) => {
-      const isExtract = typeof msg.id === 'string' && msg.id.startsWith('extract:');
-      if (isExtract) {
-        const reply = pendingExtracts.get(msg.id);
-        pendingExtracts.delete(msg.id);
-        if (reply) reply(msg);
-        return;
-      }
-      const reply = pendingReply;
-      pendingReply = null;
+      const reply = pendingReplies.get(msg.id);
+      pendingReplies.delete(msg.id);
       if (reply) reply(msg);
     });
+    // A dead worker answers nothing: fail what was in flight (it restarts on
+    // the next request) instead of leaving callers waiting forever.
+    const failAll = (error) => {
+      const waiting = [...pendingReplies.values()];
+      pendingReplies.clear();
+      worker = null;
+      for (const reply of waiting) reply({ ok: false, error });
+    };
     worker.on('error', (err) => {
       log.warn(`[poly-vault] package worker failed: ${err.message}`);
-      const reply = pendingReply;
-      pendingReply = null;
-      for (const [, reply] of pendingExtracts) reply({ ok: false, error: err.message });
-      pendingExtracts.clear();
-      worker = null;
-      if (reply) reply({ ok: false, error: err.message });
+      failAll(err.message);
     });
-    worker.on('exit', () => { worker = null; });
+    worker.on('exit', () => failAll('package worker stopped'));
     return worker;
   }
 
   function parseInWorker(file, mode, mtimeMs) {
-    return new Promise((resolve) => {
-      pendingReply = resolve;
-      try {
-        ensureWorker().postMessage({
-          id: `${file}:${mode}`,
-          file,
-          mode,
-          previewPath: previewPath(file, mtimeMs),
-          maxUncompressedBytes: mode === 'preview' ? PREVIEW_BUDGET : FULL_BUDGET,
-          timeoutMs: TIMEOUT_MS,
-        });
-      } catch (err) {
-        pendingReply = null;
-        resolve({ ok: false, error: err.message });
-      }
-    });
+    return new Promise((resolve) => sendToWorker({
+      id: nextId('index'),
+      file,
+      mode,
+      previewPath: previewPath(file, mtimeMs),
+      maxUncompressedBytes: mode === 'preview' ? PREVIEW_BUDGET : FULL_BUDGET,
+      timeoutMs: TIMEOUT_MS,
+    }, resolve));
   }
 
   /**
@@ -248,18 +247,9 @@ function createPackageIndex({
     const key = `${file}\u0000${entry}\u0000${outPath}`;
     if (extractInFlight.has(key)) return extractInFlight.get(key);
 
-    const job = extractChain.then(() => new Promise((resolve) => {
-      const id = `extract:${(extractSeq += 1)}`;
-      pendingExtracts.set(id, resolve);
-      try {
-        ensureWorker().postMessage({
-          id, action: 'extract', file, entry, outPath, maxBytes, previewOutPath, timeoutMs: TIMEOUT_MS,
-        });
-      } catch (err) {
-        pendingExtracts.delete(id);
-        resolve({ ok: false, error: err.message });
-      }
-    }));
+    const job = extractChain.then(() => new Promise((resolve) => sendToWorker({
+      id: nextId('extract'), action: 'extract', file, entry, outPath, maxBytes, previewOutPath, timeoutMs: TIMEOUT_MS,
+    }, resolve)));
 
     extractInFlight.set(key, job);
     extractChain = job.then(() => undefined, () => undefined);
@@ -275,16 +265,9 @@ function createPackageIndex({
   function extractMany(file, targets) {
     if (!enabled) return Promise.resolve({ ok: false, error: 'package index disabled' });
     if (!targets.length) return Promise.resolve({ ok: true, results: {}, scannedBytes: 0 });
-    const job = extractChain.then(() => new Promise((resolve) => {
-      const id = `extract:${(extractSeq += 1)}`;
-      pendingExtracts.set(id, resolve);
-      try {
-        ensureWorker().postMessage({ id, action: 'extractMany', file, targets, timeoutMs: graphTimeoutMs });
-      } catch (err) {
-        pendingExtracts.delete(id);
-        resolve({ ok: false, error: err.message });
-      }
-    }));
+    const job = extractChain.then(() => new Promise((resolve) => sendToWorker({
+      id: nextId('extract'), action: 'extractMany', file, targets, timeoutMs: graphTimeoutMs,
+    }, resolve)));
     extractChain = job.then(() => undefined, () => undefined);
     return job;
   }
@@ -292,15 +275,9 @@ function createPackageIndex({
   // --- link maps --------------------------------------------------------------
 
   function graphMessage(file, outPath) {
-    return new Promise((resolve) => {
-      pendingReply = resolve;
-      try {
-        ensureWorker().postMessage({ id: `${file}:graph`, action: 'graph', file, outPath, timeoutMs: graphTimeoutMs });
-      } catch (err) {
-        pendingReply = null;
-        resolve({ ok: false, error: err.message });
-      }
-    });
+    return new Promise((resolve) => sendToWorker({
+      id: nextId('graph'), action: 'graph', file, outPath, timeoutMs: graphTimeoutMs,
+    }, resolve));
   }
 
   async function processGraph(job) {
@@ -360,43 +337,74 @@ function createPackageIndex({
   // Loose folders (assets with .meta siblings): built on demand on the worker,
   // cached on disk for FOLDER_TTL_MS (folders change rarely; "Update" clears).
   const FOLDER_TTL_MS = 10 * 60 * 1000;
+  // A folder walk (one stat + read per .meta, over NFS) must not hold the
+  // worker indefinitely: past this it stops and the graph says it is partial.
+  const FOLDER_TIME_BUDGET_MS = Number(process.env.PV_FOLDER_GRAPH_BUDGET_MS || 60000);
   const folderInFlight = new Map();
+  // `shallow`: only the folder's own files (used when a model sits directly
+  // in a library root, so one click never maps a whole library).
+  const folderKey = (dirPath, shallow) => `dir:${dirPath}${shallow ? '\u0000shallow' : ''}`;
+  const folderOut = (dirPath, shallow) => path.join(graphDir, 'folders', `${sha1(folderKey(dirPath, shallow))}.json`);
   function folderGraph(dirPath, opts = {}) {
     if (!useGraph) return Promise.resolve(null);
-    const out = path.join(graphDir, 'folders', `${sha1(dirPath)}.json`);
-    const cached = graphCache.get(`dir:${dirPath}`);
+    const shallow = Boolean(opts.shallow);
+    const key = folderKey(dirPath, shallow);
+    const out = folderOut(dirPath, shallow);
+    const cached = graphCache.get(key);
     if (!opts.force && cached && Date.now() - cached.at < FOLDER_TTL_MS) return Promise.resolve(cached.graph);
     if (!opts.force) {
       try {
         const st = fs.statSync(out);
         if (Date.now() - st.mtimeMs < FOLDER_TTL_MS) {
           const graph = JSON.parse(fs.readFileSync(out, 'utf8'));
-          graphCache.set(`dir:${dirPath}`, { at: st.mtimeMs, graph });
+          graphCache.set(key, { at: st.mtimeMs, graph, dir: dirPath, shallow });
           return Promise.resolve(graph);
         }
       } catch (_) { /* build it */ }
     }
-    if (folderInFlight.has(dirPath)) return folderInFlight.get(dirPath);
-    const job = new Promise((resolve) => {
-      const id = `extract:${(extractSeq += 1)}`;
-      pendingExtracts.set(id, (msg) => {
-        if (!msg.ok) { log.warn(`[poly-vault] folder link map failed for ${dirPath}: ${msg.error}`); resolve(null); return; }
-        try {
-          const graph = JSON.parse(fs.readFileSync(out, 'utf8'));
-          graphCache.set(`dir:${dirPath}`, { at: Date.now(), graph });
-          resolve(graph);
-        } catch (_) { resolve(null); }
-      });
+    if (folderInFlight.has(key)) return folderInFlight.get(key);
+    const job = new Promise((resolve) => sendToWorker({
+      id: nextId('folder'), action: 'folderGraph', dir: dirPath, outPath: out, shallow,
+      maxFiles: opts.maxFiles || 50000, timeBudgetMs: opts.timeBudgetMs || FOLDER_TIME_BUDGET_MS,
+    }, (msg) => {
+      if (!msg.ok) { log.warn(`[poly-vault] folder link map failed for ${dirPath}: ${msg.error}`); resolve(null); return; }
       try {
-        ensureWorker().postMessage({ id, action: 'folderGraph', dir: dirPath, outPath: out, maxFiles: opts.maxFiles || 50000 });
-      } catch (err) {
-        pendingExtracts.delete(id);
-        resolve(null);
-      }
-    });
-    folderInFlight.set(dirPath, job);
-    job.finally(() => folderInFlight.delete(dirPath));
+        const graph = JSON.parse(fs.readFileSync(out, 'utf8'));
+        graphCache.set(key, { at: Date.now(), graph, dir: dirPath, shallow });
+        if (graph.truncated) log.warn(`[poly-vault] folder link map for ${dirPath} is partial (${graph.truncated})`);
+        resolve(graph);
+      } catch (_) { resolve(null); }
+    }));
+    folderInFlight.set(key, job);
+    job.finally(() => folderInFlight.delete(key));
     return job;
+  }
+
+  /**
+   * Drop cached folder link maps affected by a change at `changedPath` (all of
+   * them when omitted, e.g. the "Update" button): the folder itself, any folder
+   * containing it, and for a shallow map only a change directly inside it.
+   */
+  function invalidateFolders(changedPath) {
+    const changed = changedPath ? path.resolve(changedPath) : null;
+    const affected = (dir, shallow) => {
+      if (!changed) return true;
+      if (changed === dir) return true;
+      if (!changed.startsWith(dir + path.sep)) return false;
+      return !shallow || path.dirname(changed) === dir;
+    };
+    for (const [key, entry] of [...graphCache.entries()]) {
+      if (!key.startsWith('dir:') || !affected(entry.dir, entry.shallow)) continue;
+      graphCache.delete(key);
+      // Synchronously: the next request must not read the stale file back.
+      fs.rmSync(folderOut(entry.dir, entry.shallow), { force: true });
+    }
+    if (!changed) {
+      // Maps not in memory (evicted, or from before a restart) are on disk only.
+      let names = [];
+      try { names = fs.readdirSync(path.join(graphDir, 'folders')); } catch (_) { names = []; }
+      for (const n of names) fs.rmSync(path.join(graphDir, 'folders', n), { force: true });
+    }
   }
 
   /** Parsed link map of a package, or null when it is not built yet. */
@@ -637,7 +645,7 @@ function createPackageIndex({
 
   return {
     get, enqueue, extractTo, extractMany, status, close, cacheDir, previewDir, contentsCap: CONTENTS_CAP,
-    enqueueGraph, getGraph, graphState, graphSummary, graphFailuresList, folderGraph,
+    enqueueGraph, getGraph, graphState, graphSummary, graphFailuresList, folderGraph, invalidateFolders,
   };
 }
 

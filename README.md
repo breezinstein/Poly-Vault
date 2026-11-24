@@ -172,6 +172,7 @@ docker volume create poly-vault-data   # then use  poly-vault-data:/data
 | `PV_PACKAGE_INDEX_MAX_MB` | `4096` | Packages larger than this only get the fast preview pass (no full content listing). |
 | `PV_PACKAGE_GRAPH` | `1` | Build a link map (materials, textures, prefabs, importer settings) for every package in the background. `0` disables it and the material-aware viewer; opening a model then answers `503` with the reason. |
 | `PV_GRAPH_TIMEOUT_MS` | `1800000` | Per-package time limit for building a link map. |
+| `PV_FOLDER_GRAPH_BUDGET_MS` | `60000` | Time limit for mapping a loose asset folder; past it the map is partial and the viewer says so. |
 | `PV_TEXTURE_CACHE_MAX_FILES` | `20000` | Converted textures kept in `/data/packages/textures` (WebP, least recently used dropped first). |
 | `PV_MODEL_MAX_MB` | `256` | Largest model file the viewer reads, inspects or converts (on a worker thread). |
 | `PV_CONVERTED_CACHE_MAX_FILES` | `5000` | Converted GLBs (FBX 6, Unity mesh assets) kept in `/data/packages/converted`. |

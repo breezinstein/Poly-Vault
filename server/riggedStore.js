@@ -96,10 +96,20 @@ function createRiggedStore({ dir, maxBytes = 256 * 1024 * 1024, log = console })
     });
   }
 
-  function uniqueFolder(name) {
-    let candidate = name;
-    for (let i = 2; fs.existsSync(path.join(root, candidate)); i += 1) candidate = `${name} (${i})`;
-    return candidate;
+  // Create a new folder named after the model, "<name> (2)" etc. when taken.
+  // mkdir itself is the check (EEXIST -> next name), so two saves of the same
+  // name at the same moment never get the same folder.
+  function createUniqueFolder(name) {
+    for (let i = 1; i <= 1000; i += 1) {
+      const candidate = i === 1 ? name : `${name} (${i})`;
+      try {
+        fs.mkdirSync(path.join(root, candidate));
+        return candidate;
+      } catch (err) {
+        if (err.code !== 'EEXIST') throw err;
+      }
+    }
+    throw Object.assign(new Error(`too many saved models named "${name}"`), { status: 409 });
   }
 
   /** Store a rigged model. @returns {Promise<{folder:string, file:string, ext:string, size:number}>} */
@@ -113,11 +123,23 @@ function createRiggedStore({ dir, maxBytes = 256 * 1024 * 1024, log = console })
       throw Object.assign(new Error(`the file is not a valid ${ext.toUpperCase()}`), { status: 415 });
     }
     const name = safeName(query.from || query.name);
-    const folder = uniqueFolder(name);
+    let folder;
+    try {
+      folder = createUniqueFolder(name);
+    } catch (err) {
+      fs.rmSync(tmp, { force: true });
+      throw err;
+    }
     const dirPath = path.join(root, folder);
-    fs.mkdirSync(dirPath);
     const file = path.join(dirPath, `${name}__rigged.${ext}`);
-    fs.renameSync(tmp, file);
+    try {
+      fs.renameSync(tmp, file);
+    } catch (err) {
+      // Never leave an empty card in the library.
+      fs.rmSync(dirPath, { recursive: true, force: true });
+      fs.rmSync(tmp, { force: true });
+      throw err;
+    }
     return { folder, dir: dirPath, file, ext, size };
   }
 

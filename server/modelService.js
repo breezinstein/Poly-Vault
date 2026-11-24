@@ -79,7 +79,9 @@ function createModelService({
     // the request names.
     const rel = path.relative(root, file || real).split(path.sep).filter(Boolean);
     const assetDir = (file ? rel.length > 1 : rel.length > 0) ? path.join(root, rel[0]) : root;
-    const graph = await packageIndex.folderGraph(assetDir);
+    // A loose model directly in a library root: map only the root's own files,
+    // never the whole library.
+    const graph = await packageIndex.folderGraph(assetDir, { shallow: assetDir === root });
     if (!graph) return { error: 500, message: 'could not read the folder' };
     const relEntry = file ? path.relative(assetDir, file).split(path.sep).join('/') : String(entry || '');
     return { kind: 'folder', real: assetDir, file, stat: fileStat, graph, entry: relEntry };
@@ -342,7 +344,13 @@ function createModelService({
     if (src.pending) return { pending: true, state: src.state, position: src.position, error: src.error };
     const key = `${src.real}\u0000${src.entry}\u0000${src.graph.builtAt || ''}`;
     if (inFlight.has(key)) return inFlight.get(key);
-    const job = buildManifest(src).catch((err) => ({ error: 500, message: err.message }));
+    const job = buildManifest(src).then((res) => {
+      // A partial folder link map (file or time limit) can miss materials.
+      if (res && res.ok && src.kind === 'folder' && src.graph.truncated) {
+        res.manifest.notes.push(`this folder's link map is partial (${src.graph.truncated}): some materials or textures may not be found`);
+      }
+      return res;
+    }).catch((err) => ({ error: 500, message: err.message }));
     inFlight.set(key, job);
     job.finally(() => inFlight.delete(key));
     return job;

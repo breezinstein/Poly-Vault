@@ -137,10 +137,11 @@ echo "==> browser check against $BASE"
 docker run --rm \
   --network=host \
   -v "$WORK":/src:ro \
+  -v "$PWD/scripts/pw":/pwlock:ro -v pw-cache:/opt/pw \
   -e BASE_URL="$BASE" \
   -e PV_TOKEN="$TOKEN" \
   -e SHOT=/tmp/ui.png \
   -e NODE_PATH=/opt/pw/node_modules \
   --entrypoint "" \
   "$PLAYWRIGHT_IMAGE" \
-  sh -c 'npm install --prefix /opt/pw --no-audit --no-fund --silent playwright@1.65.0 >/dev/null 2>&1 && node /src/ui-check.js'
+  sh -c 'mkdir -p /opt/pw && if ! cmp -s /pwlock/package-lock.json /opt/pw/package-lock.json || [ ! -d /opt/pw/node_modules/playwright ]; then cp /pwlock/package.json /pwlock/package-lock.json /opt/pw/ && npm ci --prefix /opt/pw --no-audit --no-fund --silent >/dev/null 2>&1; fi && node /src/ui-check.js'
